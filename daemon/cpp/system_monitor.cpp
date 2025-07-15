@@ -3,18 +3,23 @@
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
+#include <chrono>
 
 #define LOG_TAG "cerberusd_monitor"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
-SystemMonitor::SystemMonitor() {
-    // Initial read to populate prev_cpu_times_
-    update_cpu_usage();
+SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()) {
+    // Initial read to populate prev_ states
+    update_all_stats();
 }
 
-GlobalStatsData SystemMonitor::get_stats() {
+void SystemMonitor::update_all_stats() {
     update_cpu_usage();
     update_mem_info();
+    update_network_stats();
+}
+
+GlobalStatsData SystemMonitor::get_stats() const {
     std::lock_guard<std::mutex> lock(data_mutex_);
     return current_stats_;
 }
@@ -47,7 +52,7 @@ void SystemMonitor::update_cpu_usage() {
             long long delta_idle = current_idle - prev_idle;
             
             float cpu_usage = 100.0f * (1.0f - static_cast<float>(delta_idle) / static_cast<float>(delta_total));
-
+            
             std::lock_guard<std::mutex> lock(data_mutex_);
             current_stats_.total_cpu_usage_percent = cpu_usage > 0.0f ? cpu_usage : 0.0f;
         }
@@ -66,10 +71,14 @@ void SystemMonitor::update_mem_info() {
     long mem_total = 0, mem_available = 0;
 
     while (std::getline(meminfo_file, line)) {
-        if (line.rfind("MemTotal:", 0) == 0) {
-            std::stringstream(line) >> line >> mem_total;
-        } else if (line.rfind("MemAvailable:", 0) == 0) {
-            std::stringstream(line) >> line >> mem_available;
+        std::string key;
+        long value;
+        std::stringstream ss(line);
+        ss >> key >> value;
+        if (key == "MemTotal:") {
+            mem_total = value;
+        } else if (key == "MemAvailable:") {
+            mem_available = value;
         }
         if (mem_total > 0 && mem_available > 0) {
             break;
@@ -80,4 +89,54 @@ void SystemMonitor::update_mem_info() {
     std::lock_guard<std::mutex> lock(data_mutex_);
     current_stats_.total_mem_kb = mem_total;
     current_stats_.avail_mem_kb = mem_available;
+}
+
+void SystemMonitor::update_network_stats() {
+    std::ifstream net_stats_file("/proc/net/xt_qtaguid/stats");
+    if (!net_stats_file.is_open()) {
+        // This file might not exist on all devices or might require special permission.
+        // LOGW("Failed to open /proc/net/xt_qtaguid/stats");
+        return;
+    }
+
+    long long current_total_rx = 0;
+    long long current_total_tx = 0;
+
+    std::string line;
+    // Skip header line
+    std::getline(net_stats_file, line); 
+
+    while (std::getline(net_stats_file, line)) {
+        std::string iface, tag_hex;
+        int idx, uid, cnt_set;
+        long long rx_bytes, tx_bytes;
+        // We only need a few columns
+        std::stringstream ss(line);
+        ss >> idx >> iface >> tag_hex >> uid >> cnt_set >> rx_bytes >> line >> tx_bytes;
+        
+        // We sum up all traffic for total speed
+        current_total_rx += rx_bytes;
+        current_total_tx += tx_bytes;
+    }
+    net_stats_file.close();
+
+    auto now = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_net_time_).count();
+
+    if (duration_ms > 0) {
+        long long delta_rx = current_total_rx - prev_total_rx_;
+        long long delta_tx = current_total_tx - prev_total_tx_;
+
+        // Convert to bits per second (bytes * 8 * 1000 / ms)
+        long long down_speed = delta_rx > 0 ? (delta_rx * 8 * 1000 / duration_ms) : 0;
+        long long up_speed = delta_tx > 0 ? (delta_tx * 8 * 1000 / duration_ms) : 0;
+
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        current_stats_.net_down_speed_bps = down_speed;
+        current_stats_.net_up_speed_bps = up_speed;
+    }
+
+    prev_total_rx_ = current_total_rx;
+    prev_total_tx_ = current_total_tx;
+    prev_net_time_ = now;
 }

@@ -1,56 +1,132 @@
+// app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
 import android.os.Process
+import com.crfzit.crfzit.data.uds.UdsClient
+import com.google.gson.Gson
 import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * 这是我们的 LSPosed 模块的入口点。
- * 当 LSPosed 加载我们的 APK 作为一个模块时，它会实例化这个类并调用 handleLoadPackage。
- * 当我们像普通应用一样启动 APK 时，这个类不会被加载或执行。
  */
 class ProbeHook : IXposedHookLoadPackage {
 
+    // 【新增】为 Probe 创建一个独立的协程作用域
+    private val probeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val udsClient = UdsClient(probeScope)
+    private val gson = Gson()
+
+    companion object {
+        private const val TAG = "CerberusProbe"
+    }
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         // 我们的目标是 system_server，它的进程名和包名都是 "android"
-        if (lpparam.processName != "android") {
+        if (lpparam.packageName != "android" || lpparam.processName != "android") {
             return
         }
         
-        // 打印一条日志到 LSPosed 的日志中，以确认模块已成功注入 system_server
-        XposedBridge.log("Cerberus Probe: Successfully attached to system_server (PID: ${Process.myPid()})")
+        // 模块注入成功后，立即启动UDS客户端尝试连接Daemon
+        udsClient.start()
 
-        // 在这里，我们可以开始对 system_server 中的类和方法进行 Hook
-        // 例如，Hook ActivityManagerService 来监控应用启动
+        XposedBridge.log("$TAG: Successfully attached to system_server (PID: ${Process.myPid()})")
+
+        // 开始 Hook 关键系统服务
         hookActivityManagerService(lpparam.classLoader)
     }
 
     /**
-     * 示例：Hook AMS 的方法
-     * @param classLoader system_server 的类加载器
+     * Hook AMS 的方法来监控应用生命周期
      */
     private fun hookActivityManagerService(classLoader: ClassLoader) {
         try {
-            // val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
+            val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
+
+            // Hook cleanUpRemovedTask(Task, boolean) - 任务被移除，视为应用从最近任务列表划掉
+            // 这是感知应用停止的一个可靠方式
+            XposedHelpers.findAndHookMethod(
+                amsClass,
+                "cleanUpRemovedTask",
+                "com.android.server.wm.Task", // Android 10+ TaskRecord is renamed to Task
+                Boolean::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val task = param.args[0]
+                            // 通过反射获取 Task 对象中的包名
+                            val baseIntent = XposedHelpers.getObjectField(task, "mBaseIntent")
+                            val componentName = XposedHelpers.callMethod(baseIntent, "getComponent")
+                            val packageName = XposedHelpers.callMethod(componentName, "getPackageName") as String
+
+                            XposedBridge.log("$TAG: App task removed: $packageName")
+                            sendEventToDaemon("event.app_killed", mapOf("package_name" to packageName))
+
+                        } catch (t: Throwable) {
+                            XposedBridge.log("$TAG: Error in cleanUpRemovedTask hook: ${t.message}")
+                        }
+                    }
+                }
+            )
             
-            // 这是一个示例，实际的Hook会更复杂
-            // XposedHelpers.findAndHookMethod(
-            //     amsClass,
-            //     "startProcess", // 监控进程启动的方法
-            //     // ... 此处需要复杂的参数类型列表 ...
-            //     object : XC_MethodHook() {
-            //         override fun beforeHookedMethod(param: MethodHookParam) {
-            //             val processName = param.args[...].toString() // 获取参数
-            //             XposedBridge.log("Cerberus Probe: Process starting: $processName")
-            //             // TODO: 将此事件通过 UDS 发送给 daemon
-            //         }
-            //     }
-            // )
-            XposedBridge.log("Cerberus Probe: Found AMS, ready to hook methods.")
-        } catch (e: Throwable) {
-            XposedBridge.log("Cerberus Probe: Failed to hook AMS.")
-            XposedBridge.log(e)
+            // Hook 'startProcess' - 进程启动
+            // 这个 hook 比较复杂，因为有多个重载
+            XposedHelpers.findAndHookMethod(
+                amsClass,
+                "startProcess",
+                String::class.java, // processName
+                ApplicationInfo::class.java, // info
+                Boolean::class.java, // knownToBeDead
+                Int::class.java, // intentFlags
+                String::class.java, // hostingType
+                ComponentName::class.java, // hostingName
+                Boolean::class.java, // isTopApp
+                Boolean::class.java, // isReceiver
+                Int::class.java, // userId
+                Int::class.java, // sandboxUid
+                Boolean::class.java, // isolated
+                Int::class.java, // zygotePolicyFlags
+                Boolean::class.java, // isSdkSandbox
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val appInfo = param.args[1] as ApplicationInfo?
+                        if (appInfo != null) {
+                            val packageName = appInfo.packageName
+                             XposedBridge.log("$TAG: App process starting: $packageName")
+                            sendEventToDaemon("event.app_start", mapOf("package_name" to packageName))
+                        }
+                    }
+                }
+            )
+
+            XposedBridge.log("$TAG: Successfully hooked AMS methods for app lifecycle.")
+
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: Failed to hook ActivityManagerService.")
+            XposedBridge.log(t)
+        }
+    }
+    
+    /**
+     * 辅助函数，将事件打包成 JSON 并通过 UDS 发送
+     */
+    private fun sendEventToDaemon(type: String, payload: Map<String, Any>) {
+        try {
+            val message = mapOf(
+                "v" to 1,
+                "type" to type,
+                "payload" to payload
+            )
+            val jsonString = gson.toJson(message)
+            udsClient.sendMessage(jsonString)
+        } catch (e: Exception) {
+            XposedBridge.log("$TAG: Error sending event to daemon: ${e.message}")
         }
     }
 }

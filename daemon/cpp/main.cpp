@@ -30,11 +30,11 @@ void signal_handler(int signum) {
     if (g_server) g_server->stop();
 }
 
-// 线程1：负责周期性更新所有系统状态
 void monitor_thread() {
     LOGI("Monitor thread started.");
     while (g_is_running) {
         if (g_state_manager) {
+            // 这个函数现在包含了状态机逻辑
             g_state_manager->update_all_states();
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -42,7 +42,6 @@ void monitor_thread() {
     LOGI("Monitor thread finished.");
 }
 
-// 线程2：负责周期性向UI广播最新状态
 void broadcaster_thread() {
     LOGI("Broadcaster thread started.");
     while (g_is_running) {
@@ -65,9 +64,8 @@ int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v1.1 (Real-Data) starting...");
+    LOGI("Cerberus Daemon v1.2 (StateMachine-MVP) starting...");
 
-    // 确保数据目录存在
     try {
         if (!std::filesystem::exists(DATA_DIR)) {
             std::filesystem::create_directories(DATA_DIR);
@@ -75,25 +73,23 @@ int main() {
         }
     } catch(const std::filesystem::filesystem_error& e) {
         LOGE("Failed to create data directory: %s", e.what());
-        // Don't exit, maybe it's a perm issue we can live without
     }
 
     // --- 初始化核心组件 ---
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto sys_monitor = std::make_shared<SystemMonitor>();
-    g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor);
+    auto action_executor = std::make_shared<ActionExecutor>(); // 【新增】
+    g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor); // 【注入】
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
     
-    // --- 启动后台工作线程 ---
     std::thread monitor(monitor_thread);
     std::thread broadcaster(broadcaster_thread);
 
-    // --- 主线程运行UDS服务器，阻塞至服务停止 ---
     LOGI("Main thread starting UDS server loop...");
     g_server->run();
 
     LOGI("UDS server loop has finished. Cleaning up threads...");
-    g_is_running = false; // 确保其他线程退出
+    g_is_running = false;
     if (monitor.joinable()) monitor.join();
     if (broadcaster.joinable()) broadcaster.join();
     

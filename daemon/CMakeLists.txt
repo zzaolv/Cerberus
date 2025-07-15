@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.20)
 project(cerberusd CXX C)
 
 # --- 1. 定义第三方库路径 ---
-# 假设您的 nlohmann_json, sqlite3, sqlitecpp 都在 third_party 目录下
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 # --- 2. 构建 sqlite3 库 ---
@@ -31,6 +30,7 @@ add_executable(cerberusd
     cpp/system_monitor.cpp
     cpp/database_manager.cpp
     cpp/state_manager.cpp
+    cpp/action_executor.cpp
 )
 
 # --- 5. 添加头文件搜索路径 ---

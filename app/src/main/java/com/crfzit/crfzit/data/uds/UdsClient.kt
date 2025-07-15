@@ -1,3 +1,4 @@
+// app/src/main/java/com/crfzit/crfzit/data/uds/UdsClient.kt
 package com.crfzit.crfzit.data.uds
 
 import android.net.LocalSocket
@@ -7,11 +8,13 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.io.IOException
+import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
 class UdsClient(private val scope: CoroutineScope) {
 
     private var socket: LocalSocket? = null
+    private var outputStream: OutputStream? = null // 【新增】
     private var connectionJob: Job? = null
     private val _incomingMessages = MutableSharedFlow<String>(replay = 1)
     val incomingMessages = _incomingMessages.asSharedFlow()
@@ -34,6 +37,8 @@ class UdsClient(private val scope: CoroutineScope) {
                     Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
                     socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
                         it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
+                        // 【新增】连接成功后获取输出流
+                        outputStream = it.outputStream
                     }
                     Log.i(TAG, "Successfully connected to daemon.")
                     listenForMessages()
@@ -47,6 +52,28 @@ class UdsClient(private val scope: CoroutineScope) {
             }
         }
     }
+    
+    // 【新增】发送消息的方法
+    fun sendMessage(message: String) {
+        // 在IO线程中执行发送操作，避免阻塞调用者
+        scope.launch(Dispatchers.IO) {
+            val stream = outputStream
+            if (stream == null || socket?.isConnected != true) {
+                Log.w(TAG, "Cannot send message, socket is not connected.")
+                return@launch
+            }
+            try {
+                // JSON Lines 协议，每条消息后加换行符
+                stream.write((message + "\n").toByteArray(StandardCharsets.UTF_8))
+                stream.flush()
+            } catch (e: IOException) {
+                Log.e(TAG, "Failed to send message: ${e.message}")
+                // 发送失败通常意味着连接已断开，触发重连
+                cleanupSocket()
+            }
+        }
+    }
+
 
     private suspend fun listenForMessages() {
         val currentSocket = socket ?: return
@@ -78,10 +105,12 @@ class UdsClient(private val scope: CoroutineScope) {
 
     private fun cleanupSocket() {
         try {
+            outputStream?.close()
+        } catch (e: IOException) { /* ignore */ }
+        try {
             socket?.close()
-        } catch (e: IOException) {
-            // Ignore
-        }
+        } catch (e: IOException) { /* ignore */ }
         socket = null
+        outputStream = null
     }
 }
