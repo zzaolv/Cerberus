@@ -1,0 +1,1853 @@
+build.gradle.kts
+```
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    // 正确引用在 toml 中定义的 compose 插件
+    alias(libs.plugins.jetbrains.compose) apply false
+}
+```
+
+settings.gradle.kts
+```
+// D:/project/Cerberus/settings.gradle.kts
+
+pluginManagement {
+    repositories {
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+// 核心：这里是唯一且合并后的 dependencyResolutionManagement 块
+dependencyResolutionManagement {
+    // 仓库管理模式设置，保持不变
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+
+    // 🇨🇳 把所有仓库都放在这一个 repositories 块里
+    repositories {
+        google()
+        mavenCentral()
+        // 🇨🇳 把 Xposed 的仓库也加到这里
+        maven { url = uri("https://api.xposed.info/") }
+    }
+}
+
+rootProject.name = "CRFzit" // 您可以修改为 "Cerberus"
+include(":app")
+```
+
+gradle/libs.versions.toml
+```
+[versions]
+agp = "8.11.1" # 我将版本更新到较新的稳定版，兼容Kotlin 2.0.0
+kotlin = "2.2.0"
+composeCompiler = "1.5.14" # 适配Kotlin 2.0.0的Compose编译器版本
+coreKtx = "1.16.0"
+activityCompose = "1.10.1" # 使用 1.9.0
+composeBom = "2025.06.01"
+
+# Lifecycle 库版本
+lifecycleRuntimeKtx = "2.9.1"
+lifecycleViewmodelCompose = "2.9.1"
+lifecycleKtx = "2.9.1"
+
+navigation = "2.9.1"
+# Testing
+junit = "4.13.2"
+junitVersion = "1.2.1"
+espressoCore = "3.6.1"
+
+# Annotation
+annotation = "1.9.1"
+
+# Gson
+gson = "2.13.1"
+
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+
+# Lifecycle 库
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+androidx-lifecycle-viewmodel-ktx = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-ktx", version.ref = "lifecycleKtx" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
+
+androidx-annotation = { group = "androidx.annotation", name = "annotation", version.ref = "annotation" }
+
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigation" }
+
+# Compose - 由BOM管理版本
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-material3 = { group = "androidx.compose.material3", name = "material3" }
+androidx-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+# Testing
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+androidx-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+
+# Gson
+gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
+
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+# 此处定义Compose插件，以便在app/build.gradle.kts中按ID引用
+jetbrains-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin"}
+```
+
+app/build.gradle.kts
+```
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.jetbrains.compose)
+}
+
+android {
+    namespace = "com.crfzit.crfzit"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "com.crfzit.crfzit"
+        minSdk = 30
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary = true
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            // 明确告诉编译器不要将警告视为错误
+            allWarningsAsErrors.set(false)
+        }
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion = libs.versions.composeCompiler.get()
+    }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+dependencies {
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.ktx)
+
+    implementation(libs.androidx.activity.compose)
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.ui)
+    implementation(libs.androidx.ui.graphics)
+    implementation(libs.androidx.ui.tooling.preview)
+    implementation(libs.androidx.material3)
+    implementation(libs.androidx.material.icons.extended)
+
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.annotation)
+    implementation(libs.androidx.navigation.compose)
+
+    implementation(libs.gson)
+
+    compileOnly("de.robv.android.xposed:api:82")
+    compileOnly("de.robv.android.xposed:api:82:sources")
+
+    testImplementation(libs.junit)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.ui.test.junit4)
+    debugImplementation(libs.androidx.ui.tooling)
+    debugImplementation(libs.androidx.ui.test.manifest)
+}
+```
+
+app/src/main/AndroidManifest.xml
+```
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Cerberus"
+        tools:targetApi="36">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.Cerberus">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ================================================== -->
+        <!--        LSPosed 模块元数据 (集成到主APK)          -->
+        <!-- ================================================== -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Project Cerberus - UI &amp; System Probe" />
+
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" /> <!-- 93 对应 LSPosed 1.x -->
+
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+    </application>
+</manifest>
+```
+
+app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
+```
+package com.crfzit.crfzit.data.model
+
+//--- 配置页模型 ---
+
+// 应用策略等级
+enum class Policy {
+    EXEMPTED, // 自由后台
+    IMPORTANT, // 重要
+    STANDARD, // 智能
+    STRICT, // 严格
+}
+
+// 应用信息，用于配置列表
+data class AppInfo(
+    val packageName: String,
+    val appName: String,
+    val policy: Policy,
+    val isSystemApp: Boolean = false,
+    val forcePlaybackExemption: Boolean = false,
+    val forceNetworkExemption: Boolean = false // <-- 确保这里没有多余的逗号
+)
+
+//--- 日志页模型 ---
+
+// 日志级别
+enum class LogLevel {
+    INFO, // 信息
+    SUCCESS, // 成功
+    WARNING, // 警告
+    ERROR, // 错误
+    EVENT // 事件
+}
+
+// 单条日志条目
+data class LogEntry(
+    val timestamp: Long,
+    val level: LogLevel,
+    val message: String,
+    val appName: String? = null
+)
+```
+
+app/src/main/java/com/crfzit/crfzit/data/model/DashboardModels.kt
+```
+package com.crfzit.crfzit.data.model
+
+import com.google.gson.annotations.SerializedName
+
+/**
+ * 对应 dashboard_update 消息的顶层结构 (根据技术文档的IPC协议调整)
+ */
+data class CerberusMessage(
+    @SerializedName("v")
+    val version: Int,
+    val type: String,
+    @SerializedName("req_id")
+    val requestId: String?,
+    val payload: DashboardPayload
+)
+
+/**
+ * 对应 stream.dashboard_update 的 payload
+ */
+data class DashboardPayload(
+    @SerializedName("global_stats")
+    val globalStats: GlobalStats,
+    @SerializedName("apps_runtime_state")
+    val appsRuntimeState: List<AppRuntimeState>
+)
+
+/**
+ * 全局状态的数据模型
+ */
+data class GlobalStats(
+    @SerializedName("total_cpu_usage_percent")
+    val totalCpuUsagePercent: Float = 0f,
+    @SerializedName("total_mem_kb")
+    val totalMemKb: Long = 0L,
+    @SerializedName("avail_mem_kb")
+    val availMemKb: Long = 0L,
+    @SerializedName("net_down_speed_bps")
+    val netDownSpeedBps: Long = 0L,
+    @SerializedName("net_up_speed_bps")
+    val netUpSpeedBps: Long = 0L,
+    @SerializedName("active_profile_name")
+    val activeProfileName: String = "等待连接..."
+)
+
+/**
+ * 单个应用运行时状态的数据模型
+ */
+data class AppRuntimeState(
+    @SerializedName("package_name")
+    val packageName: String,
+    @SerializedName("app_name")
+    val appName: String,
+    @SerializedName("display_status")
+    val displayStatus: DisplayStatus = DisplayStatus.UNKNOWN,
+    @SerializedName("active_freeze_mode")
+    val activeFreezeMode: FreezeMode? = null,
+    @SerializedName("mem_usage_kb")
+    val memUsageKb: Long = 0L,
+    @SerializedName("cpu_usage_percent")
+    val cpuUsagePercent: Float = 0f,
+    @SerializedName("is_whitelisted")
+    val isWhitelisted: Boolean = false,
+    @SerializedName("is_foreground")
+    val isForeground: Boolean = false,
+    // 以下为模拟状态，在真实实现中会从 Observer 获取
+    val hasPlayback: Boolean = false,
+    val hasNotification: Boolean = false,
+    val hasNetworkActivity: Boolean = false,
+    val pendingFreezeSec: Int = 0
+)
+
+/**
+ * 应用显示状态的枚举 (与文档保持一致)
+ */
+enum class DisplayStatus {
+    FOREGROUND,
+    FOREGROUND_GAME, // 补充文档中的状态
+    BACKGROUND_ACTIVE,
+    BACKGROUND_IDLE,
+    AWAITING_FREEZE,
+    FROZEN,
+    KILLED, // 补充文档中的状态
+    EXEMPTED, // 补充文档中的状态
+    UNKNOWN
+}
+
+/**
+ * 冻结模式的枚举
+ */
+enum class FreezeMode {
+    CGROUP,
+    SIGSTOP,
+    UNKNOWN
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/data/repository/DashboardRepository.kt
+```
+package com.crfzit.crfzit.data.repository
+
+import com.crfzit.crfzit.data.model.AppRuntimeState
+import com.crfzit.crfzit.data.model.GlobalStats
+import kotlinx.coroutines.flow.Flow
+
+interface DashboardRepository {
+    fun getGlobalStatsStream(): Flow<GlobalStats>
+    fun getAppRuntimeStateStream(): Flow<List<AppRuntimeState>>
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/data/repository/MockAppRepository.kt
+```
+package com.crfzit.crfzit.data.repository
+
+import com.crfzit.crfzit.data.model.AppInfo
+import com.crfzit.crfzit.data.model.LogEntry
+import com.crfzit.crfzit.data.model.LogLevel
+import com.crfzit.crfzit.data.model.Policy
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+
+class MockAppRepository {
+    private val mockApps = mutableListOf(
+        AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT),
+        AppInfo("com.eg.android.AlipayGphone", "支付宝", Policy.IMPORTANT),
+        AppInfo("com.alibaba.android.rimet", "钉钉", Policy.IMPORTANT),
+        AppInfo("com.coolapk.market", "酷安", Policy.STANDARD),
+        AppInfo("com.bilibili.app.in", "哔哩哔哩", Policy.STANDARD),
+        AppInfo("com.xunmeng.pinduoduo", "拼多多", Policy.STRICT),
+        AppInfo("com.android.systemui", "系统界面", Policy.EXEMPTED, isSystemApp = true),
+        AppInfo("com.android.settings", "设置", Policy.EXEMPTED, isSystemApp = true)
+    )
+
+    suspend fun getAllApps(): List<AppInfo> {
+        delay(500) // 模拟网络延迟
+        return mockApps
+    }
+
+    suspend fun setPolicyForApp(packageName: String, newPolicy: Policy) {
+        delay(100) // 模拟设置延迟
+        val index = mockApps.indexOfFirst { it.packageName == packageName }
+        if (index != -1) {
+            mockApps[index] = mockApps[index].copy(policy = newPolicy)
+        }
+    }
+
+    fun getLogsStream(): Flow<List<LogEntry>> = flow {
+        val logs = listOf(
+            LogEntry(System.currentTimeMillis() - 1000, LogLevel.EVENT, "屏幕已关闭，进入后台计时。", null),
+            LogEntry(System.currentTimeMillis() - 5000, LogLevel.SUCCESS, "已将 [拼多多] 置于cgroup冻结状态 (原因: 后台超时)", "拼多多"),
+            LogEntry(System.currentTimeMillis() - 15000, LogLevel.INFO, "为 [微信] 解除冻结 (原因: 收到高优先级推送)", "微信"),
+            LogEntry(System.currentTimeMillis() - 25000, LogLevel.WARNING, "SELinux 策略加载成功，有 1 条未使用规则。", null),
+            LogEntry(System.currentTimeMillis() - 35000, LogLevel.ERROR, "连接探针失败，请检查 LSPosed 模块是否激活。", null),
+            LogEntry(System.currentTimeMillis() - 45000, LogLevel.EVENT, "守护进程启动成功 (PID: 12345)", null)
+        )
+        emit(logs)
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/data/repository/UdsDashboardRepository.kt
+```
+package com.crfzit.crfzit.data.repository
+
+import android.util.Log
+import com.crfzit.crfzit.data.model.AppRuntimeState
+import com.crfzit.crfzit.data.model.CerberusMessage
+import com.crfzit.crfzit.data.model.GlobalStats
+import com.crfzit.crfzit.data.uds.UdsClient
+import com.google.gson.Gson
+import com.google.gson.JsonSyntaxException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.*
+
+class UdsDashboardRepository(
+    scope: CoroutineScope
+) : DashboardRepository {
+
+    private val udsClient = UdsClient(scope)
+    private val gson = Gson()
+
+    private val dashboardUpdateFlow: SharedFlow<CerberusMessage> = flow {
+        Log.i("UdsDashboardRepo", "UDS message flow is now active. Starting UDS client...")
+        udsClient.start()
+        udsClient.incomingMessages.collect { jsonLine ->
+            try {
+                val message = gson.fromJson(jsonLine, CerberusMessage::class.java)
+                if (message.type == "stream.dashboard_update") {
+                    emit(message)
+                }
+            } catch (e: JsonSyntaxException) {
+                Log.e("UdsDashboardRepo", "JSON parse error: ${e.message} \\n\\t for line: $jsonLine")
+            }
+        }
+    }.flowOn(Dispatchers.IO)
+     .shareIn(scope, SharingStarted.WhileSubscribed(5000), replay = 1)
+
+    override fun getGlobalStatsStream(): Flow<GlobalStats> {
+        return dashboardUpdateFlow
+            .map { it.payload.globalStats }
+            .distinctUntilChanged()
+    }
+
+    override fun getAppRuntimeStateStream(): Flow<List<AppRuntimeState>> {
+        return dashboardUpdateFlow
+            .map { it.payload.appsRuntimeState }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/data/uds/UdsClient.kt
+```
+package com.crfzit.crfzit.data.uds
+
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
+import android.util.Log
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import java.io.IOException
+import java.nio.charset.StandardCharsets
+
+class UdsClient(private val scope: CoroutineScope) {
+
+    private var socket: LocalSocket? = null
+    private var connectionJob: Job? = null
+    private val _incomingMessages = MutableSharedFlow<String>(replay = 1)
+    val incomingMessages = _incomingMessages.asSharedFlow()
+
+    companion object {
+        private const val TAG = "CerberusUdsClient"
+        private const val SOCKET_NAME = "cerberus_socket"
+        private const val RECONNECT_DELAY_MS = 5000L
+    }
+
+    fun start() {
+        if (connectionJob?.isActive == true) {
+            Log.d(TAG, "UDS client is already running.")
+            return
+        }
+        Log.i(TAG, "UDS client start() called.")
+        connectionJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                try {
+                    Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
+                    socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
+                        it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
+                    }
+                    Log.i(TAG, "Successfully connected to daemon.")
+                    listenForMessages()
+                } catch (e: IOException) {
+                    Log.w(TAG, "Connection failed or lost: ${e.message}. Retrying in ${RECONNECT_DELAY_MS}ms...")
+                    cleanupSocket()
+                }
+                if (isActive) {
+                    delay(RECONNECT_DELAY_MS)
+                }
+            }
+        }
+    }
+
+    private suspend fun listenForMessages() {
+        val currentSocket = socket ?: return
+        try {
+            currentSocket.inputStream.bufferedReader(StandardCharsets.UTF_8).use { reader ->
+                while (currentSocket.isConnected && scope.isActive) {
+                    val line = reader.readLine() ?: break
+                    if (line.isNotBlank()) {
+                        _incomingMessages.emit(line)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (scope.isActive) {
+                Log.e(TAG, "Error while reading from socket: ${e.message}")
+            }
+        } finally {
+            Log.i(TAG, "Socket read loop finished or connection lost.")
+            cleanupSocket()
+        }
+    }
+
+    fun stop() {
+        connectionJob?.cancel()
+        connectionJob = null
+        cleanupSocket()
+        Log.i(TAG, "UDS client stopped.")
+    }
+
+    private fun cleanupSocket() {
+        try {
+            socket?.close()
+        } catch (e: IOException) {
+            // Ignore
+        }
+        socket = null
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
+```
+package com.crfzit.crfzit.lsp
+
+import android.os.Process
+import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.callbacks.XC_LoadPackage
+
+/**
+ * 这是我们的 LSPosed 模块的入口点。
+ * 当 LSPosed 加载我们的 APK 作为一个模块时，它会实例化这个类并调用 handleLoadPackage。
+ * 当我们像普通应用一样启动 APK 时，这个类不会被加载或执行。
+ */
+class ProbeHook : IXposedHookLoadPackage {
+
+    override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 我们的目标是 system_server，它的进程名和包名都是 "android"
+        if (lpparam.processName != "android") {
+            return
+        }
+        
+        // 打印一条日志到 LSPosed 的日志中，以确认模块已成功注入 system_server
+        XposedBridge.log("Cerberus Probe: Successfully attached to system_server (PID: ${Process.myPid()})")
+
+        // 在这里，我们可以开始对 system_server 中的类和方法进行 Hook
+        // 例如，Hook ActivityManagerService 来监控应用启动
+        hookActivityManagerService(lpparam.classLoader)
+    }
+
+    /**
+     * 示例：Hook AMS 的方法
+     * @param classLoader system_server 的类加载器
+     */
+    private fun hookActivityManagerService(classLoader: ClassLoader) {
+        try {
+            // val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
+            
+            // 这是一个示例，实际的Hook会更复杂
+            // XposedHelpers.findAndHookMethod(
+            //     amsClass,
+            //     "startProcess", // 监控进程启动的方法
+            //     // ... 此处需要复杂的参数类型列表 ...
+            //     object : XC_MethodHook() {
+            //         override fun beforeHookedMethod(param: MethodHookParam) {
+            //             val processName = param.args[...].toString() // 获取参数
+            //             XposedBridge.log("Cerberus Probe: Process starting: $processName")
+            //             // TODO: 将此事件通过 UDS 发送给 daemon
+            //         }
+            //     }
+            // )
+            XposedBridge.log("Cerberus Probe: Found AMS, ready to hook methods.")
+        } catch (e: Throwable) {
+            XposedBridge.log("Cerberus Probe: Failed to hook AMS.")
+            XposedBridge.log(e)
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/MainActivity.kt
+```
+package com.crfzit.crfzit
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.ui.Modifier
+import com.crfzit.crfzit.ui.theme.CRFzitTheme
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            CRFzitTheme {
+               Surface(
+                   modifier = Modifier.fillMaxSize(),
+                   color = MaterialTheme.colorScheme.background
+               ) {
+                   // 应用的入口点现在是 MainScreen
+                   MainScreen()
+               }
+            }
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/MainScreen.kt
+```
+package com.crfzit.crfzit
+
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.navigation.NavDestination.Companion.hierarchy
+import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
+import com.crfzit.crfzit.navigation.Screen
+import com.crfzit.crfzit.ui.configuration.ConfigurationScreen
+import com.crfzit.crfzit.ui.dashboard.DashboardScreen
+import com.crfzit.crfzit.ui.logs.LogsScreen
+import com.crfzit.crfzit.ui.profiles.ProfileManagementScreen // <-- 关键修正：添加 import
+import com.crfzit.crfzit.ui.settings.SettingsScreen
+
+@Composable
+fun MainScreen() {
+    val navController = rememberNavController()
+    val screens = listOf(
+        Screen.Dashboard,
+        Screen.Configuration,
+        Screen.Logs,
+        Screen.Settings
+    )
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                val navBackStackEntry by navController.currentBackStackEntryAsState()
+                val currentDestination = navBackStackEntry?.destination
+
+                screens.forEach { screen ->
+                    NavigationBarItem(
+                        icon = { Icon(screen.icon, contentDescription = null) },
+                        label = { Text(screen.label) },
+                        selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
+                        onClick = {
+                            navController.navigate(screen.route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true
+                                }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        NavHost(
+            navController = navController,
+            startDestination = Screen.Dashboard.route,
+            modifier = Modifier.padding(innerPadding)
+        ) {
+            composable(Screen.Dashboard.route) { DashboardScreen() }
+            composable(Screen.Configuration.route) {
+                // <-- 关键修正：传入 navController
+                ConfigurationScreen(navController = navController)
+            }
+            composable(Screen.Logs.route) { LogsScreen() }
+            composable(Screen.Settings.route) { SettingsScreen() }
+            composable(Screen.ProfileManagement.route) {
+                ProfileManagementScreen(onNavigateBack = { navController.popBackStack() })
+            }
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/navigation/Screen.kt
+```
+package com.crfzit.crfzit.navigation
+
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Style // <-- 关键修正：添加 import
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.ui.graphics.vector.ImageVector
+
+sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
+    data object Dashboard : Screen("dashboard", "主页", Icons.Default.Dashboard)
+    data object Configuration : Screen("configuration", "配置", Icons.Default.Tune)
+    data object Logs : Screen("logs", "日志", Icons.AutoMirrored.Filled.ListAlt)
+    data object Settings : Screen("settings", "设置", Icons.Default.Settings)
+    data object ProfileManagement : Screen("profile_management", "情景模式", Icons.Default.Style)
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
+```
+package com.crfzit.crfzit.ui.configuration
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Style // <-- 关键修正：添加 import
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController // <-- 关键修正：添加 import
+import com.crfzit.crfzit.data.model.AppInfo
+import com.crfzit.crfzit.data.model.Policy
+import com.crfzit.crfzit.navigation.Screen // <-- 关键修正：添加 import
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConfigurationScreen(
+    navController: NavController, // 定义 navController 参数
+    viewModel: ConfigurationViewModel = viewModel()
+) {
+    val uiState by viewModel.uiState.collectAsState()
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+    var selectedApp by remember { mutableStateOf<AppInfo?>(null) }
+
+    val filteredApps = remember(uiState.allApps, uiState.searchQuery, uiState.showSystemApps) {
+        uiState.allApps.filter { app ->
+            (uiState.showSystemApps || !app.isSystemApp) &&
+            (app.appName.contains(uiState.searchQuery, ignoreCase = true) ||
+             app.packageName.contains(uiState.searchQuery, ignoreCase = true))
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("应用配置") },
+                actions = {
+                    IconButton(onClick = { navController.navigate(Screen.ProfileManagement.route) }) {
+                        Icon(Icons.Default.Style, contentDescription = "情景模式管理")
+                    }
+                    var showMenu by remember { mutableStateOf(false) }
+                    IconButton(onClick = { showMenu = !showMenu }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "更多选项")
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
+                            onClick = {
+                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
+                                showMenu = false
+                            }
+                        )
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(Modifier.padding(padding)) {
+            OutlinedTextField(
+                value = uiState.searchQuery,
+                onValueChange = viewModel::onSearchQueryChanged,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                label = { Text("搜索应用") },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                singleLine = true
+            )
+
+            if (uiState.isLoading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(filteredApps, key = { it.packageName }) { app ->
+                        AppPolicyItem(app = app) {
+                            selectedApp = app
+                            scope.launch { sheetState.show() }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (selectedApp != null) {
+        ModalBottomSheet(
+            onDismissRequest = { selectedApp = null },
+            sheetState = sheetState,
+        ) {
+            AppPolicyBottomSheetContent(
+                app = selectedApp!!,
+                viewModel = viewModel,
+                onPolicyChange = { newPolicy ->
+                    viewModel.setPolicy(selectedApp!!.packageName, newPolicy)
+                    // 选择后自动关闭 BottomSheet
+                    scope.launch { sheetState.hide() }.invokeOnCompletion {
+                        if (!sheetState.isVisible) {
+                            selectedApp = null
+                        }
+                    }
+                }
+            )
+        }
+    }
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
+    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Spacer(Modifier.size(40.dp))
+            Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                Text(app.appName, fontWeight = FontWeight.Bold)
+                Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                text = getPolicyLabel(app.policy).first,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+fun AppPolicyBottomSheetContent(
+    app: AppInfo,
+    viewModel: ConfigurationViewModel,
+    onPolicyChange: (Policy) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .padding(16.dp)
+            .navigationBarsPadding(),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(app.appName, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.align(Alignment.CenterHorizontally))
+        HorizontalDivider()
+        Text("策略等级", style = MaterialTheme.typography.titleMedium)
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Policy.entries.forEach { policy ->
+                val (label, icon) = getPolicyLabel(policy)
+                Button(
+                    onClick = { onPolicyChange(policy) },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = app.policy != policy
+                ) {
+                    Text("$icon $label")
+                }
+            }
+        }
+        HorizontalDivider()
+        Text("手动豁免", style = MaterialTheme.typography.titleMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("强制后台播放豁免", modifier = Modifier.weight(1f))
+            Switch(
+                checked = app.forcePlaybackExemption,
+                onCheckedChange = { viewModel.setPlaybackExemption(app.packageName, it) }
+            )
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("强制网络活动豁免", modifier = Modifier.weight(1f))
+            Switch(
+                checked = app.forceNetworkExemption,
+                onCheckedChange = { viewModel.setNetworkExemption(app.packageName, it) }
+            )
+        }
+    }
+}
+
+fun getPolicyLabel(policy: Policy): Pair<String, String> {
+    return when (policy) {
+        Policy.EXEMPTED -> "自由后台" to "🛡️"
+        Policy.IMPORTANT -> "重要" to "✅"
+        Policy.STANDARD -> "智能" to "⚙️"
+        Policy.STRICT -> "严格" to "🧊"
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationViewModel.kt
+```
+package com.crfzit.crfzit.ui.configuration
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.crfzit.crfzit.data.model.AppInfo
+import com.crfzit.crfzit.data.model.Policy
+// import com.crfzit.crfzit.data.repository.MockAppRepository // 不再使用
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class ConfigurationUiState(
+    val isLoading: Boolean = true,
+    val allApps: List<AppInfo> = emptyList(),
+    val searchQuery: String = "",
+    val showSystemApps: Boolean = false
+)
+
+class ConfigurationViewModel : ViewModel() {
+    // private val repository = MockAppRepository() // <-- 关键修正：移除模拟仓库
+
+    private val _uiState = MutableStateFlow(ConfigurationUiState())
+    val uiState: StateFlow<ConfigurationUiState> = _uiState.asStateFlow()
+
+    init {
+        // TODO: 未来在这里调用真实仓库加载应用列表
+        // loadApps()
+        // 目前，我们让它显示加载状态，或者一个空列表
+        _uiState.update { it.copy(isLoading = false) } // 暂时设为加载完成，显示空列表
+    }
+
+    // loadApps, setPolicy 等函数暂时保留，但它们操作的是内存中的状态
+    // 这样UI交互仍然可以工作，只是数据不会持久化
+    fun onSearchQueryChanged(query: String) {
+        _uiState.update { it.copy(searchQuery = query) }
+    }
+
+    fun onShowSystemAppsChanged(show: Boolean) {
+        _uiState.update { it.copy(showSystemApps = show) }
+    }
+
+    fun setPolicy(packageName: String, policy: Policy) {
+        _uiState.update { currentState ->
+            val updatedApps = currentState.allApps.map {
+                if (it.packageName == packageName) it.copy(policy = policy) else it
+            }
+            currentState.copy(allApps = updatedApps)
+        }
+    }
+
+    fun setPlaybackExemption(packageName: String, isExempt: Boolean) {
+        _uiState.update { currentState ->
+            val updatedApps = currentState.allApps.map {
+                if (it.packageName == packageName) it.copy(forcePlaybackExemption = isExempt) else it
+            }
+            currentState.copy(allApps = updatedApps)
+        }
+    }
+
+    fun setNetworkExemption(packageName: String, isExempt: Boolean) {
+        _uiState.update { currentState ->
+            val updatedApps = currentState.allApps.map {
+                if (it.packageName == packageName) it.copy(forceNetworkExemption = isExempt) else it
+            }
+            currentState.copy(allApps = updatedApps)
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/dashboard/DashboardScreen.kt
+```
+package com.crfzit.crfzit.ui.dashboard
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider // <-- 已修正：使用 HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.crfzit.crfzit.data.model.AppRuntimeState
+import com.crfzit.crfzit.data.model.DisplayStatus
+import com.crfzit.crfzit.data.model.FreezeMode
+import com.crfzit.crfzit.data.model.GlobalStats
+import com.crfzit.crfzit.ui.theme.CRFzitTheme
+import java.util.Locale
+
+@Composable
+fun DashboardScreen(
+    viewModel: DashboardViewModel = viewModel()
+) {
+    // 正确使用 collectAsState，不会产生 linter 警告
+    val uiState by viewModel.uiState.collectAsState()
+
+    // 将状态传递给纯UI的可组合项，这是最佳实践
+    DashboardContent(
+        uiState = uiState
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DashboardContent(uiState: DashboardUiState) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Cerberus Dashboard") },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            )
+        }
+    ) { paddingValues ->
+        Column(
+            modifier = Modifier
+                .padding(paddingValues)
+                .fillMaxSize()
+        ) {
+            when {
+                uiState.isLoading -> {
+                    StatusIndicator("等待连接守护进程...", showProgress = true)
+                }
+                !uiState.isConnected -> {
+                    StatusIndicator("连接守护进程失败！\n请检查模块是否正常运行，并授予Root权限。", showProgress = false)
+                }
+                else -> {
+                    GlobalStatsHeader(stats = uiState.globalStats)
+                    HorizontalDivider() // <-- 已修正：使用 HorizontalDivider
+                    ActiveAppsList(apps = uiState.activeApps)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StatusIndicator(text: String, showProgress: Boolean) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            if (showProgress) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+            Text(text, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 32.dp))
+        }
+    }
+}
+
+@Composable
+fun GlobalStatsHeader(stats: GlobalStats) {
+    val memUsedGb = (stats.totalMemKb - stats.availMemKb) / (1024.0 * 1024.0)
+    val memTotalGb = stats.totalMemKb / (1024.0 * 1024.0)
+    val netDownMbps = stats.netDownSpeedBps / (1024.0 * 1024.0 * 8)
+    val netUpKbps = stats.netUpSpeedBps / (1024.0 * 8)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 12.dp, horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceAround,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = "CPU: ${"%.1f".format(stats.totalCpuUsagePercent)}%", fontSize = 14.sp)
+            Text(text = "MEM: ${"%.1f".format(memUsedGb)}/${"%.1f".format(memTotalGb)}G", fontSize = 14.sp)
+            Text(text = "NET: ↓${"%.1f".format(netDownMbps)}MB/s ↑${"%.0f".format(netUpKbps)}KB/s", fontSize = 14.sp)
+        }
+        Text(text = "MODE: ${stats.activeProfileName}", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun ActiveAppsList(apps: List<AppRuntimeState>) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        items(items = apps, key = { it.packageName }) { app ->
+            AppStatusCard(app = app)
+        }
+    }
+}
+
+@Composable
+fun AppStatusCard(app: AppRuntimeState) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(MaterialTheme.colorScheme.secondaryContainer, shape = MaterialTheme.shapes.medium),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = app.appName.take(2).uppercase(Locale.ROOT),
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Text(
+                    text = app.appName,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.weight(1f)
+                )
+                AppStatusIndicators(app = app)
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp)) // <-- 已修正
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "MEM: ${app.memUsageKb / 1024}MB | CPU: ${"%.1f".format(app.cpuUsagePercent)}%",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = getStatusText(app),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun AppStatusIndicators(app: AppRuntimeState) {
+    Row {
+        if (app.isForeground) Text("▶️", modifier = Modifier.padding(horizontal = 2.dp))
+        if (app.displayStatus == DisplayStatus.FOREGROUND_GAME) Text("🎮", modifier = Modifier.padding(horizontal = 2.dp))
+        if (app.isWhitelisted) Text("🛡️", modifier = Modifier.padding(horizontal = 2.dp))
+        if (app.hasPlayback) Text("🎵", modifier = Modifier.padding(horizontal = 2.dp))
+        if (app.hasNotification) Text("🔔", modifier = Modifier.padding(horizontal = 2.dp))
+        if (app.hasNetworkActivity) Text("📡", modifier = Modifier.padding(horizontal = 2.dp))
+
+        when (app.displayStatus) {
+            DisplayStatus.FROZEN -> Text("❄️", modifier = Modifier.padding(horizontal = 2.dp))
+            DisplayStatus.KILLED -> Text("🧊", modifier = Modifier.padding(horizontal = 2.dp))
+            DisplayStatus.AWAITING_FREEZE -> Text("⏳", modifier = Modifier.padding(horizontal = 2.dp))
+            else -> {}
+        }
+    }
+}
+
+fun getStatusText(app: AppRuntimeState): String {
+    return when (app.displayStatus) {
+        DisplayStatus.FOREGROUND -> "前台运行"
+        DisplayStatus.FOREGROUND_GAME -> "前台游戏"
+        DisplayStatus.BACKGROUND_ACTIVE -> "后台活动"
+        DisplayStatus.BACKGROUND_IDLE -> "后台空闲"
+        DisplayStatus.AWAITING_FREEZE -> "等待冻结"
+        DisplayStatus.FROZEN -> "已冻结 (${app.activeFreezeMode?.name ?: "N/A"})"
+        DisplayStatus.KILLED -> "已结束"
+        DisplayStatus.EXEMPTED -> "自由后台"
+        DisplayStatus.UNKNOWN -> "状态未知"
+    }
+}
+
+
+// --- 预览函数区 ---
+// 这里是正确的预览实现方式，不会导致任何编译错误或警告。
+
+@Preview(showBackground = true, widthDp = 360, heightDp = 780)
+@Composable
+fun DashboardScreenConnectedPreview() {
+    CRFzitTheme {
+        val previewState = DashboardUiState(
+            globalStats = GlobalStats(
+                totalCpuUsagePercent = 15.7f,
+                totalMemKb = 12000000,
+                availMemKb = 4000000,
+                netDownSpeedBps = 1234567,
+                netUpSpeedBps = 56789,
+                activeProfileName = "🎮 游戏模式"
+            ),
+            activeApps = listOf(
+                AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, displayStatus = DisplayStatus.FOREGROUND, memUsageKb = 350 * 1024, cpuUsagePercent = 12.3f),
+                AppRuntimeState(packageName = "com.netease.cloudmusic", appName = "网易云音乐", hasPlayback = true, isWhitelisted = true, displayStatus = DisplayStatus.EXEMPTED, memUsageKb = 180 * 1024),
+                AppRuntimeState(packageName = "com.alibaba.taobao", appName = "淘宝", displayStatus = DisplayStatus.AWAITING_FREEZE, memUsageKb = 500 * 1024),
+                AppRuntimeState(packageName = "com.xunmeng.pinduoduo", appName = "拼多多", displayStatus = DisplayStatus.FROZEN, activeFreezeMode = FreezeMode.CGROUP)
+            ),
+            isLoading = false,
+            isConnected = true
+        )
+        // 直接将模拟状态传入内部 Content 函数进行预览
+        DashboardContent(uiState = previewState)
+    }
+}
+
+@Preview(showBackground = true, widthDp = 360)
+@Composable
+fun DashboardScreenConnectingPreview() {
+    CRFzitTheme {
+        DashboardContent(uiState = DashboardUiState(isLoading = true, isConnected = false))
+    }
+}
+
+@Preview(showBackground = true, widthDp = 360)
+@Composable
+fun DashboardScreenFailedPreview() {
+    CRFzitTheme {
+        DashboardContent(uiState = DashboardUiState(isLoading = false, isConnected = false))
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/dashboard/DashboardViewModel.kt
+```
+package com.crfzit.crfzit.ui.dashboard
+
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.crfzit.crfzit.data.model.AppRuntimeState
+import com.crfzit.crfzit.data.model.GlobalStats
+import com.crfzit.crfzit.data.repository.DashboardRepository
+import com.crfzit.crfzit.data.repository.UdsDashboardRepository
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+data class DashboardUiState(
+    val globalStats: GlobalStats = GlobalStats(),
+    val activeApps: List<AppRuntimeState> = emptyList(),
+    val isLoading: Boolean = true,
+    val isConnected: Boolean = false
+)
+
+class DashboardViewModel(
+    private val repositoryOverride: DashboardRepository? = null
+) : ViewModel() {
+
+    private val repository: DashboardRepository by lazy {
+        Log.i("DashboardViewModel", "Lazy repository is being initialized.")
+        repositoryOverride ?: UdsDashboardRepository(viewModelScope)
+    }
+
+    private val _uiState = MutableStateFlow(DashboardUiState())
+    val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
+
+    init {
+        Log.i("DashboardViewModel", "ViewModel init called.")
+        observeDashboardData()
+    }
+
+    private fun observeDashboardData() {
+        Log.i("DashboardViewModel", "Starting to observe dashboard data...")
+        viewModelScope.launch {
+            // 将两个流合并
+            repository.getGlobalStatsStream()
+                .combine(repository.getAppRuntimeStateStream()) { stats, apps ->
+                    // 成功接收到数据，更新UI状态
+                    Log.d("DashboardViewModel", "Received new data from streams.")
+                    DashboardUiState(
+                        globalStats = stats,
+                        activeApps = apps.sortedWith(compareBy({ !it.isForeground }, { it.appName })),
+                        isLoading = false,
+                        isConnected = true
+                    )
+                }
+                .onStart {
+                    // Flow开始收集时，立即发出加载状态
+                    Log.i("DashboardViewModel", "Data stream collection started. Emitting loading state.")
+                    emit(DashboardUiState(isLoading = true))
+                }
+                .catch { e ->
+                    // 如果在收集中发生错误（例如UDS连接中断），发出失败状态
+                    Log.e("DashboardViewModel", "Error in data stream: ${e.message}", e)
+                    emit(DashboardUiState(isLoading = false, isConnected = false))
+                }
+                .collect { newState ->
+                    // 将合并后的最新状态更新到 _uiState
+                    _uiState.value = newState
+                }
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
+```
+package com.crfzit.crfzit.ui.logs
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.crfzit.crfzit.data.model.LogEntry
+import com.crfzit.crfzit.data.model.LogLevel
+import java.text.SimpleDateFormat
+import java.util.*
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
+    val logs by viewModel.logs.collectAsState()
+    var selectedTab by remember { mutableIntStateOf(0) }
+    val tabs = listOf("事件时间线", "资源统计")
+
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("日志与统计") }) }
+    ) { padding ->
+        Column(Modifier.padding(padding)) {
+            PrimaryTabRow(selectedTabIndex = selectedTab) {
+                tabs.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTab == index,
+                        onClick = { selectedTab = index },
+                        text = { Text(title) }
+                    )
+                }
+            }
+            when (selectedTab) {
+                0 -> EventTimeline(logs)
+                1 -> ResourceStatistics()
+            }
+        }
+    }
+}
+
+@Composable
+fun EventTimeline(logs: List<LogEntry>) {
+    LazyColumn(
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        reverseLayout = true
+    ) {
+        items(logs, key = { it.timestamp }) { log ->
+            LogItem(log)
+        }
+    }
+}
+
+@Composable
+fun LogItem(log: LogEntry) {
+    val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
+    val (icon, color) = getLogAppearance(log.level)
+
+    Row(verticalAlignment = Alignment.Top) {
+        Text(
+            text = "${formatter.format(Date(log.timestamp))} $icon",
+            color = color,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(end = 8.dp)
+        )
+        Text(log.message, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+fun ResourceStatistics() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("资源统计图表 (待实现)")
+    }
+}
+
+// <-- 关键修正：将此函数标记为 @Composable
+@Composable
+fun getLogAppearance(level: LogLevel): Pair<String, Color> {
+    return when (level) {
+        LogLevel.INFO -> "ℹ️" to MaterialTheme.colorScheme.outline
+        LogLevel.SUCCESS -> "✅" to Color(0xFF34A853) // Green
+        LogLevel.WARNING -> "⚠️" to Color(0xFFFBBC05) // Yellow
+        LogLevel.ERROR -> "❌" to MaterialTheme.colorScheme.error
+        // 现在可以安全地访问 MaterialTheme.colorScheme 了
+        LogLevel.EVENT -> "⚡" to MaterialTheme.colorScheme.primary
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/logs/LogsViewModel.kt
+```
+package com.crfzit.crfzit.ui.logs
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.crfzit.crfzit.data.model.LogEntry
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
+
+class LogsViewModel : ViewModel() {
+
+    // TODO: 未来从真实仓库获取日志流
+    val logs: StateFlow<List<LogEntry>> =
+        // <-- 关键修正：明确指定泛型类型
+        flowOf<List<LogEntry>>(emptyList())
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/profiles/ProfileManagementScreen.kt
+```
+package com.crfzit.crfzit.ui.profiles
+
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ProfileManagementScreen(onNavigateBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("情景模式管理") },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Box(
+            modifier = Modifier.padding(padding).fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("情景模式管理功能 (待实现)")
+        }
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/settings/SettingsScreen.kt
+```
+package com.crfzit.crfzit.ui.settings
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen() {
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("设置") }) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.padding(padding),
+            contentPadding = PaddingValues(vertical = 16.dp)
+        ) {
+            item {
+                SettingsGroup(title = "核心引擎") {
+                    SettingsDropdown("Freezer类型", listOf("自动选择", "cgroup", "SIGSTOP"))
+                    SettingsSlider("后台超时 (智能)", 60f, "秒")
+                    SettingsSwitch("定时解冻", false)
+                }
+            }
+            item {
+                SettingsGroup(title = "全局豁免") {
+                    SettingsSwitch("智能推送感知", true)
+                    SettingsSwitch("高网络活动感知", true)
+                }
+            }
+            item {
+                SettingsGroup(title = "模块信息与操作") {
+                    InfoItem("守护进程状态", "✅ 运行中 (PID: 12345)")
+                    InfoItem("探针状态", "✅ 已在 system_server 激活")
+                    ButtonItem("健康检查") {}
+                    ButtonItem("重启守护进程") {}
+                }
+            }
+            item {
+                SettingsGroup(title = "关于") {
+                    InfoItem("版本", "1.1 (UI-dev)")
+                    InfoItem("作者", "Your Name")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsGroup(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+        content()
+        HorizontalDivider(modifier = Modifier.padding(top = 8.dp))
+    }
+}
+
+@Composable
+fun SettingsSwitch(title: String, initialValue: Boolean) {
+    var checked by remember { mutableStateOf(initialValue) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { checked = !checked }
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(title, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = { checked = it })
+    }
+}
+
+@Composable
+fun SettingsSlider(title: String, initialValue: Float, unit: String) {
+    var sliderPosition by remember { mutableFloatStateOf(initialValue) }
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text("$title: ${sliderPosition.toInt()} $unit")
+        Slider(
+            value = sliderPosition,
+            onValueChange = { sliderPosition = it },
+            valueRange = 10f..300f
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsDropdown(title: String, options: List<String>) {
+    var expanded by remember { mutableStateOf(false) }
+    var selectedOptionText by remember { mutableStateOf(options[0]) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded },
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        OutlinedTextField(
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(),
+            readOnly = true,
+            value = selectedOptionText,
+            onValueChange = {},
+            label = { Text(title) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { selectionOption ->
+                DropdownMenuItem(
+                    text = { Text(selectionOption) },
+                    onClick = {
+                        selectedOptionText = selectionOption
+                        expanded = false
+                    },
+                    contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun InfoItem(title: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 16.dp),
+    ) {
+        Text(title, modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
+        Text(value)
+    }
+}
+
+@Composable
+fun ButtonItem(title: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Text(title)
+    }
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/theme/Color.kt
+```
+package com.crfzit.crfzit.ui.theme // 确保包名正确
+
+import androidx.compose.ui.graphics.Color
+
+val Purple80 = Color(0xFFD0BCFF)
+val PurpleGrey80 = Color(0xFFCCC2DC)
+val Pink80 = Color(0xFFEFB8C8)
+
+val Purple40 = Color(0xFF6650a4)
+val PurpleGrey40 = Color(0xFF625b71)
+val Pink40 = Color(0xFF7D5260)
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/theme/Theme.kt
+```
+package com.crfzit.crfzit.ui.theme // 确保包名正确
+
+import android.app.Activity
+import android.os.Build
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
+
+private val DarkColorScheme = darkColorScheme(
+    primary = Purple80,
+    secondary = PurpleGrey80,
+    tertiary = Pink80
+)
+
+private val LightColorScheme = lightColorScheme(
+    primary = Purple40,
+    secondary = PurpleGrey40,
+    tertiary = Pink40
+)
+
+@Composable
+fun CRFzitTheme( // 这里是函数的定义
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    dynamicColor: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    val colorScheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val context = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+        }
+        darkTheme -> DarkColorScheme
+        else -> LightColorScheme
+    }
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            window.statusBarColor = colorScheme.primaryContainer.toArgb()
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+        }
+    }
+
+    MaterialTheme(
+        colorScheme = colorScheme,
+        typography = Typography,
+        content = content
+    )
+}
+```
+
+app/src/main/java/com/crfzit/crfzit/ui/theme/Type.kt
+```
+package com.crfzit.crfzit.ui.theme // 确保包名正确
+
+import androidx.compose.material3.Typography
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+
+val Typography = Typography(
+    bodyLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 16.sp,
+        lineHeight = 24.sp,
+        letterSpacing = 0.5.sp
+    )
+)
+```
+

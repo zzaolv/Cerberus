@@ -1,0 +1,325 @@
+daemon/CMakeLists.txt
+```
+# 启用 C 和 CXX (C++) 语言支持，这是解决链接错误的关键
+cmake_minimum_required(VERSION 3.20)
+project(cerberusd CXX C) 
+
+# --- 1. 定义第三方库路径 ---
+set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+# --- 2. 构建我们自己提供的 sqlite3 库 ---
+# 因为我们在 project() 中启用了 C 语言，CMake现在知道如何处理这个 .c 文件
+add_library(sqlite3_lib STATIC ${THIRDPARTY_DIR}/sqlite3/sqlite3.c)
+target_include_directories(sqlite3_lib PUBLIC ${THIRDPARTY_DIR}/sqlite3)
+
+# --- 3. 构建 SQLiteCpp 库 ---
+add_library(sqlitecpp_lib STATIC
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Database.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Statement.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Column.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Backup.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Exception.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Savepoint.cpp
+    ${THIRDPARTY_DIR}/sqlitecpp/src/Transaction.cpp
+)
+target_include_directories(sqlitecpp_lib PUBLIC ${THIRDPARTY_DIR}/sqlitecpp/include)
+target_link_libraries(sqlitecpp_lib PUBLIC sqlite3_lib) # 链接 sqlite3
+
+# --- 4. 定义最终的可执行文件 ---
+add_executable(cerberusd
+    cpp/main.cpp
+    cpp/uds_server.cpp
+)
+
+# --- 5. 添加头文件搜索路径 ---
+target_include_directories(cerberusd PRIVATE
+    ${THIRDPARTY_DIR}/nlohmann_json/include
+    # SQLiteCpp 的头文件已经通过 sqlitecpp_lib 传递，这里无需重复
+)
+
+# --- 6. 链接最终的可执行文件 ---
+target_link_libraries(cerberusd
+    PRIVATE
+    sqlitecpp_lib # 链接我们自己构建的 SQLiteCpp
+    log           # 链接安卓日志库
+)
+
+# --- 7. 设置 C++ 标准 ---
+set_target_properties(cerberusd PROPERTIES CXX_STANDARD 17)
+```
+
+daemon/cpp/main.cpp
+```
+#include "uds_server.h"
+#include "nlohmann/json.hpp" // 引入json库
+#include <android/log.h>
+#include <csignal>
+#include <thread>
+#include <chrono>
+
+#define LOG_TAG "cerberusd"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+using json = nlohmann::json;
+
+// 与UI App中的UdsClient保持一致
+const std::string SOCKET_NAME = "cerberus_socket";
+
+// 全局变量，用于信号处理
+std::unique_ptr<UdsServer> g_server = nullptr;
+std::atomic<bool> g_is_running = true;
+
+// 数据广播线程
+void broadcast_thread() {
+    LOGI("Broadcast thread started.");
+    while (g_is_running) {
+        if (g_server) {
+            // --- 创建模拟的仪表盘数据 ---
+            json payload;
+            // 全局状态
+            payload["global_stats"] = {
+                {"total_cpu_usage_percent", 15.0 + (rand() % 10)},
+                {"total_mem_kb", 8 * 1024 * 1024},
+                {"avail_mem_kb", (4 + (rand() % 2)) * 1024 * 1024},
+                {"net_down_speed_bps", (long)(rand() % 100000)},
+                {"net_up_speed_bps", (long)(rand() % 50000)},
+                {"active_profile_name", "常规模式"}
+            };
+            // 应用状态
+            payload["apps_runtime_state"] = json::array({
+                {
+                    {"package_name", "com.fake.app1"},
+                    {"app_name", "模拟应用A"},
+                    {"display_status", "FOREGROUND"},
+                    {"mem_usage_kb", 150 * 1024},
+                    {"cpu_usage_percent", 25.5f},
+                    {"is_foreground", true}
+                },
+                {
+                    {"package_name", "com.fake.app2"},
+                    {"app_name", "模拟应用B"},
+                    {"display_status", "FROZEN"},
+                    {"active_freeze_mode", "CGROUP"},
+                    {"mem_usage_kb", 50 * 1024},
+                    {"cpu_usage_percent", 0.1f},
+                    {"is_foreground", false}
+                }
+            });
+
+            json message = {
+                {"v", 1},
+                {"type", "stream.dashboard_update"},
+                {"payload", payload}
+            };
+            
+            // 广播消息
+            g_server->broadcast_message(message.dump());
+        }
+        // 每2秒广播一次
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    LOGI("Broadcast thread finished.");
+}
+
+// 信号处理函数
+void signal_handler(int signum) {
+    LOGI("Caught signal %d, shutting down...", signum);
+    g_is_running = false;
+    if (g_server) {
+        g_server->stop(); // 优雅地停止服务器
+    }
+}
+
+int main() {
+    // 注册信号处理
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+
+    LOGI("Cerberus Daemon v1.0 starting...");
+
+    // 初始化并启动服务器
+    g_server = std::make_unique<UdsServer>(SOCKET_NAME);
+    
+    // 启动广播线程
+    std::thread broadcaster(broadcast_thread);
+
+    // 主线程阻塞在这里，运行服务器的accept循环
+    g_server->run();
+    
+    // 等待广播线程结束
+    if (broadcaster.joinable()) {
+        broadcaster.join();
+    }
+    
+    LOGI("Cerberus Daemon has shut down cleanly.");
+    return 0;
+}
+```
+
+daemon/cpp/uds_server.cpp
+```
+#include "uds_server.h"
+#include <android/log.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <algorithm>
+#include <vector>
+
+#define LOG_TAG "cerberusd"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+UdsServer::UdsServer(const std::string& socket_path)
+    : socket_path_(socket_path), server_fd_(-1), is_running_(false) {}
+
+UdsServer::~UdsServer() {
+    stop();
+}
+
+void UdsServer::add_client(int client_fd) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    client_fds_.push_back(client_fd);
+    LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
+}
+
+void UdsServer::remove_client(int client_fd) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
+    if (it != client_fds_.end()) {
+        client_fds_.erase(it, client_fds_.end());
+        LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
+        close(client_fd);
+    }
+}
+
+void UdsServer::broadcast_message(const std::string& message) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    if (client_fds_.empty()) return;
+
+    // JSON Lines 协议要求每条消息以换行符结尾
+    std::string line = message + "\n";
+    std::vector<int> disconnected_clients;
+
+    for (int fd : client_fds_) {
+        ssize_t bytes_sent = send(fd, line.c_str(), line.length(), MSG_NOSIGNAL);
+        if (bytes_sent < 0) {
+            // EPIPE 表示客户端已关闭连接
+            if (errno == EPIPE || errno == ECONNRESET) {
+                LOGW("Client fd %d write failed (EPIPE/ECONNRESET), marking for removal.", fd);
+                disconnected_clients.push_back(fd);
+            } else {
+                LOGE("Failed to send to client fd %d: %s", fd, strerror(errno));
+            }
+        }
+    }
+
+    // 从主列表移除已断开的客户端
+    for (int fd : disconnected_clients) {
+        // 这里不加锁，因为 remove_client 内部会加锁
+        // 为了避免死锁，创建一个临时副本来迭代
+        remove_client(fd);
+    }
+}
+
+void UdsServer::stop() {
+    is_running_ = false;
+    if (server_fd_ != -1) {
+        shutdown(server_fd_, SHUT_RDWR);
+        close(server_fd_);
+        server_fd_ = -1;
+    }
+
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    for (int fd : client_fds_) {
+        close(fd);
+    }
+    client_fds_.clear();
+}
+
+void UdsServer::run() {
+    server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd_ == -1) {
+        LOGE("Failed to create socket: %s", strerror(errno));
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    // 使用抽象命名空间，第一个字节必须是 \0
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
+
+    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
+        close(server_fd_);
+        return;
+    }
+
+    if (listen(server_fd_, 5) == -1) {
+        LOGE("Failed to listen on socket: %s", strerror(errno));
+        close(server_fd_);
+        return;
+    }
+
+    LOGI("Server is listening on abstract UDS: @%s", socket_path_.c_str());
+    is_running_ = true;
+
+    while (is_running_) {
+        int client_fd = accept(server_fd_, nullptr, nullptr);
+        if (client_fd == -1) {
+            if (is_running_) { // 如果不是主动停止，就报错
+                LOGE("Failed to accept connection: %s", strerror(errno));
+            }
+            continue;
+        }
+        add_client(client_fd);
+        // 我们不为每个客户端创建读线程，因为当前阶段只关心广播
+    }
+}
+```
+
+daemon/cpp/uds_server.h
+```
+#ifndef CERBERUSD_UDS_SERVER_H
+#define CERBERUSD_UDS_SERVER_H
+
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+class UdsServer {
+public:
+    explicit UdsServer(const std::string& socket_path);
+    ~UdsServer();
+
+    // 启动服务器的主循环
+    void run();
+    // 停止服务器
+    void stop();
+    // 向所有连接的客户端广播消息
+    void broadcast_message(const std::string& message);
+
+private:
+    void add_client(int client_fd);
+    void remove_client(int client_fd);
+
+    std::string socket_path_;
+    int server_fd_;
+    std::atomic<bool> is_running_;
+    
+    // 客户端文件描述符列表
+    std::vector<int> client_fds_;
+    std::mutex client_mutex_;
+};
+
+#endif //CERBERUSD_UDS_SERVER_H
+```
+
