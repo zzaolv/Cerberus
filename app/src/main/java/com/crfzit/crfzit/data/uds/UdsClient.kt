@@ -18,28 +18,25 @@ class UdsClient(private val scope: CoroutineScope) {
 
     companion object {
         private const val TAG = "CerberusUdsClient"
-        // 与 daemon 和 SELinux 策略中的 socket name 保持一致
         private const val SOCKET_NAME = "cerberus_socket"
         private const val RECONNECT_DELAY_MS = 5000L
     }
 
     fun start() {
-        if (connectionJob?.isActive == true) return
+        if (connectionJob?.isActive == true) {
+            Log.d(TAG, "UDS client is already running.")
+            return
+        }
+        Log.i(TAG, "UDS client start() called.")
         connectionJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
                     Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
-                    socket = LocalSocket().also {
-                        // 使用 ABSTRACT namespace，这与 C++ daemon 的实现匹配
+                    socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
                         it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
                     }
                     Log.i(TAG, "Successfully connected to daemon.")
-                    
-                    // 发送一个心跳或版本信息，表明UI已连接
-                    // sendMessage("{\"v\": 1, \"type\": \"cmd.client_hello\"}")
-                    
                     listenForMessages()
-
                 } catch (e: IOException) {
                     Log.w(TAG, "Connection failed or lost: ${e.message}. Retrying in ${RECONNECT_DELAY_MS}ms...")
                     cleanupSocket()
@@ -54,12 +51,10 @@ class UdsClient(private val scope: CoroutineScope) {
     private suspend fun listenForMessages() {
         val currentSocket = socket ?: return
         try {
-            // 使用 use 块确保资源自动关闭
             currentSocket.inputStream.bufferedReader(StandardCharsets.UTF_8).use { reader ->
                 while (currentSocket.isConnected && scope.isActive) {
-                    val line = reader.readLine() ?: break // 读取到流末尾，连接已断开
+                    val line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                        // Log.v(TAG, "Received line: $line") // Verbose log for debugging
                         _incomingMessages.emit(line)
                     }
                 }
@@ -73,7 +68,7 @@ class UdsClient(private val scope: CoroutineScope) {
             cleanupSocket()
         }
     }
-    
+
     fun stop() {
         connectionJob?.cancel()
         connectionJob = null

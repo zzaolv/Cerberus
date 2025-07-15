@@ -1,5 +1,6 @@
 package com.crfzit.crfzit.ui.dashboard
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppRuntimeState
@@ -8,7 +9,6 @@ import com.crfzit.crfzit.data.repository.DashboardRepository
 import com.crfzit.crfzit.data.repository.UdsDashboardRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 
 data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
@@ -18,48 +18,49 @@ data class DashboardUiState(
 )
 
 class DashboardViewModel(
-    private val injectedRepository: DashboardRepository? = null
+    private val repositoryOverride: DashboardRepository? = null
 ) : ViewModel() {
 
     private val repository: DashboardRepository by lazy {
-        injectedRepository ?: UdsDashboardRepository(viewModelScope)
+        Log.i("DashboardViewModel", "Lazy repository is being initialized.")
+        repositoryOverride ?: UdsDashboardRepository(viewModelScope)
     }
 
     private val _uiState = MutableStateFlow(DashboardUiState())
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     init {
+        Log.i("DashboardViewModel", "ViewModel init called.")
         observeDashboardData()
     }
 
     private fun observeDashboardData() {
+        Log.i("DashboardViewModel", "Starting to observe dashboard data...")
         viewModelScope.launch {
-            // 添加一个初始延迟，给UDS客户端一点时间去连接
-            // 如果5秒后还没有数据，就认为连接失败
-            launch {
-                delay(5000)
-                if (_uiState.value.isLoading) {
-                    _uiState.value = _uiState.value.copy(isLoading = false, isConnected = false)
-                }
-            }
-
+            // 将两个流合并
             repository.getGlobalStatsStream()
                 .combine(repository.getAppRuntimeStateStream()) { stats, apps ->
+                    // 成功接收到数据，更新UI状态
+                    Log.d("DashboardViewModel", "Received new data from streams.")
                     DashboardUiState(
                         globalStats = stats,
-                        activeApps = apps.sortedWith(compareBy({ !it.isForeground }, { it.appName })), // 排序
+                        activeApps = apps.sortedWith(compareBy({ !it.isForeground }, { it.appName })),
                         isLoading = false,
                         isConnected = true
                     )
                 }
                 .onStart {
-                    _uiState.value = DashboardUiState(isLoading = true, isConnected = false)
+                    // Flow开始收集时，立即发出加载状态
+                    Log.i("DashboardViewModel", "Data stream collection started. Emitting loading state.")
+                    emit(DashboardUiState(isLoading = true))
                 }
                 .catch { e ->
-                    // Flow 异常时，标记为未连接
-                    _uiState.value = _uiState.value.copy(isLoading = false, isConnected = false)
+                    // 如果在收集中发生错误（例如UDS连接中断），发出失败状态
+                    Log.e("DashboardViewModel", "Error in data stream: ${e.message}", e)
+                    emit(DashboardUiState(isLoading = false, isConnected = false))
                 }
                 .collect { newState ->
+                    // 将合并后的最新状态更新到 _uiState
                     _uiState.value = newState
                 }
         }

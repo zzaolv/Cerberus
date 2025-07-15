@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+/magisk/Cerberus.zip
+/magisk/cerberus-UI.apk
+/magisk/cerberusd
