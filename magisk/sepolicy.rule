@@ -36,3 +36,6 @@ allow cerberus_daemon_t { zygote untrusted_app platform_app system_app }:process
 
 # 允许写入Magisk模块自身的属性文件，用于动态更新状态描述
 allow cerberus_daemon_t magisk_file:file { write open };
+allow cerberus_daemon_t proc:file { read open getattr };
+allow cerberus_daemon_t proc_stat:file { read open getattr };
+allow cerberus_daemon_t proc_meminfo:file { read open getattr };
