@@ -5,46 +5,64 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.Policy // 【新增】导入Policy
+import com.crfzit.crfzit.data.model.Policy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
-class AppInfoRepository(private val context: Context) {
+// 【修改】将 AppInfoRepository 变成一个单例，以实现全局缓存
+class AppInfoRepository private constructor(context: Context) {
 
     private val packageManager: PackageManager = context.packageManager
-    // 【修改】缓存类型更新为新的 AppInfo
-    private var appInfoCache: Map<String, AppInfo>? = null
+    // 【修改】使用 ConcurrentHashMap 确保线程安全
+    private val appInfoCache: MutableMap<String, AppInfo> = ConcurrentHashMap()
 
-    suspend fun getAllInstalledApps(forceRefresh: Boolean = false): Map<String, AppInfo> {
-        // 使用缓存，避免每次都重复加载
-        if (appInfoCache != null && !forceRefresh) {
-            return appInfoCache!!
+    // 【修改】对外提供获取已缓存数据的方法
+    fun getCachedApps(): Map<String, AppInfo> {
+        return appInfoCache.toMap()
+    }
+
+    // 【修改】加载函数现在只负责填充缓存
+    suspend fun loadAllInstalledApps(forceRefresh: Boolean = false) {
+        if (appInfoCache.isNotEmpty() && !forceRefresh) {
+            return
         }
         
-        return withContext(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filterNotNull()
                 .mapNotNull { appInfo ->
-                    // 尝试加载应用名和图标
                     try {
-                        // 【修改】创建统一的 AppInfo 对象
-                        // 对于仓库来说，它只负责提供基础信息，策略等配置信息留空或使用默认值
                         AppInfo(
                             packageName = appInfo.packageName,
                             appName = appInfo.loadLabel(packageManager).toString(),
                             icon = appInfo.loadIcon(packageManager),
-                            policy = Policy.STANDARD, // 提供一个默认值
+                            policy = Policy.STANDARD,
                             isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
                         )
                     } catch (e: Exception) {
-                        // 如果某个应用信息加载失败，则跳过
                         null
                     }
                 }
-                .associateBy { it.packageName } // 转换成以包名为key的Map，方便快速查找
+                .associateBy { it.packageName }
             
-            appInfoCache = apps
-            apps
+            // 【修改】填充缓存
+            appInfoCache.clear()
+            appInfoCache.putAll(apps)
+        }
+    }
+
+    // 【新增】单例模式的实现
+    companion object {
+        @Volatile
+        private var INSTANCE: AppInfoRepository? = null
+
+        fun getInstance(context: Context): AppInfoRepository {
+            return INSTANCE ?: synchronized(this) {
+                val instance = AppInfoRepository(context.applicationContext)
+                INSTANCE = instance
+                instance
+            }
         }
     }
 }

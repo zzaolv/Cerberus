@@ -1,10 +1,10 @@
 // daemon/cpp/system_monitor.cpp
-#include "system_monitor.h"
+#include "system_monitor.hh"
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
 #include <chrono>
-#include <unistd.h> // for get_pid_for_package
+#include <unistd.h>
 #include <array>
 #include <memory>
 #include <string>
@@ -16,7 +16,6 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 
-// 【新增】辅助函数：执行shell命令并获取输出
 std::string exec_shell(const char* cmd) {
     std::array<char, 256> buffer;
     std::string result;
@@ -31,9 +30,7 @@ std::string exec_shell(const char* cmd) {
     return result;
 }
 
-// 【新增】辅助函数：通过包名获取主PID
 int get_pid_for_package(const std::string& package_name) {
-    // pidof 是一个很方便的工具
     std::string cmd = "pidof -s " + package_name;
     std::string pid_str = exec_shell(cmd.c_str());
     if (pid_str.empty()) {
@@ -47,13 +44,11 @@ int get_pid_for_package(const std::string& package_name) {
 }
 
 
-SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()) {
-    // 初始读取以填充 prev_ 状态
+SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()), is_first_net_read_(true) { // 【新增】初始化标志位
     update_all_stats();
 }
 
 void SystemMonitor::update_all_stats() {
-    // 这个函数现在是触发所有全局状态更新的入口
     update_cpu_usage();
     update_mem_info();
     update_network_stats();
@@ -64,15 +59,13 @@ GlobalStatsData SystemMonitor::get_stats() const {
     return current_stats_;
 }
 
-// 【新增】获取单个应用统计数据的实现
 AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_name) {
     AppStatsData stats;
     int pid = get_pid_for_package(package_name);
     if (pid <= 0) {
-        return stats; // 进程不存在，返回0
+        return stats;
     }
 
-    // 1. 获取内存使用 (RSS)
     std::string statm_path = "/proc/" + std::to_string(pid) + "/statm";
     std::ifstream statm_file(statm_path);
     if (statm_file.is_open()) {
@@ -81,7 +74,6 @@ AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_na
         stats.mem_usage_kb = resident * sysconf(_SC_PAGESIZE) / 1024;
     }
 
-    // 2. 获取并计算CPU使用率
     std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream stat_file(stat_path);
     if (stat_file.is_open()) {
@@ -89,7 +81,6 @@ AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_na
         std::getline(stat_file, line);
         std::stringstream ss(line);
         std::string value;
-        // 根据 proc(5) man page，utime 是第14个字段，stime 是第15个
         for(int i=0; i<13; ++i) ss >> value; 
         long long utime, stime;
         ss >> utime >> stime;
@@ -102,7 +93,7 @@ AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_na
         if (cpu_state.prev_app_jiffies > 0) {
             long long app_delta = current_app_jiffies - cpu_state.prev_app_jiffies;
             long long total_delta = current_total_jiffies - cpu_state.prev_total_jiffies;
-            if (total_delta > 0) {
+            if (total_delta > 0 && app_delta >= 0) {
                 stats.cpu_usage_percent = 100.0f * static_cast<float>(app_delta) / static_cast<float>(total_delta);
             }
         }
@@ -145,7 +136,7 @@ void SystemMonitor::update_cpu_usage() {
             float cpu_usage = 100.0f * (1.0f - static_cast<float>(delta_idle) / static_cast<float>(delta_total));
             
             std::lock_guard<std::mutex> lock(data_mutex_);
-            current_stats_.total_cpu_usage_percent = cpu_usage > 0.0f ? cpu_usage : 0.0f;
+            current_stats_.total_cpu_usage_percent = cpu_usage >= 0.0f ? cpu_usage : 0.0f;
         }
         prev_cpu_times_ = current_times;
     }
@@ -209,10 +200,15 @@ void SystemMonitor::update_network_stats() {
     auto now = std::chrono::steady_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_net_time_).count();
 
-    if (duration_ms > 0 && prev_total_rx_ > 0) { // prev > 0 ensures this isn't the first run
+    // 【核心修复】使用 is_first_net_read_ 标志位来处理第一次读取
+    if (is_first_net_read_) {
+        is_first_net_read_ = false;
+        // 第一次只记录数据，不计算速度
+    } else if (duration_ms > 100) { // 确保有足够的时间间隔
         long long delta_rx = current_total_rx - prev_total_rx_;
         long long delta_tx = current_total_tx - prev_total_tx_;
 
+        // 只有当流量增量为正时才计算
         long long down_speed = delta_rx >= 0 ? (delta_rx * 8 * 1000 / duration_ms) : 0;
         long long up_speed = delta_tx >= 0 ? (delta_tx * 8 * 1000 / duration_ms) : 0;
 

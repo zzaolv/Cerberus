@@ -6,10 +6,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -31,23 +31,42 @@ import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
-// 顶层 Composable，负责获取 ViewModel 和观察状态
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
-    // 使用 ViewModel Factory 来创建需要 Application Context 的 ViewModel
     viewModel: DashboardViewModel = viewModel(factory = DashboardViewModelFactory(LocalContext.current.applicationContext as Application))
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    var showMenu by remember { mutableStateOf(false) } // 【新增】菜单状态
 
-    // 将 UI 状态传递给纯展示的 Composable
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Cerberus Dashboard") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
+                ),
+                // 【新增】右上角菜单
+                actions = {
+                    Box {
+                        IconButton(onClick = { showMenu = true }) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "更多选项")
+                        }
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
+                                onClick = {
+                                    viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
+                                    showMenu = false
+                                }
+                            )
+                        }
+                    }
+                }
             )
         }
     ) { paddingValues ->
@@ -58,7 +77,6 @@ fun DashboardScreen(
     }
 }
 
-// ViewModel Factory，用于创建 AndroidViewModel
 class DashboardViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(DashboardViewModel::class.java)) {
@@ -69,27 +87,25 @@ class DashboardViewModelFactory(private val application: Application) : ViewMode
     }
 }
 
-// 纯展示的 Content Composable
 @Composable
 fun DashboardContent(uiState: DashboardUiState, modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxSize()) {
         when {
-            uiState.isLoading -> {
-                StatusIndicator("正在连接守护进程并加载应用列表...", showProgress = true)
+            uiState.isLoading || !uiState.appInfoLoaded -> {
+                StatusIndicator("正在连接并加载应用信息...", showProgress = true)
             }
             !uiState.isConnected -> {
-                StatusIndicator("连接守护进程失败！\n请检查模块是否正常运行，并授予Root权限。", showProgress = false)
+                StatusIndicator("连接守护进程失败！\n请检查模块是否正常运行。", showProgress = false)
             }
             else -> {
                 GlobalStatusArea(stats = uiState.globalStats)
                 HorizontalDivider()
-                RuntimeStatusList(apps = uiState.activeApps)
+                // 【修改】使用新的 displayedApps 列表
+                RuntimeStatusList(apps = uiState.displayedApps)
             }
         }
     }
 }
-
-// --- 以下是所有辅助函数 (Helper Composables) ---
 
 @Composable
 fun StatusIndicator(text: String, showProgress: Boolean) {
@@ -117,7 +133,6 @@ fun GlobalStatusArea(stats: GlobalStats) {
         100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
     } else 0.0
 
-    // 【修改】使用驼峰式命名
     val downSpeed = formatSpeed(stats.netDownSpeedBps)
     val upSpeed = formatSpeed(stats.netUpSpeedBps)
 
@@ -141,7 +156,7 @@ fun GlobalStatusArea(stats: GlobalStats) {
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                InfoChip("CPU", "${"%.1f".format(stats.totalCpuUsagePercent)}", "%")
+                InfoChip("CPU", "${"%.1f".format(Locale.US, stats.totalCpuUsagePercent)}", "%")
                 InfoChip("MEM", "${"%.0f".format(memUsedPercent)}", "%")
                 InfoChip("↓", downSpeed.first, downSpeed.second)
                 InfoChip("↑", upSpeed.first, upSpeed.second)
@@ -186,7 +201,7 @@ fun AppStatusCard(app: UiApp) {
                         .crossfade(true)
                         .build(),
                 ),
-                contentDescription = "${app.appInfo?.appName ?: app.runtimeState.packageName} icon",
+                contentDescription = "${app.appInfo?.appName} icon",
                 modifier = Modifier.size(48.dp)
             )
             
@@ -194,19 +209,21 @@ fun AppStatusCard(app: UiApp) {
 
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // 【核心修复】显示应用名，如果为空则显示包名作为后备
+                    val displayName = app.appInfo?.appName ?: app.runtimeState.packageName
                     Text(
-                        text = app.appInfo?.appName ?: app.runtimeState.packageName,
+                        text = displayName,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false) // 避免挤占图标空间
+                        modifier = Modifier.weight(1f, fill = false)
                     )
                     Spacer(Modifier.width(8.dp))
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
                 Text(
-                    text = "MEM: ${app.runtimeState.memUsageKb / 1024}MB | CPU: ${"%.1f".format(app.runtimeState.cpuUsagePercent)}%",
+                    text = "MEM: ${app.runtimeState.memUsageKb / 1024} MB | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -241,8 +258,6 @@ fun AppStatusIndicatorIcons(app: AppRuntimeState) {
     }
 }
 
-// --- 以下是所有辅助函数 (Pure Functions) ---
-
 fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     return when {
         bitsPerSecond < 1000 -> Pair(bitsPerSecond.toString(), "bps")
@@ -259,15 +274,13 @@ fun getStatusText(app: AppRuntimeState): String {
         DisplayStatus.BACKGROUND_ACTIVE -> "后台活动"
         DisplayStatus.BACKGROUND_IDLE -> "后台空闲"
         DisplayStatus.AWAITING_FREEZE -> "等待冻结中"
-        DisplayStatus.FROZEN -> "已冻结 (CGROUP)"
+        DisplayStatus.FROZEN -> "已冻结"
         DisplayStatus.KILLED -> "已结束"
-        DisplayStatus.EXEMPTED -> "自由后台 (已豁免)"
+        DisplayStatus.EXEMPTED -> "自由后台"
         DisplayStatus.UNKNOWN -> "状态未知"
     }
 }
 
-
-// --- 预览区 ---
 @Preview(showBackground = true, widthDp = 360)
 @Composable
 fun DashboardContentPreview() {
@@ -275,33 +288,24 @@ fun DashboardContentPreview() {
         val previewState = DashboardUiState(
             isLoading = false,
             isConnected = true,
+            appInfoLoaded = true,
             globalStats = GlobalStats(
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,
                 availMemKb = 3000000,
-                // 【修改】使用驼峰式命名
-                netDownSpeedBps = 12_582_912, // 12 Mbps
-                netUpSpeedBps = 1_310_720,    // 1.3 Mbps
+                netDownSpeedBps = 12_582_912,
+                netUpSpeedBps = 1_310_720,
                 activeProfileName = "🎮 游戏模式"
             ),
-            activeApps = listOf(
+            displayedApps = listOf(
                 UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, displayStatus = DisplayStatus.FOREGROUND),
-                    // 【修改】使用统一的 AppInfo，icon 为 null
+                    runtimeState = AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, memUsageKb = 512000, displayStatus = DisplayStatus.FOREGROUND),
                     appInfo = AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT, icon = null)
                 ),
                 UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.bilibili.app.in", appName = "哔哩哔哩", isWhitelisted = true, displayStatus = DisplayStatus.EXEMPTED),
+                    runtimeState = AppRuntimeState(packageName = "com.bilibili.app.in", appName = "哔哩哔哩", isWhitelisted = true, memUsageKb = 256000, displayStatus = DisplayStatus.EXEMPTED),
                     appInfo = AppInfo("com.bilibili.app.in", "哔哩哔哩", Policy.STANDARD, icon = null)
-                ),
-                UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.coolapk.market", appName = "酷安", displayStatus = DisplayStatus.AWAITING_FREEZE),
-                    appInfo = AppInfo("com.coolapk.market", "酷安", Policy.STANDARD, icon = null)
-                ),
-                UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.xunmeng.pinduoduo", appName = "拼多多", displayStatus = DisplayStatus.FROZEN),
-                    appInfo = AppInfo("com.xunmeng.pinduoduo", "拼多多", Policy.STRICT, icon = null)
-                ),
+                )
             )
         )
         DashboardContent(uiState = previewState)

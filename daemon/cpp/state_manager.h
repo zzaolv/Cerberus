@@ -1,59 +1,60 @@
-// daemon/cpp/state_manager.h
-#ifndef CERBERUS_STATE_MANAGER_H
-#define CERBERUS_STATE_MANAGER_H
+// daemon/cpp/system_monitor.h
+#ifndef CERBERUS_SYSTEM_MONITOR_H
+#define CERBERUS_SYSTEM_MONITOR_H
 
-#include "database_manager.h"
-#include "system_monitor.h"
-#include "action_executor.h"
-#include <nlohmann/json.hpp>
 #include <string>
-#include <vector>
-#include <map>
-#include <memory>
 #include <mutex>
+#include <map>
 #include <chrono>
 
-struct AppRuntimeState {
-    std::string package_name;
-    std::string app_name;
-    int uid;
+struct GlobalStatsData {
+    float total_cpu_usage_percent = 0.0f;
+    long total_mem_kb = 0;
+    long avail_mem_kb = 0;
+    long long net_down_speed_bps = 0;
+    long long net_up_speed_bps = 0;
+};
 
-    AppConfig config;
-
-    enum class Status {
-        FOREGROUND, BACKGROUND_ACTIVE, BACKGROUND_IDLE, AWAITING_FREEZE, FROZEN, EXEMPTED
-    } current_status = Status::BACKGROUND_IDLE;
-    
-    // 【新增】状态机计时器
-    std::chrono::steady_clock::time_point last_state_change_time;
-
+struct AppStatsData {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
 };
 
-
-class StateManager {
-public:
-    StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
-
-    void update_all_states();
-    nlohmann::json get_dashboard_payload();
-
-    // 【新增】处理来自 Probe 的事件
-    void on_app_killed(const std::string& package_name);
-    void on_app_started(const std::string& package_name);
-
-private:
-    void refresh_installed_apps();
-    void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
-
-    std::shared_ptr<DatabaseManager> db_manager_;
-    std::shared_ptr<SystemMonitor> sys_monitor_;
-    std::shared_ptr<ActionExecutor> action_executor_;
-
-    std::mutex state_mutex_;
-    GlobalStatsData global_stats_;
-    std::map<std::string, AppRuntimeState> managed_apps_;
+struct CpuTimes {
+    long long user = 0, nice = 0, system = 0, idle = 0;
+    long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    long long total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
+    long long idle_total() const { return idle + iowait; }
 };
 
-#endif //CERBERUS_STATE_MANAGER_H
+class SystemMonitor {
+public:
+    SystemMonitor();
+    
+    void update_all_stats();
+    GlobalStatsData get_stats() const;
+    AppStatsData get_app_stats(int uid, const std::string& package_name);
+
+private:
+    void update_cpu_usage();
+    void update_mem_info();
+    void update_network_stats();
+    void update_app_stats(int uid, const std::string& package_name);
+
+    mutable std::mutex data_mutex_;
+    GlobalStatsData current_stats_;
+    CpuTimes prev_cpu_times_;
+
+    long long prev_total_rx_ = 0;
+    long long prev_total_tx_ = 0;
+    std::chrono::steady_clock::time_point prev_net_time_;
+    bool is_first_net_read_; // 【新增】标志位
+
+    struct AppCpuState {
+        long long prev_app_jiffies = 0;
+        long long prev_total_jiffies = 0;
+    };
+    std::map<int, AppCpuState> app_cpu_states_;
+};
+
+#endif //CERBERUS_SYSTEM_MONITOR_H
