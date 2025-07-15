@@ -1,5 +1,6 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
+#include "action_executor.h" // 【核心修复】在这里包含被移除的头文件
 #include <android/log.h>
 #include <cstdio>
 #include <memory>
@@ -11,7 +12,6 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// 【修改】从 SystemMonitor 移动到这里，因为它只在这里被使用
 std::string exec_shell_local(const char* cmd) {
     std::array<char, 256> buffer;
     std::string result;
@@ -46,7 +46,6 @@ void StateManager::refresh_installed_apps() {
     LOGI("Refreshing installed apps list...");
     
     managed_apps_.clear();
-    // 【修改】移除 "-3"，获取所有已安装的应用（包括系统应用），与UI端行为保持一致
     std::string package_list_str = exec_shell_local("pm list packages -U");
 
     std::stringstream ss(package_list_str);
@@ -111,12 +110,10 @@ void StateManager::update_all_states() {
     auto now = std::chrono::steady_clock::now();
     for (auto& [pkg, app] : managed_apps_) {
         
-        // 【核心修复】无论应用处于何种状态，都更新其实时资源占用
         AppStatsData app_stats = sys_monitor_->get_app_stats(app.uid, app.package_name);
         app.cpu_usage_percent = app_stats.cpu_usage_percent;
         app.mem_usage_kb = app_stats.mem_usage_kb;
 
-        // 状态机逻辑
         switch (app.current_status) {
             case AppRuntimeState::Status::BACKGROUND_IDLE: {
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
@@ -171,11 +168,10 @@ nlohmann::json StateManager::get_dashboard_payload() {
     
     json apps_state = json::array();
     for (const auto& [pkg, app] : managed_apps_) {
-        // 只推送有活动或非标准状态的应用，以减少数据量（可选优化）
         if (app.current_status == AppRuntimeState::Status::FOREGROUND || app.mem_usage_kb > 0 || app.current_status != AppRuntimeState::Status::BACKGROUND_IDLE) {
             json app_json;
             app_json["package_name"] = app.package_name;
-            app_json["app_name"] = app.app_name; // 这里的 app_name 仍然是包名，UI 端会替换
+            app_json["app_name"] = app.app_name;
             app_json["display_status"] = status_to_string(app.current_status);
             app_json["active_freeze_mode"] = "CGROUP";
             app_json["mem_usage_kb"] = app.mem_usage_kb;
