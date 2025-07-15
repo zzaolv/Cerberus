@@ -1,5 +1,5 @@
 // daemon/cpp/system_monitor.cpp
-#include "system_monitor.hh"
+#include "system_monitor.h"
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
@@ -44,7 +44,7 @@ int get_pid_for_package(const std::string& package_name) {
 }
 
 
-SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()), is_first_net_read_(true) { // 【新增】初始化标志位
+SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()), is_first_net_read_(true) {
     update_all_stats();
 }
 
@@ -200,15 +200,12 @@ void SystemMonitor::update_network_stats() {
     auto now = std::chrono::steady_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_net_time_).count();
 
-    // 【核心修复】使用 is_first_net_read_ 标志位来处理第一次读取
     if (is_first_net_read_) {
         is_first_net_read_ = false;
-        // 第一次只记录数据，不计算速度
-    } else if (duration_ms > 100) { // 确保有足够的时间间隔
+    } else if (duration_ms > 100) {
         long long delta_rx = current_total_rx - prev_total_rx_;
         long long delta_tx = current_total_tx - prev_total_tx_;
 
-        // 只有当流量增量为正时才计算
         long long down_speed = delta_rx >= 0 ? (delta_rx * 8 * 1000 / duration_ms) : 0;
         long long up_speed = delta_tx >= 0 ? (delta_tx * 8 * 1000 / duration_ms) : 0;
 

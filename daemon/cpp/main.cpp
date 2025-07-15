@@ -1,6 +1,9 @@
 // daemon/cpp/main.cpp
 #include "uds_server.h"
-#include "state_manager.h"
+#include "state_manager.h"    // 【修复】添加缺失的头文件
+#include "system_monitor.h"   // 【修复】添加缺失的头文件
+#include "database_manager.h" // 【修复】添加缺失的头文件
+#include "action_executor.h"  // 【修复】添加缺失的头文件
 #include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
@@ -22,7 +25,7 @@ const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
-std::shared_ptr<SystemMonitor> g_sys_monitor; // 【新增】将 monitor 提升为全局共享
+std::shared_ptr<SystemMonitor> g_sys_monitor;
 std::atomic<bool> g_is_running = true;
 
 void signal_handler(int signum) {
@@ -35,13 +38,11 @@ void monitor_thread() {
     LOGI("Monitor thread started.");
     while (g_is_running) {
         if (g_sys_monitor) {
-            // 【修改】核心修复：每次循环都主动更新所有全局统计数据
             g_sys_monitor->update_all_stats(); 
         }
         if (g_state_manager) {
             g_state_manager->update_all_states();
         }
-        // 监控和状态更新可以频繁一些
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     LOGI("Monitor thread finished.");
@@ -59,7 +60,6 @@ void broadcaster_thread() {
             };
             g_server->broadcast_message(message.dump());
         }
-        // 广播频率可以稍低，减少UI刷新压力
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     LOGI("Broadcaster thread finished.");
@@ -70,7 +70,7 @@ int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v1.3 (Real-Stats-MVP) starting...");
+    LOGI("Cerberus Daemon v1.4 (Build-Fix) starting...");
 
     try {
         if (!std::filesystem::exists(DATA_DIR)) {
@@ -81,12 +81,9 @@ int main() {
         LOGE("Failed to create data directory: %s", e.what());
     }
 
-    // --- 初始化核心组件 ---
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
-    // 【修改】将 monitor 实例化为 g_sys_monitor
     g_sys_monitor = std::make_shared<SystemMonitor>();
     auto action_executor = std::make_shared<ActionExecutor>();
-    // 【修改】传入 g_sys_monitor
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor);
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
     
