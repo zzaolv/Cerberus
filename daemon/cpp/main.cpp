@@ -1,6 +1,7 @@
 #include "uds_server.h"
 #include <android/log.h>
 #include <csignal>
+#include <unistd.h> // <-- 在这里添加头文件
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
