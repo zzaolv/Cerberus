@@ -1,5 +1,4 @@
 // daemon/cpp/uds_server.cpp
-
 #include "uds_server.h"
 #include <android/log.h>
 #include <sys/socket.h>
@@ -9,9 +8,10 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
-#include <cstddef> // For offsetof
+#include <cstddef>
+#include <sys/select.h> // 【新增】
 
-#define LOG_TAG "cerberusd"
+#define LOG_TAG "cerberusd_uds" // 修改日志标签以便区分
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -25,9 +25,15 @@ UdsServer::~UdsServer() {
     }
 }
 
+// 【新增】实现回调设置
+void UdsServer::set_message_handler(std::function<void(const std::string&)> handler) {
+    on_message_received_ = std::move(handler);
+}
+
 void UdsServer::add_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     client_fds_.push_back(client_fd);
+    client_buffers_[client_fd] = ""; // 初始化缓冲区
     LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
 }
 
@@ -36,6 +42,7 @@ void UdsServer::remove_client(int client_fd) {
     auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
     if (it != client_fds_.end()) {
         client_fds_.erase(it, client_fds_.end());
+        client_buffers_.erase(client_fd); // 清理缓冲区
         LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
         close(client_fd);
     }
@@ -52,23 +59,52 @@ void UdsServer::broadcast_message(const std::string& message) {
         ssize_t bytes_sent = send(fd, line.c_str(), line.length(), MSG_NOSIGNAL);
         if (bytes_sent < 0) {
             if (errno == EPIPE || errno == ECONNRESET) {
-                LOGW("Client fd %d write failed (Connection closed), marking for removal.", fd);
                 disconnected_clients.push_back(fd);
-            } else {
-                LOGE("Failed to send to client fd %d: %s", fd, strerror(errno));
             }
         }
     }
 
     if (!disconnected_clients.empty()) {
+        // 在循环外统一移除，避免迭代器失效
         for (int fd : disconnected_clients) {
-             auto it = std::remove(client_fds_.begin(), client_fds_.end(), fd);
-             if (it != client_fds_.end()) {
-                client_fds_.erase(it, client_fds_.end());
+            // 这里只在锁内部调用内部的 remove_client
+            auto it_fds = std::remove(client_fds_.begin(), client_fds_.end(), fd);
+            if (it_fds != client_fds_.end()) {
+                client_fds_.erase(it_fds, client_fds_.end());
+                client_buffers_.erase(fd);
+                LOGI("Client fd %d write failed (Connection closed), removing.", fd);
                 close(fd);
-             }
+            }
         }
-        LOGI("Cleaned up %zu disconnected clients. Current clients: %zu", disconnected_clients.size(), client_fds_.size());
+    }
+}
+
+// 【新增】处理客户端数据的逻辑
+void UdsServer::handle_client_data(int client_fd) {
+    char buffer[4096];
+    ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+    if (bytes_read <= 0) {
+        // 0 表示连接关闭，<0 表示错误
+        remove_client(client_fd);
+        return;
+    }
+
+    buffer[bytes_read] = '\0';
+    
+    // 加锁以保护 client_buffers_
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    client_buffers_[client_fd] += buffer;
+
+    // 处理完整的 JSON Lines
+    size_t pos;
+    while ((pos = client_buffers_[client_fd].find('\n')) != std::string::npos) {
+        std::string message = client_buffers_[client_fd].substr(0, pos);
+        client_buffers_[client_fd].erase(0, pos + 1);
+        
+        if (on_message_received_ && !message.empty()) {
+            on_message_received_(message);
+        }
     }
 }
 
@@ -87,34 +123,30 @@ void UdsServer::stop() {
         close(fd);
     }
     client_fds_.clear();
+    client_buffers_.clear();
     LOGI("All client connections closed.");
 }
 
+// 【核心重写】使用 select() 的非阻塞 I/O 循环
 void UdsServer::run() {
-    LOGI("Attempting to create UDS socket...");
     server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_ == -1) {
         LOGE("Failed to create socket: %s", strerror(errno));
         return;
     }
-    LOGI("Socket created successfully (fd: %d).", server_fd_);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
-
-    // 【核心修复】计算正确的地址长度
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_path_.length() + 1;
 
-    LOGI("Attempting to bind to abstract socket '@%s' with length %d...", socket_path_.c_str(), addr_len);
     if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
         LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
         close(server_fd_);
-        return; // 进程将在此处退出
+        return;
     }
-    LOGI("Socket bound successfully.");
 
     if (listen(server_fd_, 5) == -1) {
         LOGE("Failed to listen on socket: %s", strerror(errno));
@@ -126,16 +158,50 @@ void UdsServer::run() {
     is_running_ = true;
 
     while (is_running_) {
-        LOGI("Waiting for a new client connection...");
-        int client_fd = accept(server_fd_, nullptr, nullptr);
-        if (client_fd == -1) {
-            if (is_running_) {
-                LOGE("Failed to accept connection: %s", strerror(errno));
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd_, &read_fds);
+        int max_fd = server_fd_;
+
+        {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            for (int fd : client_fds_) {
+                FD_SET(fd, &read_fds);
+                if (fd > max_fd) {
+                    max_fd = fd;
+                }
             }
-            continue;
         }
-        add_client(client_fd);
+
+        int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr);
+
+        if (activity < 0 && errno != EINTR) {
+            LOGE("select() error: %s", strerror(errno));
+            break;
+        }
+
+        if (!is_running_) break;
+
+        // 检查是否有新连接
+        if (FD_ISSET(server_fd_, &read_fds)) {
+            int new_socket = accept(server_fd_, nullptr, nullptr);
+            if (new_socket >= 0) {
+                add_client(new_socket);
+            }
+        }
+        
+        // 检查已连接客户端是否有数据
+        std::vector<int> current_clients;
+        {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            current_clients = client_fds_; // 复制一份以安全迭代
+        }
+        for (int fd : current_clients) {
+            if (FD_ISSET(fd, &read_fds)) {
+                handle_client_data(fd);
+            }
+        }
     }
 
-    LOGI("Server accept loop has terminated.");
+    LOGI("Server event loop has terminated.");
 }
