@@ -1,3 +1,4 @@
+// app/src/main/java/com/crfzit/crfzit/data/repository/MockAppRepository.kt
 package com.crfzit.crfzit.data.repository
 
 import com.crfzit.crfzit.data.model.AppInfo
@@ -9,6 +10,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
 class MockAppRepository {
+    // 【修改】修正所有 AppInfo 的实例化
     private val mockApps = mutableListOf(
         AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT),
         AppInfo("com.eg.android.AlipayGphone", "支付宝", Policy.IMPORTANT),

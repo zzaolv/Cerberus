@@ -1,3 +1,4 @@
+// app/src/main/java/com/crfzit/crfzit/data/model/DashboardModels.kt
 package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
@@ -34,6 +35,7 @@ data class GlobalStats(
     val totalMemKb: Long = 0L,
     @SerializedName("avail_mem_kb")
     val availMemKb: Long = 0L,
+    // 【修改】属性名改为驼峰式
     @SerializedName("net_down_speed_bps")
     val netDownSpeedBps: Long = 0L,
     @SerializedName("net_up_speed_bps")

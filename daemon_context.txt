@@ -1,14 +1,13 @@
 daemon/CMakeLists.txt
 ```
-# 启用 C 和 CXX (C++) 语言支持，这是解决链接错误的关键
+# daemon/CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
-project(cerberusd CXX C) 
+project(cerberusd CXX C)
 
 # --- 1. 定义第三方库路径 ---
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
-# --- 2. 构建我们自己提供的 sqlite3 库 ---
-# 因为我们在 project() 中启用了 C 语言，CMake现在知道如何处理这个 .c 文件
+# --- 2. 构建 sqlite3 库 ---
 add_library(sqlite3_lib STATIC ${THIRDPARTY_DIR}/sqlite3/sqlite3.c)
 target_include_directories(sqlite3_lib PUBLIC ${THIRDPARTY_DIR}/sqlite3)
 
@@ -23,18 +22,22 @@ add_library(sqlitecpp_lib STATIC
     ${THIRDPARTY_DIR}/sqlitecpp/src/Transaction.cpp
 )
 target_include_directories(sqlitecpp_lib PUBLIC ${THIRDPARTY_DIR}/sqlitecpp/include)
-target_link_libraries(sqlitecpp_lib PUBLIC sqlite3_lib) # 链接 sqlite3
+target_link_libraries(sqlitecpp_lib PUBLIC sqlite3_lib)
 
 # --- 4. 定义最终的可执行文件 ---
+# 【核心修改】添加新的源文件
 add_executable(cerberusd
     cpp/main.cpp
     cpp/uds_server.cpp
+    cpp/system_monitor.cpp
+    cpp/database_manager.cpp
+    cpp/state_manager.cpp
+    cpp/action_executor.cpp
 )
 
 # --- 5. 添加头文件搜索路径 ---
 target_include_directories(cerberusd PRIVATE
     ${THIRDPARTY_DIR}/nlohmann_json/include
-    # SQLiteCpp 的头文件已经通过 sqlitecpp_lib 传递，这里无需重复
 )
 
 # --- 6. 链接最终的可执行文件 ---
@@ -48,14 +51,295 @@ target_link_libraries(cerberusd
 set_target_properties(cerberusd PROPERTIES CXX_STANDARD 17)
 ```
 
+daemon/cpp/action_executor.cpp
+```
+// daemon/cpp/action_executor.cpp
+#include "action_executor.h"
+#include <android/log.h>
+#include <sys/stat.h>
+#include <fstream>
+#include <filesystem> // C++17
+#include <unistd.h>
+
+#define LOG_TAG "cerberusd_action"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace fs = std::filesystem;
+
+std::string ActionExecutor::get_freezer_path() {
+    // Android P and later use /acct
+    if (access("/acct/uid_0/cgroup.procs", F_OK) == 0) {
+        return "/acct";
+    }
+    // Older versions might use /dev/cpuctl
+    if (access("/dev/cpuctl/tasks", F_OK) == 0) {
+        return "/dev/cpuctl";
+    }
+    return ""; // Not found
+}
+
+bool ActionExecutor::write_to_cgroup(const std::string& path, const std::string& value) {
+    std::ofstream ofs(path);
+    if (!ofs.is_open()) {
+        LOGE("Failed to open cgroup file: %s. Error: %s", path.c_str(), strerror(errno));
+        return false;
+    }
+    ofs << value;
+    if (ofs.fail()) {
+        LOGE("Failed to write '%s' to %s. Error: %s", value.c_str(), path.c_str(), strerror(errno));
+        return false;
+    }
+    ofs.close();
+    return true;
+}
+
+std::vector<int> ActionExecutor::get_pids_for_uid(int uid) {
+    std::vector<int> pids;
+    std::string uid_str = std::to_string(uid);
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        
+        struct stat st;
+        if (stat(entry.path().c_str(), &st) == 0 && st.st_uid == uid) {
+            try {
+                pids.push_back(std::stoi(entry.path().filename().string()));
+            } catch (const std::invalid_argument&) {
+                // Ignore non-numeric directory names like 'self', 'thread-self'
+            }
+        }
+    }
+    return pids;
+}
+
+
+bool ActionExecutor::freeze_uid(int uid) {
+    LOGI("Attempting to FREEZE uid %d", uid);
+    std::string freezer_base_path = get_freezer_path();
+    if (freezer_base_path.empty()) {
+        LOGE("cgroup freezer path not found, cannot freeze.");
+        return false;
+    }
+
+    std::string freezer_path = freezer_base_path + "/uid_" + std::to_string(uid) + "/freezer.state";
+    if (access(freezer_path.c_str(), F_OK) != 0) {
+        LOGW("Freezer path %s not found. Freezing via PIDs.", freezer_path.c_str());
+        // Fallback: If UID-based cgroup doesn't exist, try freezing individual PIDs
+        auto pids = get_pids_for_uid(uid);
+        if (pids.empty()) {
+            LOGW("No PIDs found for UID %d, freeze operation skipped.", uid);
+            return true; // No processes to freeze
+        }
+        for (int pid : pids) {
+            std::string pid_cgroup_tasks = freezer_base_path + "/tasks";
+             if(!write_to_cgroup(pid_cgroup_tasks, std::to_string(pid))){
+                 // Logged inside write_to_cgroup
+             }
+        }
+        return write_to_cgroup(freezer_base_path + "/freezer.state", "FROZEN");
+    }
+
+    return write_to_cgroup(freezer_path, "FROZEN");
+}
+
+bool ActionExecutor::unfreeze_uid(int uid) {
+    LOGI("Attempting to UNFREEZE uid %d", uid);
+    std::string freezer_base_path = get_freezer_path();
+    if (freezer_base_path.empty()) {
+        LOGE("cgroup freezer path not found, cannot unfreeze.");
+        return false;
+    }
+
+    std::string freezer_path = freezer_base_path + "/uid_" + std::to_string(uid) + "/freezer.state";
+    if (access(freezer_path.c_str(), F_OK) != 0) {
+         LOGW("Freezer path %s not found. Unfreezing root cgroup.", freezer_path.c_str());
+         return write_to_cgroup(freezer_base_path + "/freezer.state", "THAWED");
+    }
+    
+    return write_to_cgroup(freezer_path, "THAWED");
+}
+```
+
+daemon/cpp/action_executor.h
+```
+// daemon/cpp/action_executor.h
+#ifndef CERBERUS_ACTION_EXECUTOR_H
+#define CERBERUS_ACTION_EXECUTOR_H
+
+#include <string>
+#include <vector>
+
+class ActionExecutor {
+public:
+    // 获取设备上 cgroup v1 freezer 的基路径
+    static std::string get_freezer_path();
+    
+    // 冻结指定UID的所有进程
+    bool freeze_uid(int uid);
+    // 解冻指定UID的所有进程
+    bool unfreeze_uid(int uid);
+
+private:
+    bool write_to_cgroup(const std::string& path, const std::string& value);
+    std::vector<int> get_pids_for_uid(int uid);
+};
+
+#endif //CERBERUS_ACTION_EXECUTOR_H
+```
+
+daemon/cpp/database_manager.cpp
+```
+// daemon/cpp/database_manager.cpp
+#include "database_manager.h"
+#include <android/log.h>
+
+#define LOG_TAG "cerberusd_db"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+DatabaseManager::DatabaseManager(const std::string& db_path)
+    : db_(db_path, SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE) {
+    LOGI("Database opened at %s", db_path.c_str());
+    initialize_database();
+}
+
+void DatabaseManager::initialize_database() {
+    try {
+        if (!db_.tableExists("app_policies")) {
+            LOGI("Table 'app_policies' does not exist. Creating it.");
+            db_.exec(R"(
+                CREATE TABLE app_policies (
+                    package_name TEXT PRIMARY KEY,
+                    policy INTEGER NOT NULL DEFAULT 2,
+                    force_playback_exempt INTEGER NOT NULL DEFAULT 0,
+                    force_network_exempt INTEGER NOT NULL DEFAULT 0
+                )
+            )");
+        }
+    } catch (const std::exception& e) {
+        LOGE("Database initialization failed: %s", e.what());
+    }
+}
+
+std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
+    try {
+        SQLite::Statement query(db_, "SELECT policy, force_playback_exempt, force_network_exempt FROM app_policies WHERE package_name = ?");
+        query.bind(1, package_name);
+
+        if (query.executeStep()) {
+            AppConfig config;
+            config.package_name = package_name;
+            config.policy = static_cast<AppPolicy>(query.getColumn(0).getInt());
+            config.force_playback_exempt = query.getColumn(1).getInt();
+            config.force_network_exempt = query.getColumn(2).getInt();
+            return config;
+        }
+    } catch (const std::exception& e) {
+        LOGE("Failed to get app config for %s: %s", package_name.c_str(), e.what());
+    }
+    return std::nullopt;
+}
+
+bool DatabaseManager::set_app_config(const AppConfig& config) {
+    try {
+        SQLite::Statement query(db_, R"(
+            INSERT INTO app_policies (package_name, policy, force_playback_exempt, force_network_exempt)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(package_name) DO UPDATE SET
+            policy = excluded.policy,
+            force_playback_exempt = excluded.force_playback_exempt,
+            force_network_exempt = excluded.force_network_exempt
+        )");
+        query.bind(1, config.package_name);
+        query.bind(2, static_cast<int>(config.policy));
+        query.bind(3, static_cast<int>(config.force_playback_exempt));
+        query.bind(4, static_cast<int>(config.force_network_exempt));
+        query.exec();
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("Failed to update app config for %s: %s", config.package_name.c_str(), e.what());
+        return false;
+    }
+}
+
+std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
+    std::vector<AppConfig> configs;
+    try {
+        SQLite::Statement query(db_, "SELECT package_name, policy, force_playback_exempt, force_network_exempt FROM app_policies");
+        while (query.executeStep()) {
+            AppConfig config;
+            config.package_name = query.getColumn(0).getString();
+            config.policy = static_cast<AppPolicy>(query.getColumn(1).getInt());
+            config.force_playback_exempt = query.getColumn(2).getInt();
+            config.force_network_exempt = query.getColumn(3).getInt();
+            configs.push_back(config);
+        }
+    } catch (const std::exception& e) {
+        LOGE("Failed to get all app configs: %s", e.what());
+    }
+    return configs;
+}
+```
+
+daemon/cpp/database_manager.h
+```
+// daemon/cpp/database_manager.h
+#ifndef CERBERUS_DATABASE_MANAGER_H
+#define CERBERUS_DATABASE_MANAGER_H
+
+#include <string>
+#include <vector>
+#include <optional>
+#include <SQLiteCpp/Database.h>
+#include <SQLiteCpp/Statement.h>
+#include <SQLiteCpp/Transaction.h>
+
+// 对应文档中的应用策略 (Policy Tiers)
+enum class AppPolicy {
+    EXEMPTED = 0,   // 自由后台
+    IMPORTANT = 1,  // 重要
+    STANDARD = 2,   // 智能
+    STRICT = 3      // 严格
+};
+
+// 应用的持久化配置
+struct AppConfig {
+    std::string package_name;
+    AppPolicy policy = AppPolicy::STANDARD;
+    bool force_playback_exempt = false;
+    bool force_network_exempt = false;
+};
+
+class DatabaseManager {
+public:
+    explicit DatabaseManager(const std::string& db_path);
+
+    std::optional<AppConfig> get_app_config(const std::string& package_name);
+    bool set_app_config(const AppConfig& config);
+    std::vector<AppConfig> get_all_app_configs();
+
+private:
+    void initialize_database();
+    SQLite::Database db_;
+};
+
+#endif //CERBERUS_DATABASE_MANAGER_H
+```
+
 daemon/cpp/main.cpp
 ```
+// daemon/cpp/main.cpp
 #include "uds_server.h"
-#include "nlohmann/json.hpp"
+#include "state_manager.h"
+#include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
 #include <thread>
 #include <chrono>
+#include <memory>
+#include <atomic>
+#include <filesystem>
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -64,77 +348,549 @@ daemon/cpp/main.cpp
 using json = nlohmann::json;
 
 const std::string SOCKET_NAME = "cerberus_socket";
+const std::string DATA_DIR = "/data/adb/cerberus";
+const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 
-std::unique_ptr<UdsServer> g_server = nullptr;
+std::unique_ptr<UdsServer> g_server;
+std::shared_ptr<StateManager> g_state_manager;
 std::atomic<bool> g_is_running = true;
 
-// 信号处理函数，保持不变
 void signal_handler(int signum) {
-    LOGI("Caught signal %d, shutting down...", signum);
+    LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
-    if (g_server) {
-        g_server->stop();
-    }
+    if (g_server) g_server->stop();
 }
+
+void monitor_thread() {
+    LOGI("Monitor thread started.");
+    while (g_is_running) {
+        if (g_state_manager) {
+            // 这个函数现在包含了状态机逻辑
+            g_state_manager->update_all_states();
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    LOGI("Monitor thread finished.");
+}
+
+void broadcaster_thread() {
+    LOGI("Broadcaster thread started.");
+    while (g_is_running) {
+        if (g_server && g_state_manager) {
+            json payload = g_state_manager->get_dashboard_payload();
+            json message = {
+                {"v", 1},
+                {"type", "stream.dashboard_update"},
+                {"payload", payload}
+            };
+            g_server->broadcast_message(message.dump());
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    LOGI("Broadcaster thread finished.");
+}
+
 
 int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v1.1 (Thread-Safe) starting...");
+    LOGI("Cerberus Daemon v1.2 (StateMachine-MVP) starting...");
 
+    try {
+        if (!std::filesystem::exists(DATA_DIR)) {
+            std::filesystem::create_directories(DATA_DIR);
+            LOGI("Created data directory: %s", DATA_DIR.c_str());
+        }
+    } catch(const std::filesystem::filesystem_error& e) {
+        LOGE("Failed to create data directory: %s", e.what());
+    }
+
+    // --- 初始化核心组件 ---
+    auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
+    auto sys_monitor = std::make_shared<SystemMonitor>();
+    auto action_executor = std::make_shared<ActionExecutor>(); // 【新增】
+    g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor); // 【注入】
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
-
-    // 1. 将服务器的accept循环放在一个专门的子线程中
-    std::thread server_thread([&]() {
-        LOGI("Server thread started, entering accept loop.");
-        g_server->run();
-        LOGI("Server thread finished.");
-    });
-
-    LOGI("Main thread is starting broadcast loop.");
-    // 2. 主线程负责数据生成和广播
-    while (g_is_running) {
-        // --- 创建模拟的仪表盘数据 ---
-        json payload;
-        payload["global_stats"] = {
-            {"total_cpu_usage_percent", 15.0 + (rand() % 10)},
-            {"total_mem_kb", 8 * 1024 * 1024},
-            {"avail_mem_kb", (4 + (rand() % 2)) * 1024 * 1024},
-            {"net_down_speed_bps", (long)(rand() % 100000)},
-            {"net_up_speed_bps", (long)(rand() % 50000)},
-            {"active_profile_name", "常规模式"}
-        };
-        payload["apps_runtime_state"] = json::array({
-            {{"package_name", "com.fake.app1"}, {"app_name", "模拟应用A"}, {"display_status", "FOREGROUND"}, {"mem_usage_kb", 150*1024}, {"cpu_usage_percent", 25.5f}, {"is_foreground", true}},
-            {{"package_name", "com.fake.app2"}, {"app_name", "模拟应用B"}, {"display_status", "FROZEN"}, {"active_freeze_mode", "CGROUP"}, {"mem_usage_kb", 50*1024}, {"cpu_usage_percent", 0.1f}, {"is_foreground", false}}
-        });
-
-        json message = {
-            {"v", 1},
-            {"type", "stream.dashboard_update"},
-            {"payload", payload}
-        };
-        
-        // 广播消息
-        g_server->broadcast_message(message.dump());
-        
-        // 每2秒广播一次
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
     
-    // 等待服务器线程结束
-    if (server_thread.joinable()) {
-        server_thread.join();
-    }
+    std::thread monitor(monitor_thread);
+    std::thread broadcaster(broadcaster_thread);
+
+    LOGI("Main thread starting UDS server loop...");
+    g_server->run();
+
+    LOGI("UDS server loop has finished. Cleaning up threads...");
+    g_is_running = false;
+    if (monitor.joinable()) monitor.join();
+    if (broadcaster.joinable()) broadcaster.join();
     
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;
 }
 ```
 
+daemon/cpp/state_manager.cpp
+```
+// daemon/cpp/state_manager.cpp
+#include "state_manager.h"
+#include <android/log.h>
+#include <cstdio>
+#include <memory>
+#include <array>
+#include <sstream>
+
+#define LOG_TAG "cerberusd_state"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+std::string exec_shell(const char* cmd) {
+    std::array<char, 256> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) {
+        LOGE("popen() failed!");
+        return "";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
+StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor)
+    : db_manager_(std::move(db_manager)), 
+      sys_monitor_(std::move(sys_monitor)),
+      action_executor_(std::move(action_executor)) {
+    LOGI("StateManager initialized.");
+    refresh_installed_apps();
+}
+
+void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status) {
+    if (app.current_status == new_status) return;
+    // TODO: Add logging for state transitions
+    app.current_status = new_status;
+    app.last_state_change_time = std::chrono::steady_clock::now();
+}
+
+void StateManager::refresh_installed_apps() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    LOGI("Refreshing installed apps list...");
+    
+    managed_apps_.clear();
+    std::string package_list_str = exec_shell("pm list packages -U -3");
+
+    std::stringstream ss(package_list_str);
+    std::string line;
+    while (std::getline(ss, line, '\n')) {
+        size_t pkg_pos = line.find("package:");
+        size_t uid_pos = line.find(" uid:");
+        if (uid_pos == std::string::npos || pkg_pos == std::string::npos) continue;
+
+        std::string package_name = line.substr(pkg_pos + 8, uid_pos - (pkg_pos + 8));
+        
+        AppRuntimeState app_state;
+        app_state.package_name = package_name;
+        app_state.app_name = package_name; 
+        app_state.uid = std::stoi(line.substr(uid_pos + 5));
+        
+        auto config_opt = db_manager_->get_app_config(package_name);
+        if (config_opt) {
+            app_state.config = *config_opt;
+        } else {
+            app_state.config.package_name = package_name;
+            db_manager_->set_app_config(app_state.config);
+        }
+        
+        transition_state(app_state, (app_state.config.policy == AppPolicy::EXEMPTED)
+                                    ? AppRuntimeState::Status::EXEMPTED
+                                    : AppRuntimeState::Status::BACKGROUND_IDLE);
+        
+        managed_apps_[package_name] = app_state;
+    }
+    LOGI("Found %zu third-party apps.", managed_apps_.size());
+}
+
+// 【新增】处理来自 Probe 的事件
+void StateManager::on_app_killed(const std::string& package_name) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto it = managed_apps_.find(package_name);
+    if (it != managed_apps_.end()) {
+        LOGI("Event: App %s killed. Transitioning to BACKGROUND_IDLE.", package_name.c_str());
+        // 任何时候进程被杀，都重置回后台空闲状态
+        transition_state(it->second, AppRuntimeState::Status::BACKGROUND_IDLE);
+    }
+}
+void StateManager::on_app_started(const std::string& package_name) {
+     std::lock_guard<std::mutex> lock(state_mutex_);
+    auto it = managed_apps_.find(package_name);
+    if (it != managed_apps_.end()) {
+        LOGI("Event: App %s started. Transitioning to FOREGROUND.", package_name.c_str());
+        if(it->second.current_status == AppRuntimeState::Status::FROZEN){
+            action_executor_->unfreeze_uid(it->second.uid);
+        }
+        transition_state(it->second, AppRuntimeState::Status::FOREGROUND);
+    }
+}
+
+void StateManager::update_all_states() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    global_stats_ = sys_monitor_->get_stats();
+
+    auto now = std::chrono::steady_clock::now();
+    for (auto& [pkg, app] : managed_apps_) {
+        // 【核心】状态机逻辑
+        switch (app.current_status) {
+            case AppRuntimeState::Status::BACKGROUND_IDLE: {
+                auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                // 简化：后台空闲超过 15 秒就准备冻结
+                if (elapsed_seconds > 15) {
+                    LOGI("State transition: %s from BACKGROUND_IDLE to AWAITING_FREEZE (timeout).", app.package_name.c_str());
+                    transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
+                }
+                break;
+            }
+            case AppRuntimeState::Status::AWAITING_FREEZE: {
+                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                // 等待期 5 秒
+                 if (elapsed_seconds > 5) {
+                    if (action_executor_->freeze_uid(app.uid)) {
+                        LOGI("State transition: %s from AWAITING_FREEZE to FROZEN (action success).", app.package_name.c_str());
+                        transition_state(app, AppRuntimeState::Status::FROZEN);
+                    } else {
+                        LOGW("Freeze action failed for %s. Reverting to BACKGROUND_IDLE.", app.package_name.c_str());
+                        transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
+                    }
+                 }
+                break;
+            }
+            // 其他状态...
+            default:
+                break;
+        }
+    }
+}
+
+std::string status_to_string(AppRuntimeState::Status status) {
+    switch (status) {
+        case AppRuntimeState::Status::FOREGROUND: return "FOREGROUND";
+        case AppRuntimeState::Status::BACKGROUND_ACTIVE: return "BACKGROUND_ACTIVE";
+        case AppRuntimeState::Status::BACKGROUND_IDLE: return "BACKGROUND_IDLE";
+        case AppRuntimeState::Status::AWAITING_FREEZE: return "AWAITING_FREEZE";
+        case AppRuntimeState::Status::FROZEN: return "FROZEN";
+        case AppRuntimeState::Status::EXEMPTED: return "EXEMPTED";
+    }
+    return "UNKNOWN";
+}
+
+nlohmann::json StateManager::get_dashboard_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    using json = nlohmann::json;
+
+    json payload;
+    payload["global_stats"] = {
+        {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent},
+        {"total_mem_kb", global_stats_.total_mem_kb},
+        {"avail_mem_kb", global_stats_.avail_mem_kb},
+        {"net_down_speed_bps", global_stats_.net_down_speed_bps},
+        {"net_up_speed_bps", global_stats_.net_up_speed_bps},
+        {"active_profile_name", "⚡️ 省电模式"}
+    };
+    
+    json apps_state = json::array();
+    for (const auto& [pkg, app] : managed_apps_) {
+        json app_json;
+        app_json["package_name"] = app.package_name;
+        // Daemon 不再负责应用名
+        app_json["app_name"] = app.package_name;
+        app_json["display_status"] = status_to_string(app.current_status);
+        app_json["active_freeze_mode"] = "CGROUP";
+        app_json["mem_usage_kb"] = app.mem_usage_kb;
+        app_json["cpu_usage_percent"] = app.cpu_usage_percent;
+        app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
+        app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
+        apps_state.push_back(app_json);
+    }
+    payload["apps_runtime_state"] = apps_state;
+    return payload;
+}
+```
+
+daemon/cpp/state_manager.h
+```
+// daemon/cpp/state_manager.h
+#ifndef CERBERUS_STATE_MANAGER_H
+#define CERBERUS_STATE_MANAGER_H
+
+#include "database_manager.h"
+#include "system_monitor.h"
+#include "action_executor.h"
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <chrono>
+
+struct AppRuntimeState {
+    std::string package_name;
+    std::string app_name;
+    int uid;
+
+    AppConfig config;
+
+    enum class Status {
+        FOREGROUND, BACKGROUND_ACTIVE, BACKGROUND_IDLE, AWAITING_FREEZE, FROZEN, EXEMPTED
+    } current_status = Status::BACKGROUND_IDLE;
+    
+    // 【新增】状态机计时器
+    std::chrono::steady_clock::time_point last_state_change_time;
+
+    float cpu_usage_percent = 0.0f;
+    long mem_usage_kb = 0;
+};
+
+
+class StateManager {
+public:
+    StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
+
+    void update_all_states();
+    nlohmann::json get_dashboard_payload();
+
+    // 【新增】处理来自 Probe 的事件
+    void on_app_killed(const std::string& package_name);
+    void on_app_started(const std::string& package_name);
+
+private:
+    void refresh_installed_apps();
+    void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
+
+    std::shared_ptr<DatabaseManager> db_manager_;
+    std::shared_ptr<SystemMonitor> sys_monitor_;
+    std::shared_ptr<ActionExecutor> action_executor_;
+
+    std::mutex state_mutex_;
+    GlobalStatsData global_stats_;
+    std::map<std::string, AppRuntimeState> managed_apps_;
+};
+
+#endif //CERBERUS_STATE_MANAGER_H
+```
+
+daemon/cpp/system_monitor.cpp
+```
+// daemon/cpp/system_monitor.cpp
+#include "system_monitor.h"
+#include <fstream>
+#include <sstream>
+#include <android/log.h>
+#include <chrono>
+
+#define LOG_TAG "cerberusd_monitor"
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+
+SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()) {
+    // Initial read to populate prev_ states
+    update_all_stats();
+}
+
+void SystemMonitor::update_all_stats() {
+    update_cpu_usage();
+    update_mem_info();
+    update_network_stats();
+}
+
+GlobalStatsData SystemMonitor::get_stats() const {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    return current_stats_;
+}
+
+void SystemMonitor::update_cpu_usage() {
+    std::ifstream stat_file("/proc/stat");
+    if (!stat_file.is_open()) {
+        LOGW("Failed to open /proc/stat");
+        return;
+    }
+
+    std::string line;
+    std::getline(stat_file, line);
+    stat_file.close();
+
+    std::string cpu_label;
+    CpuTimes current_times;
+    std::stringstream ss(line);
+    ss >> cpu_label >> current_times.user >> current_times.nice >> current_times.system >> current_times.idle
+       >> current_times.iowait >> current_times.irq >> current_times.softirq >> current_times.steal;
+
+    if (cpu_label == "cpu") {
+        long long prev_total = prev_cpu_times_.total();
+        long long current_total = current_times.total();
+        long long delta_total = current_total - prev_total;
+
+        if (delta_total > 0) {
+            long long prev_idle = prev_cpu_times_.idle_total();
+            long long current_idle = current_times.idle_total();
+            long long delta_idle = current_idle - prev_idle;
+            
+            float cpu_usage = 100.0f * (1.0f - static_cast<float>(delta_idle) / static_cast<float>(delta_total));
+            
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            current_stats_.total_cpu_usage_percent = cpu_usage > 0.0f ? cpu_usage : 0.0f;
+        }
+        prev_cpu_times_ = current_times;
+    }
+}
+
+void SystemMonitor::update_mem_info() {
+    std::ifstream meminfo_file("/proc/meminfo");
+    if (!meminfo_file.is_open()) {
+        LOGW("Failed to open /proc/meminfo");
+        return;
+    }
+
+    std::string line;
+    long mem_total = 0, mem_available = 0;
+
+    while (std::getline(meminfo_file, line)) {
+        std::string key;
+        long value;
+        std::stringstream ss(line);
+        ss >> key >> value;
+        if (key == "MemTotal:") {
+            mem_total = value;
+        } else if (key == "MemAvailable:") {
+            mem_available = value;
+        }
+        if (mem_total > 0 && mem_available > 0) {
+            break;
+        }
+    }
+    meminfo_file.close();
+
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    current_stats_.total_mem_kb = mem_total;
+    current_stats_.avail_mem_kb = mem_available;
+}
+
+void SystemMonitor::update_network_stats() {
+    std::ifstream net_stats_file("/proc/net/xt_qtaguid/stats");
+    if (!net_stats_file.is_open()) {
+        // This file might not exist on all devices or might require special permission.
+        // LOGW("Failed to open /proc/net/xt_qtaguid/stats");
+        return;
+    }
+
+    long long current_total_rx = 0;
+    long long current_total_tx = 0;
+
+    std::string line;
+    // Skip header line
+    std::getline(net_stats_file, line); 
+
+    while (std::getline(net_stats_file, line)) {
+        std::string iface, tag_hex;
+        int idx, uid, cnt_set;
+        long long rx_bytes, tx_bytes;
+        // We only need a few columns
+        std::stringstream ss(line);
+        ss >> idx >> iface >> tag_hex >> uid >> cnt_set >> rx_bytes >> line >> tx_bytes;
+        
+        // We sum up all traffic for total speed
+        current_total_rx += rx_bytes;
+        current_total_tx += tx_bytes;
+    }
+    net_stats_file.close();
+
+    auto now = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_net_time_).count();
+
+    if (duration_ms > 0) {
+        long long delta_rx = current_total_rx - prev_total_rx_;
+        long long delta_tx = current_total_tx - prev_total_tx_;
+
+        // Convert to bits per second (bytes * 8 * 1000 / ms)
+        long long down_speed = delta_rx > 0 ? (delta_rx * 8 * 1000 / duration_ms) : 0;
+        long long up_speed = delta_tx > 0 ? (delta_tx * 8 * 1000 / duration_ms) : 0;
+
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        current_stats_.net_down_speed_bps = down_speed;
+        current_stats_.net_up_speed_bps = up_speed;
+    }
+
+    prev_total_rx_ = current_total_rx;
+    prev_total_tx_ = current_total_tx;
+    prev_net_time_ = now;
+}
+```
+
+daemon/cpp/system_monitor.h
+```
+// daemon/cpp/system_monitor.h
+#ifndef CERBERUS_SYSTEM_MONITOR_H
+#define CERBERUS_SYSTEM_MONITOR_H
+
+#include <string>
+#include <mutex>
+#include <map>
+
+struct GlobalStatsData {
+    float total_cpu_usage_percent = 0.0f;
+    long total_mem_kb = 0;
+    long avail_mem_kb = 0;
+    // 【新增】网络速度
+    long long net_down_speed_bps = 0;
+    long long net_up_speed_bps = 0;
+};
+
+struct CpuTimes {
+    long long user = 0, nice = 0, system = 0, idle = 0;
+    long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    long long total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
+    long long idle_total() const { return idle + iowait; }
+};
+
+// 【新增】网络流量数据结构
+struct NetworkUsage {
+    long long rx_bytes = 0;
+    long long tx_bytes = 0;
+};
+
+class SystemMonitor {
+public:
+    SystemMonitor();
+    // 修改为 const 方法
+    GlobalStatsData get_stats() const;
+    void update_all_stats();
+
+private:
+    void update_cpu_usage();
+    void update_mem_info();
+    void update_network_stats();
+
+    // 改为 mutable 以便在 const 方法中加锁
+    mutable std::mutex data_mutex_;
+    GlobalStatsData current_stats_;
+
+    // For CPU usage calculation
+    CpuTimes prev_cpu_times_;
+
+    // 【新增】For network usage calculation
+    std::map<int, NetworkUsage> prev_network_usage_;
+    long long prev_total_rx_ = 0;
+    long long prev_total_tx_ = 0;
+    std::chrono::steady_clock::time_point prev_net_time_;
+};
+
+#endif //CERBERUS_SYSTEM_MONITOR_H
+```
+
 daemon/cpp/uds_server.cpp
 ```
+// daemon/cpp/uds_server.cpp
+
 #include "uds_server.h"
 #include <android/log.h>
 #include <sys/socket.h>
@@ -144,6 +900,7 @@ daemon/cpp/uds_server.cpp
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <cstddef> // For offsetof
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -154,7 +911,9 @@ UdsServer::UdsServer(const std::string& socket_path)
     : socket_path_(socket_path), server_fd_(-1), is_running_(false) {}
 
 UdsServer::~UdsServer() {
-    stop();
+    if (is_running_) {
+        stop();
+    }
 }
 
 void UdsServer::add_client(int client_fd) {
@@ -177,16 +936,14 @@ void UdsServer::broadcast_message(const std::string& message) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     if (client_fds_.empty()) return;
 
-    // JSON Lines 协议要求每条消息以换行符结尾
     std::string line = message + "\n";
     std::vector<int> disconnected_clients;
 
     for (int fd : client_fds_) {
         ssize_t bytes_sent = send(fd, line.c_str(), line.length(), MSG_NOSIGNAL);
         if (bytes_sent < 0) {
-            // EPIPE 表示客户端已关闭连接
             if (errno == EPIPE || errno == ECONNRESET) {
-                LOGW("Client fd %d write failed (EPIPE/ECONNRESET), marking for removal.", fd);
+                LOGW("Client fd %d write failed (Connection closed), marking for removal.", fd);
                 disconnected_clients.push_back(fd);
             } else {
                 LOGE("Failed to send to client fd %d: %s", fd, strerror(errno));
@@ -194,16 +951,22 @@ void UdsServer::broadcast_message(const std::string& message) {
         }
     }
 
-    // 从主列表移除已断开的客户端
-    for (int fd : disconnected_clients) {
-        // 这里不加锁，因为 remove_client 内部会加锁
-        // 为了避免死锁，创建一个临时副本来迭代
-        remove_client(fd);
+    if (!disconnected_clients.empty()) {
+        for (int fd : disconnected_clients) {
+             auto it = std::remove(client_fds_.begin(), client_fds_.end(), fd);
+             if (it != client_fds_.end()) {
+                client_fds_.erase(it, client_fds_.end());
+                close(fd);
+             }
+        }
+        LOGI("Cleaned up %zu disconnected clients. Current clients: %zu", disconnected_clients.size(), client_fds_.size());
     }
 }
 
 void UdsServer::stop() {
+    LOGI("Stopping UDS server...");
     is_running_ = false;
+
     if (server_fd_ != -1) {
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
@@ -215,27 +978,34 @@ void UdsServer::stop() {
         close(fd);
     }
     client_fds_.clear();
+    LOGI("All client connections closed.");
 }
 
 void UdsServer::run() {
-    server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    LOGI("Attempting to create UDS socket...");
+    server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_ == -1) {
         LOGE("Failed to create socket: %s", strerror(errno));
         return;
     }
+    LOGI("Socket created successfully (fd: %d).", server_fd_);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 使用抽象命名空间，第一个字节必须是 \0
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
 
-    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+    // 【核心修复】计算正确的地址长度
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_path_.length() + 1;
+
+    LOGI("Attempting to bind to abstract socket '@%s' with length %d...", socket_path_.c_str(), addr_len);
+    if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
         LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
         close(server_fd_);
-        return;
+        return; // 进程将在此处退出
     }
+    LOGI("Socket bound successfully.");
 
     if (listen(server_fd_, 5) == -1) {
         LOGE("Failed to listen on socket: %s", strerror(errno));
@@ -247,16 +1017,18 @@ void UdsServer::run() {
     is_running_ = true;
 
     while (is_running_) {
+        LOGI("Waiting for a new client connection...");
         int client_fd = accept(server_fd_, nullptr, nullptr);
         if (client_fd == -1) {
-            if (is_running_) { // 如果不是主动停止，就报错
+            if (is_running_) {
                 LOGE("Failed to accept connection: %s", strerror(errno));
             }
             continue;
         }
         add_client(client_fd);
-        // 我们不为每个客户端创建读线程，因为当前阶段只关心广播
     }
+
+    LOGI("Server accept loop has terminated.");
 }
 ```
 

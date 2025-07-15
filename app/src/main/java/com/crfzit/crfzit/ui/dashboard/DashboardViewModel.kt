@@ -16,33 +16,30 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 
-// 【修改】合并后的UI状态，包含静态的应用信息
 data class UiApp(
     val runtimeState: AppRuntimeState,
-    val appInfo: AppInfo? // 可能为null，如果某个包名没有对应的应用信息
+    val appInfo: AppInfo?
 )
 
 data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
-    // 【修改】列表类型变为 UiApp
     val activeApps: List<UiApp> = emptyList(),
     val isLoading: Boolean = true,
-    val isConnected: Boolean = false
+    val isConnected: Boolean = false,
+    val appInfoLoaded: Boolean = false // 【新增】一个标志位，表示应用信息是否加载完毕
 )
 
-// 【修改】继承自 AndroidViewModel 以获取 Application Context
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
 
     private val udsRepository: DashboardRepository by lazy {
         UdsDashboardRepository(viewModelScope)
     }
-    // 【新增】应用信息仓库
     private val appInfoRepository = AppInfoRepository(application)
     
-    // 【新增】用于缓存应用信息的 StateFlow
     private val appInfoFlow = MutableStateFlow<Map<String, AppInfo>>(emptyMap())
 
     private val _uiState = MutableStateFlow(DashboardUiState())
@@ -50,54 +47,60 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         Log.i("DashboardViewModel", "ViewModel init called.")
-        loadAppInfo()
         observeDashboardData()
+        loadAppInfo() // 【修改】在观察之后启动加载
     }
     
     private fun loadAppInfo() {
         viewModelScope.launch {
             Log.i("DashboardViewModel", "Loading all installed app info...")
-            appInfoFlow.value = appInfoRepository.getAllInstalledApps()
-            Log.i("DashboardViewModel", "App info loaded. Found ${appInfoFlow.value.size} apps.")
+            val allApps = appInfoRepository.getAllInstalledApps()
+            appInfoFlow.value = allApps
+            _uiState.value = _uiState.value.copy(appInfoLoaded = true) // 【新增】加载完成后更新标志位
+            Log.i("DashboardViewModel", "App info loaded. Found ${allApps.size} apps.")
         }
     }
 
     private fun observeDashboardData() {
         Log.i("DashboardViewModel", "Starting to observe dashboard data...")
         viewModelScope.launch {
-            // 【核心修改】将三个流合并：全局状态、运行时状态、应用信息
             combine(
                 udsRepository.getGlobalStatsStream(),
                 udsRepository.getAppRuntimeStateStream(),
                 appInfoFlow
             ) { stats, runtimeApps, appInfoMap ->
                 
-                // 将运行时状态和应用信息合并
-                val uiApps = runtimeApps.map { runtime ->
-                    UiApp(
-                        runtimeState = runtime,
-                        appInfo = appInfoMap[runtime.packageName]
+                // 【修改】仅当 appInfoMap 不为空时才进行映射，避免初始空状态显示包名
+                val uiApps = if (appInfoMap.isNotEmpty()) {
+                    runtimeApps.map { runtime ->
+                        UiApp(
+                            runtimeState = runtime,
+                            appInfo = appInfoMap[runtime.packageName]
+                        )
+                    }.sortedWith(
+                        compareBy<UiApp> { !it.runtimeState.isForeground }
+                            .thenBy { it.appInfo?.appName ?: it.runtimeState.packageName }
                     )
-                }.sortedWith(
-                    // 排序逻辑：前台应用在前，然后按应用名排序
-                    compareBy<UiApp> { !it.runtimeState.isForeground }
-                        .thenBy { it.appInfo?.appName ?: it.runtimeState.packageName }
-                )
+                } else {
+                    emptyList()
+                }
                 
                 DashboardUiState(
                     globalStats = stats,
                     activeApps = uiApps,
-                    isLoading = false,
-                    isConnected = true
+                    isLoading = false, // 收到数据流就不再是全局loading
+                    isConnected = true,
+                    appInfoLoaded = _uiState.value.appInfoLoaded
                 )
             }
             .onStart {
                 Log.i("DashboardViewModel", "Data stream collection started. Emitting loading state.")
-                emit(DashboardUiState(isLoading = true))
+                // 初始状态，连接和appInfo都未完成
+                emit(DashboardUiState(isLoading = true, isConnected = false, appInfoLoaded = false))
             }
             .catch { e ->
                 Log.e("DashboardViewModel", "Error in data stream: ${e.message}", e)
-                emit(DashboardUiState(isLoading = false, isConnected = false))
+                emit(DashboardUiState(isLoading = false, isConnected = false, appInfoLoaded = _uiState.value.appInfoLoaded))
             }
             .collect { newState ->
                 _uiState.value = newState

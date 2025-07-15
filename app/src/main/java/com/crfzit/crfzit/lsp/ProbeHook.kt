@@ -1,6 +1,8 @@
 // app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
+import android.content.ComponentName // 【新增】导入
+import android.content.pm.ApplicationInfo // 【新增】导入
 import android.os.Process
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
@@ -62,8 +64,8 @@ class ProbeHook : IXposedHookLoadPackage {
                             val task = param.args[0]
                             // 通过反射获取 Task 对象中的包名
                             val baseIntent = XposedHelpers.getObjectField(task, "mBaseIntent")
-                            val componentName = XposedHelpers.callMethod(baseIntent, "getComponent")
-                            val packageName = XposedHelpers.callMethod(componentName, "getPackageName") as String
+                            val componentName = XposedHelpers.callMethod(baseIntent, "getComponent") as ComponentName?
+                            val packageName = componentName?.packageName ?: "Unknown"
 
                             XposedBridge.log("$TAG: App task removed: $packageName")
                             sendEventToDaemon("event.app_killed", mapOf("package_name" to packageName))
@@ -77,6 +79,7 @@ class ProbeHook : IXposedHookLoadPackage {
             
             // Hook 'startProcess' - 进程启动
             // 这个 hook 比较复杂，因为有多个重载
+            // 【修改】简化Hook查找，使用更通用的参数类型
             XposedHelpers.findAndHookMethod(
                 amsClass,
                 "startProcess",

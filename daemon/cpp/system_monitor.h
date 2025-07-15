@@ -5,14 +5,20 @@
 #include <string>
 #include <mutex>
 #include <map>
+#include <chrono> // 【新增】
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
     long total_mem_kb = 0;
     long avail_mem_kb = 0;
-    // 【新增】网络速度
     long long net_down_speed_bps = 0;
     long long net_up_speed_bps = 0;
+};
+
+// 【新增】单个应用资源数据结构
+struct AppStatsData {
+    float cpu_usage_percent = 0.0f;
+    long mem_usage_kb = 0;
 };
 
 struct CpuTimes {
@@ -22,36 +28,38 @@ struct CpuTimes {
     long long idle_total() const { return idle + iowait; }
 };
 
-// 【新增】网络流量数据结构
-struct NetworkUsage {
-    long long rx_bytes = 0;
-    long long tx_bytes = 0;
-};
-
 class SystemMonitor {
 public:
     SystemMonitor();
-    // 修改为 const 方法
-    GlobalStatsData get_stats() const;
+    
+    // 【修改】这个方法将触发一次所有全局数据的更新
     void update_all_stats();
+    GlobalStatsData get_stats() const;
+
+    // 【新增】获取单个应用的资源统计信息
+    AppStatsData get_app_stats(int uid, const std::string& package_name);
 
 private:
     void update_cpu_usage();
     void update_mem_info();
     void update_network_stats();
+    // 【新增】更新单个应用统计的内部实现
+    void update_app_stats(int uid, const std::string& package_name);
 
-    // 改为 mutable 以便在 const 方法中加锁
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
-
-    // For CPU usage calculation
     CpuTimes prev_cpu_times_;
 
-    // 【新增】For network usage calculation
-    std::map<int, NetworkUsage> prev_network_usage_;
     long long prev_total_rx_ = 0;
     long long prev_total_tx_ = 0;
     std::chrono::steady_clock::time_point prev_net_time_;
+
+    // 【新增】用于计算每个应用CPU使用率所需的状态
+    struct AppCpuState {
+        long long prev_app_jiffies = 0;
+        long long prev_total_jiffies = 0;
+    };
+    std::map<int, AppCpuState> app_cpu_states_;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H

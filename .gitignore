@@ -16,3 +16,8 @@ local.properties
 /magisk/Cerberus.zip
 /magisk/cerberus-UI.apk
 /magisk/cerberusd
+daemon_context.txt
+local.properties
+daemon.py
+collo.py
+tree.py

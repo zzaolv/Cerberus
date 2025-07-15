@@ -11,7 +11,8 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-std::string exec_shell(const char* cmd) {
+// 【修改】从 SystemMonitor 移动到这里，因为它只在这里被使用
+std::string exec_shell_local(const char* cmd) {
     std::array<char, 256> buffer;
     std::string result;
     std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
@@ -35,7 +36,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::sha
 
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status) {
     if (app.current_status == new_status) return;
-    // TODO: Add logging for state transitions
+    LOGI("State transition for %s: from %d to %d", app.package_name.c_str(), static_cast<int>(app.current_status), static_cast<int>(new_status));
     app.current_status = new_status;
     app.last_state_change_time = std::chrono::steady_clock::now();
 }
@@ -45,7 +46,8 @@ void StateManager::refresh_installed_apps() {
     LOGI("Refreshing installed apps list...");
     
     managed_apps_.clear();
-    std::string package_list_str = exec_shell("pm list packages -U -3");
+    // 【修改】移除 "-3"，获取所有已安装的应用（包括系统应用），与UI端行为保持一致
+    std::string package_list_str = exec_shell_local("pm list packages -U");
 
     std::stringstream ss(package_list_str);
     std::string line;
@@ -75,16 +77,17 @@ void StateManager::refresh_installed_apps() {
         
         managed_apps_[package_name] = app_state;
     }
-    LOGI("Found %zu third-party apps.", managed_apps_.size());
+    LOGI("Found %zu installed apps.", managed_apps_.size());
 }
 
-// 【新增】处理来自 Probe 的事件
 void StateManager::on_app_killed(const std::string& package_name) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto it = managed_apps_.find(package_name);
     if (it != managed_apps_.end()) {
         LOGI("Event: App %s killed. Transitioning to BACKGROUND_IDLE.", package_name.c_str());
-        // 任何时候进程被杀，都重置回后台空闲状态
+        if(it->second.current_status == AppRuntimeState::Status::FROZEN){
+             action_executor_->unfreeze_uid(it->second.uid);
+        }
         transition_state(it->second, AppRuntimeState::Status::BACKGROUND_IDLE);
     }
 }
@@ -107,23 +110,25 @@ void StateManager::update_all_states() {
 
     auto now = std::chrono::steady_clock::now();
     for (auto& [pkg, app] : managed_apps_) {
-        // 【核心】状态机逻辑
+        
+        // 【核心修复】无论应用处于何种状态，都更新其实时资源占用
+        AppStatsData app_stats = sys_monitor_->get_app_stats(app.uid, app.package_name);
+        app.cpu_usage_percent = app_stats.cpu_usage_percent;
+        app.mem_usage_kb = app_stats.mem_usage_kb;
+
+        // 状态机逻辑
         switch (app.current_status) {
             case AppRuntimeState::Status::BACKGROUND_IDLE: {
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                // 简化：后台空闲超过 15 秒就准备冻结
                 if (elapsed_seconds > 15) {
-                    LOGI("State transition: %s from BACKGROUND_IDLE to AWAITING_FREEZE (timeout).", app.package_name.c_str());
                     transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
                 }
                 break;
             }
             case AppRuntimeState::Status::AWAITING_FREEZE: {
                  auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                // 等待期 5 秒
                  if (elapsed_seconds > 5) {
                     if (action_executor_->freeze_uid(app.uid)) {
-                        LOGI("State transition: %s from AWAITING_FREEZE to FROZEN (action success).", app.package_name.c_str());
                         transition_state(app, AppRuntimeState::Status::FROZEN);
                     } else {
                         LOGW("Freeze action failed for %s. Reverting to BACKGROUND_IDLE.", app.package_name.c_str());
@@ -132,7 +137,6 @@ void StateManager::update_all_states() {
                  }
                 break;
             }
-            // 其他状态...
             default:
                 break;
         }
@@ -167,17 +171,19 @@ nlohmann::json StateManager::get_dashboard_payload() {
     
     json apps_state = json::array();
     for (const auto& [pkg, app] : managed_apps_) {
-        json app_json;
-        app_json["package_name"] = app.package_name;
-        // Daemon 不再负责应用名
-        app_json["app_name"] = app.package_name;
-        app_json["display_status"] = status_to_string(app.current_status);
-        app_json["active_freeze_mode"] = "CGROUP";
-        app_json["mem_usage_kb"] = app.mem_usage_kb;
-        app_json["cpu_usage_percent"] = app.cpu_usage_percent;
-        app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
-        app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
-        apps_state.push_back(app_json);
+        // 只推送有活动或非标准状态的应用，以减少数据量（可选优化）
+        if (app.current_status == AppRuntimeState::Status::FOREGROUND || app.mem_usage_kb > 0 || app.current_status != AppRuntimeState::Status::BACKGROUND_IDLE) {
+            json app_json;
+            app_json["package_name"] = app.package_name;
+            app_json["app_name"] = app.app_name; // 这里的 app_name 仍然是包名，UI 端会替换
+            app_json["display_status"] = status_to_string(app.current_status);
+            app_json["active_freeze_mode"] = "CGROUP";
+            app_json["mem_usage_kb"] = app.mem_usage_kb;
+            app_json["cpu_usage_percent"] = app.cpu_usage_percent;
+            app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
+            app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
+            apps_state.push_back(app_json);
+        }
     }
     payload["apps_runtime_state"] = apps_state;
     return payload;

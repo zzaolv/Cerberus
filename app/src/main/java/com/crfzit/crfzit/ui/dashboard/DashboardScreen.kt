@@ -3,7 +3,6 @@ package com.crfzit.crfzit.ui.dashboard
 
 import android.app.Application
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,6 +27,7 @@ import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.DisplayStatus
 import com.crfzit.crfzit.data.model.GlobalStats
+import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
@@ -117,8 +117,9 @@ fun GlobalStatusArea(stats: GlobalStats) {
         100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
     } else 0.0
 
-    val downSpeed = formatSpeed(stats.net_down_speed_bps)
-    val upSpeed = formatSpeed(stats.net_up_speed_bps)
+    // 【修改】使用驼峰式命名
+    val downSpeed = formatSpeed(stats.netDownSpeedBps)
+    val upSpeed = formatSpeed(stats.netUpSpeedBps)
 
     Card(
         modifier = Modifier
@@ -184,9 +185,6 @@ fun AppStatusCard(app: UiApp) {
                         .data(app.appInfo?.icon)
                         .crossfade(true)
                         .build(),
-                    // 可选：添加占位符和错误图标
-                    // placeholder = painterResource(id = R.drawable.ic_placeholder),
-                    // error = painterResource(id = R.drawable.ic_error_fallback)
                 ),
                 contentDescription = "${app.appInfo?.appName ?: app.runtimeState.packageName} icon",
                 modifier = Modifier.size(48.dp)
@@ -248,9 +246,9 @@ fun AppStatusIndicatorIcons(app: AppRuntimeState) {
 fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     return when {
         bitsPerSecond < 1000 -> Pair(bitsPerSecond.toString(), "bps")
-        bitsPerSecond < 1000 * 1000 -> Pair("%.1f".format(bitsPerSecond / 1000.0), "Kbps")
-        bitsPerSecond < 1000 * 1000 * 1000 -> Pair("%.1f".format(bitsPerSecond / (1000.0 * 1000.0)), "Mbps")
-        else -> Pair("%.1f".format(bitsPerSecond / (1000.0 * 1000.0 * 1000.0)), "Gbps")
+        bitsPerSecond < 1000 * 1000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
+        bitsPerSecond < 1000 * 1000 * 1000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / (1000.0 * 1000.0)), "Mbps")
+        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / (1000.0 * 1000.0 * 1000.0)), "Gbps")
     }
 }
 
@@ -281,26 +279,28 @@ fun DashboardContentPreview() {
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,
                 availMemKb = 3000000,
-                net_down_speed_bps = 12_582_912, // 12 Mbps
-                net_up_speed_bps = 1_310_720,    // 1.3 Mbps
+                // 【修改】使用驼峰式命名
+                netDownSpeedBps = 12_582_912, // 12 Mbps
+                netUpSpeedBps = 1_310_720,    // 1.3 Mbps
                 activeProfileName = "🎮 游戏模式"
             ),
             activeApps = listOf(
                 UiApp(
                     runtimeState = AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, displayStatus = DisplayStatus.FOREGROUND),
-                    appInfo = AppInfo("com.tencent.mm", "微信", icon = android.R.drawable.sym_def_app_icon)
+                    // 【修改】使用统一的 AppInfo，icon 为 null
+                    appInfo = AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT, icon = null)
                 ),
                 UiApp(
                     runtimeState = AppRuntimeState(packageName = "com.bilibili.app.in", appName = "哔哩哔哩", isWhitelisted = true, displayStatus = DisplayStatus.EXEMPTED),
-                    appInfo = AppInfo("com.bilibili.app.in", "哔哩哔哩", icon = android.R.drawable.sym_def_app_icon)
+                    appInfo = AppInfo("com.bilibili.app.in", "哔哩哔哩", Policy.STANDARD, icon = null)
                 ),
                 UiApp(
                     runtimeState = AppRuntimeState(packageName = "com.coolapk.market", appName = "酷安", displayStatus = DisplayStatus.AWAITING_FREEZE),
-                    appInfo = AppInfo("com.coolapk.market", "酷安", icon = android.R.drawable.sym_def_app_icon)
+                    appInfo = AppInfo("com.coolapk.market", "酷安", Policy.STANDARD, icon = null)
                 ),
                 UiApp(
                     runtimeState = AppRuntimeState(packageName = "com.xunmeng.pinduoduo", appName = "拼多多", displayStatus = DisplayStatus.FROZEN),
-                    appInfo = AppInfo("com.xunmeng.pinduoduo", "拼多多", icon = android.R.drawable.sym_def_app_icon)
+                    appInfo = AppInfo("com.xunmeng.pinduoduo", "拼多多", Policy.STRICT, icon = null)
                 ),
             )
         )

@@ -1,4 +1,7 @@
+// app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
 package com.crfzit.crfzit.data.model
+
+import android.graphics.drawable.Drawable
 
 //--- 配置页模型 ---
 
@@ -10,14 +13,15 @@ enum class Policy {
     STRICT, // 严格
 }
 
-// 应用信息，用于配置列表
+// 应用信息，【已合并】用于配置列表和UI显示
 data class AppInfo(
     val packageName: String,
     val appName: String,
     val policy: Policy,
+    val icon: Drawable? = null, // 【新增】用于UI显示，可为空
     val isSystemApp: Boolean = false,
     val forcePlaybackExemption: Boolean = false,
-    val forceNetworkExemption: Boolean = false // <-- 确保这里没有多余的逗号
+    val forceNetworkExemption: Boolean = false
 )
 
 //--- 日志页模型 ---
