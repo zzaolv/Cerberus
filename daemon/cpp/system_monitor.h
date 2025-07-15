@@ -5,7 +5,7 @@
 #include <string>
 #include <mutex>
 #include <map>
-#include <chrono> // 【新增】
+#include <chrono>
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -15,7 +15,6 @@ struct GlobalStatsData {
     long long net_up_speed_bps = 0;
 };
 
-// 【新增】单个应用资源数据结构
 struct AppStatsData {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
@@ -32,19 +31,17 @@ class SystemMonitor {
 public:
     SystemMonitor();
     
-    // 【修改】这个方法将触发一次所有全局数据的更新
     void update_all_stats();
     GlobalStatsData get_stats() const;
-
-    // 【新增】获取单个应用的资源统计信息
     AppStatsData get_app_stats(int uid, const std::string& package_name);
 
 private:
     void update_cpu_usage();
     void update_mem_info();
     void update_network_stats();
-    // 【新增】更新单个应用统计的内部实现
-    void update_app_stats(int uid, const std::string& package_name);
+    
+    // 【注意】移除了这个未使用的私有声明
+    // void update_app_stats(int uid, const std::string& package_name); 
 
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
@@ -53,8 +50,10 @@ private:
     long long prev_total_rx_ = 0;
     long long prev_total_tx_ = 0;
     std::chrono::steady_clock::time_point prev_net_time_;
+    
+    // 【核心修复】在这里声明 is_first_net_read_ 成员变量
+    bool is_first_net_read_; 
 
-    // 【新增】用于计算每个应用CPU使用率所需的状态
     struct AppCpuState {
         long long prev_app_jiffies = 0;
         long long prev_total_jiffies = 0;
