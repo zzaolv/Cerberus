@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
-#include <algorithm>
 #include <vector>
 
 #define LOG_TAG "cerberusd"
@@ -20,64 +19,19 @@ UdsServer::~UdsServer() {
     stop();
 }
 
-void UdsServer::add_client(int client_fd) {
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    client_fds_.push_back(client_fd);
-    LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
-}
-
-void UdsServer::remove_client(int client_fd) {
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
-    if (it != client_fds_.end()) {
-        client_fds_.erase(it, client_fds_.end());
-        LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
-        close(client_fd);
-    }
-}
-
 void UdsServer::broadcast_message(const std::string& message) {
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    if (client_fds_.empty()) return;
-
-    // JSON Lines 协议要求每条消息以换行符结尾
-    std::string line = message + "\n";
-    std::vector<int> disconnected_clients;
-
-    for (int fd : client_fds_) {
-        ssize_t bytes_sent = send(fd, line.c_str(), line.length(), MSG_NOSIGNAL);
-        if (bytes_sent < 0) {
-            // EPIPE 表示客户端已关闭连接
-            if (errno == EPIPE || errno == ECONNRESET) {
-                LOGW("Client fd %d write failed (EPIPE/ECONNRESET), marking for removal.", fd);
-                disconnected_clients.push_back(fd);
-            } else {
-                LOGE("Failed to send to client fd %d: %s", fd, strerror(errno));
-            }
-        }
-    }
-
-    // 从主列表移除已断开的客户端
-    for (int fd : disconnected_clients) {
-        // 这里不加锁，因为 remove_client 内部会加锁
-        // 为了避免死锁，创建一个临时副本来迭代
-        remove_client(fd);
-    }
+    // 在这个测试版本中，我们不实现广播
 }
 
 void UdsServer::stop() {
     is_running_ = false;
     if (server_fd_ != -1) {
+        // 关闭服务器socket会解除accept的阻塞
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
         server_fd_ = -1;
+        LOGI("Server socket shut down.");
     }
-
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    for (int fd : client_fds_) {
-        close(fd);
-    }
-    client_fds_.clear();
 }
 
 void UdsServer::run() {
@@ -90,9 +44,12 @@ void UdsServer::run() {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 使用抽象命名空间，第一个字节必须是 \0
-    addr.sun_path[0] = '\0';
+    addr.sun_path[0] = '\0'; // Abstract namespace
     strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
+
+    // SO_REUSEADDR 对 UDS 意义不大，但加上无害
+    int reuse = 1;
+    setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
         LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
@@ -110,14 +67,27 @@ void UdsServer::run() {
     is_running_ = true;
 
     while (is_running_) {
+        LOGI("Waiting for a new connection... (blocking on accept)");
         int client_fd = accept(server_fd_, nullptr, nullptr);
+        
         if (client_fd == -1) {
-            if (is_running_) { // 如果不是主动停止，就报错
+            // 如果不是因为我们主动停止服务器而导致的错误
+            if (is_running_) {
                 LOGE("Failed to accept connection: %s", strerror(errno));
             }
-            continue;
+            continue; // 继续下一次循环
         }
-        add_client(client_fd);
-        // 我们不为每个客户端创建读线程，因为当前阶段只关心广播
+
+        // 如果成功接受连接
+        LOGI("===========================================");
+        LOGI(">>> Client connected! File descriptor: %d", client_fd);
+        LOGI("===========================================");
+        
+        // 在这个测试版本中，我们接受连接后立即关闭它，以准备接受下一个。
+        // 这足以测试连接是否成功。
+        close(client_fd);
+        LOGI("<<< Client %d disconnected (connection closed by server).", client_fd);
     }
+
+    LOGI("Exiting server run loop.");
 }

@@ -67,8 +67,14 @@ set_perm "$MODPATH/cerberusd" 0 0 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
 # uninstall.sh: root可执行
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
-# 数据目录: 只有守护进程(root)和UI App可以访问
-# set_perm_recursive "$DATA_DIR" 1000 1000 0770 0660
+
+# === 新增部分：为数据目录设置权限 ===
+# 守护进程以 root(0) 运行，UI App 以 app (e.g., 10xxx) 运行。
+# 771 权限允许 owner(root) 和 group(root) 读写执行，其他人无权限。
+# 这对于 socket 和数据库是安全的。SELinux 策略将进一步细化访问控制。
+ui_print "- 设置数据目录权限..."
+set_perm_recursive "$DATA_DIR" 0 0 0771 0660
+
 
 # 4. OEM 后台管理反制 (OEM Guard)
 ui_print "- 正在检测并禁用厂商后台管理服务..."
@@ -88,8 +94,6 @@ for PKG in $CONFLICT_PACKAGES; do
   fi
 done
 
-# ... (在脚本的最后，显示“安装完成”信息之前，添加以下内容) ...
-
 # 5. 自动安装UI应用
 ui_print "- 正在安装 Cerberus UI 应用..."
 # 使用 pm install 命令来安装模块目录中的APK
@@ -103,11 +107,6 @@ else
   ui_print "     APK 路径: /data/adb/modules/cerberus/Cerberus-UI.apk"
 fi
 
-
-ui_print ""
-ui_print "*********************************************************"
-ui_print "*      Project Cerberus 安装完成！                      *"
-# ... (后续内容不变) ...
 
 ui_print ""
 ui_print "*********************************************************"
