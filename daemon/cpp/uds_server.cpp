@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <cstddef> // For offsetof
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -19,7 +20,6 @@ UdsServer::UdsServer(const std::string& socket_path)
     : socket_path_(socket_path), server_fd_(-1), is_running_(false) {}
 
 UdsServer::~UdsServer() {
-    // 确保在析构时停止服务器
     if (is_running_) {
         stop();
     }
@@ -45,7 +45,6 @@ void UdsServer::broadcast_message(const std::string& message) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     if (client_fds_.empty()) return;
 
-    // JSON Lines 协议要求每条消息以换行符结尾
     std::string line = message + "\n";
     std::vector<int> disconnected_clients;
 
@@ -61,7 +60,6 @@ void UdsServer::broadcast_message(const std::string& message) {
         }
     }
 
-    // 从主列表安全地移除已断开的客户端
     if (!disconnected_clients.empty()) {
         for (int fd : disconnected_clients) {
              auto it = std::remove(client_fds_.begin(), client_fds_.end(), fd);
@@ -79,13 +77,11 @@ void UdsServer::stop() {
     is_running_ = false;
 
     if (server_fd_ != -1) {
-        // 关闭服务器套接字，这将导致阻塞的 accept() 调用返回-1
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
         server_fd_ = -1;
     }
 
-    // 关闭所有客户端连接
     std::lock_guard<std::mutex> lock(client_mutex_);
     for (int fd : client_fds_) {
         close(fd);
@@ -96,7 +92,7 @@ void UdsServer::stop() {
 
 void UdsServer::run() {
     LOGI("Attempting to create UDS socket...");
-    server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); // 使用 SOCK_CLOEXEC
+    server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_ == -1) {
         LOGE("Failed to create socket: %s", strerror(errno));
         return;
@@ -106,15 +102,17 @@ void UdsServer::run() {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 使用抽象命名空间，第一个字节必须是 '\0'
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
 
-    LOGI("Attempting to bind to abstract socket '@%s'...", socket_path_.c_str());
-    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+    // 【核心修复】计算正确的地址长度
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_path_.length() + 1;
+
+    LOGI("Attempting to bind to abstract socket '@%s' with length %d...", socket_path_.c_str(), addr_len);
+    if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
         LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
         close(server_fd_);
-        return;
+        return; // 进程将在此处退出
     }
     LOGI("Socket bound successfully.");
 
@@ -131,15 +129,12 @@ void UdsServer::run() {
         LOGI("Waiting for a new client connection...");
         int client_fd = accept(server_fd_, nullptr, nullptr);
         if (client_fd == -1) {
-            // 如果 is_running_ 为 false，这是由 stop() 引起的正常退出
             if (is_running_) {
                 LOGE("Failed to accept connection: %s", strerror(errno));
             }
-            continue; // 继续循环，如果 is_running_ 为 false，循环将终止
+            continue;
         }
         add_client(client_fd);
-        // 当前设计是单向广播，所以我们不为每个客户端创建读取线程。
-        // 如果未来需要双向通信，可以在这里创建一个读线程。
     }
 
     LOGI("Server accept loop has terminated.");
