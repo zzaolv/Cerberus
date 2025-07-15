@@ -9,9 +9,9 @@
 #include <algorithm>
 #include <vector>
 #include <cstddef>
-#include <sys/select.h> // 【新增】
+#include <sys/select.h>
 
-#define LOG_TAG "cerberusd_uds" // 修改日志标签以便区分
+#define LOG_TAG "cerberusd_uds"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -25,7 +25,6 @@ UdsServer::~UdsServer() {
     }
 }
 
-// 【新增】实现回调设置
 void UdsServer::set_message_handler(std::function<void(const std::string&)> handler) {
     on_message_received_ = std::move(handler);
 }
@@ -33,7 +32,7 @@ void UdsServer::set_message_handler(std::function<void(const std::string&)> hand
 void UdsServer::add_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     client_fds_.push_back(client_fd);
-    client_buffers_[client_fd] = ""; // 初始化缓冲区
+    client_buffers_[client_fd] = "";
     LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
 }
 
@@ -42,7 +41,7 @@ void UdsServer::remove_client(int client_fd) {
     auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
     if (it != client_fds_.end()) {
         client_fds_.erase(it, client_fds_.end());
-        client_buffers_.erase(client_fd); // 清理缓冲区
+        client_buffers_.erase(client_fd);
         LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
         close(client_fd);
     }
@@ -65,9 +64,7 @@ void UdsServer::broadcast_message(const std::string& message) {
     }
 
     if (!disconnected_clients.empty()) {
-        // 在循环外统一移除，避免迭代器失效
         for (int fd : disconnected_clients) {
-            // 这里只在锁内部调用内部的 remove_client
             auto it_fds = std::remove(client_fds_.begin(), client_fds_.end(), fd);
             if (it_fds != client_fds_.end()) {
                 client_fds_.erase(it_fds, client_fds_.end());
@@ -79,34 +76,49 @@ void UdsServer::broadcast_message(const std::string& message) {
     }
 }
 
-// 【新增】处理客户端数据的逻辑
+// 【核心重写】修复死锁风险
 void UdsServer::handle_client_data(int client_fd) {
     char buffer[4096];
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
     if (bytes_read <= 0) {
-        // 0 表示连接关闭，<0 表示错误
         remove_client(client_fd);
         return;
     }
 
     buffer[bytes_read] = '\0';
     
-    // 加锁以保护 client_buffers_
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    client_buffers_[client_fd] += buffer;
+    std::vector<std::string> messages_to_process;
+    
+    // 1. 加锁，从缓冲区提取完整的消息
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        auto it = client_buffers_.find(client_fd);
+        if (it == client_buffers_.end()) {
+            return; // 客户端可能刚刚断开
+        }
 
-    // 处理完整的 JSON Lines
-    size_t pos;
-    while ((pos = client_buffers_[client_fd].find('\n')) != std::string::npos) {
-        std::string message = client_buffers_[client_fd].substr(0, pos);
-        client_buffers_[client_fd].erase(0, pos + 1);
-        
-        if (on_message_received_ && !message.empty()) {
-            on_message_received_(message);
+        it->second += buffer;
+        std::string& client_buffer = it->second;
+
+        size_t pos;
+        while ((pos = client_buffer.find('\n')) != std::string::npos) {
+            std::string message = client_buffer.substr(0, pos);
+            if (!message.empty()) {
+                messages_to_process.push_back(message);
+            }
+            client_buffer.erase(0, pos + 1);
+        }
+    } // 2. 锁在这里被自动释放
+
+    // 3. 在没有锁的情况下，处理消息
+    if (on_message_received_ && !messages_to_process.empty()) {
+        for (const auto& msg : messages_to_process) {
+            on_message_received_(msg);
         }
     }
 }
+
 
 void UdsServer::stop() {
     LOGI("Stopping UDS server...");
@@ -127,7 +139,6 @@ void UdsServer::stop() {
     LOGI("All client connections closed.");
 }
 
-// 【核心重写】使用 select() 的非阻塞 I/O 循环
 void UdsServer::run() {
     server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_ == -1) {
@@ -172,8 +183,13 @@ void UdsServer::run() {
                 }
             }
         }
+        
+        // 【新增】为 select 添加1秒的超时，使其不会永久阻塞
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
 
-        int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr);
+        int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
 
         if (activity < 0 && errno != EINTR) {
             LOGE("select() error: %s", strerror(errno));
@@ -181,8 +197,8 @@ void UdsServer::run() {
         }
 
         if (!is_running_) break;
+        if (activity == 0) continue; // 超时，继续下一次循环
 
-        // 检查是否有新连接
         if (FD_ISSET(server_fd_, &read_fds)) {
             int new_socket = accept(server_fd_, nullptr, nullptr);
             if (new_socket >= 0) {
@@ -190,11 +206,10 @@ void UdsServer::run() {
             }
         }
         
-        // 检查已连接客户端是否有数据
         std::vector<int> current_clients;
         {
             std::lock_guard<std::mutex> lock(client_mutex_);
-            current_clients = client_fds_; // 复制一份以安全迭代
+            current_clients = client_fds_;
         }
         for (int fd : current_clients) {
             if (FD_ISSET(fd, &read_fds)) {
