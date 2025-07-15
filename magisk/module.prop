@@ -1,0 +1,6 @@
+id=cerberus
+name=Project Cerberus
+version=v1.0
+versionCode=1
+author=zzaolv
+description=An advanced system management framework for Android. Includes UI and system daemon.
