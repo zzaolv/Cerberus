@@ -52,6 +52,9 @@ data class AppRuntimeState(
     val packageName: String,
     @SerializedName("app_name")
     val appName: String,
+    // 【新增】
+    @SerializedName("user_id")
+    val userId: Int = 0,
     @SerializedName("display_status")
     val displayStatus: DisplayStatus = DisplayStatus.UNKNOWN,
     @SerializedName("active_freeze_mode")
@@ -75,6 +78,7 @@ data class AppRuntimeState(
  * 应用显示状态的枚举 (与文档保持一致)
  */
 enum class DisplayStatus {
+    STOPPED, // 新增
     FOREGROUND,
     FOREGROUND_GAME, // 补充文档中的状态
     BACKGROUND_ACTIVE,

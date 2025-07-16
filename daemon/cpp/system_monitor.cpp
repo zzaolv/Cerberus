@@ -15,36 +15,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-
-std::string exec_shell(const char* cmd) {
-    std::array<char, 256> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-    if (!pipe) {
-        LOGE("popen() failed for command: %s", cmd);
-        return "";
-    }
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    return result;
-}
-
-int get_pid_for_package(const std::string& package_name) {
-    std::string cmd = "pidof -s " + package_name;
-    std::string pid_str = exec_shell(cmd.c_str());
-    if (pid_str.empty()) {
-        return -1;
-    }
-    try {
-        return std::stoi(pid_str);
-    } catch (const std::exception&) {
-        return -1;
-    }
-}
-
-
-SystemMonitor::SystemMonitor() : prev_net_time_(std::chrono::steady_clock::now()), is_first_net_read_(true) {
+SystemMonitor::SystemMonitor() : prev_total_rx_(0), prev_total_tx_(0), prev_net_time_(std::chrono::steady_clock::now()) {
     update_all_stats();
 }
 
@@ -59,21 +30,29 @@ GlobalStatsData SystemMonitor::get_stats() const {
     return current_stats_;
 }
 
-AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_name) {
+// 【核心修改】读取 PSS 内存并重构
+AppStatsData SystemMonitor::get_app_stats(int pid) {
     AppStatsData stats;
-    int pid = get_pid_for_package(package_name);
-    if (pid <= 0) {
-        return stats;
+    if (pid <= 0) return stats;
+
+    // 1. 获取内存使用 (PSS) from smaps_rollup
+    std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
+    std::ifstream smaps_file(smaps_path);
+    if (smaps_file.is_open()) {
+        std::string line;
+        while(std::getline(smaps_file, line)) {
+            if (line.rfind("Pss_Total:", 0) == 0) {
+                try {
+                    stats.mem_usage_kb = std::stol(line.substr(10));
+                    break;
+                } catch (const std::exception&) {
+                    // ignore parse error
+                }
+            }
+        }
     }
 
-    std::string statm_path = "/proc/" + std::to_string(pid) + "/statm";
-    std::ifstream statm_file(statm_path);
-    if (statm_file.is_open()) {
-        long size, resident;
-        statm_file >> size >> resident;
-        stats.mem_usage_kb = resident * sysconf(_SC_PAGESIZE) / 1024;
-    }
-
+    // 2. 获取并计算CPU使用率
     std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream stat_file(stat_path);
     if (stat_file.is_open()) {
@@ -87,8 +66,7 @@ AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_na
         long long current_app_jiffies = utime + stime;
         
         long long current_total_jiffies = prev_cpu_times_.total();
-
-        auto& cpu_state = app_cpu_states_[uid];
+        auto& cpu_state = app_cpu_states_[pid]; // Use PID as key
 
         if (cpu_state.prev_app_jiffies > 0) {
             long long app_delta = current_app_jiffies - cpu_state.prev_app_jiffies;
@@ -105,13 +83,9 @@ AppStatsData SystemMonitor::get_app_stats(int uid, const std::string& package_na
     return stats;
 }
 
-
 void SystemMonitor::update_cpu_usage() {
     std::ifstream stat_file("/proc/stat");
-    if (!stat_file.is_open()) {
-        LOGW("Failed to open /proc/stat");
-        return;
-    }
+    if (!stat_file.is_open()) return;
 
     std::string line;
     std::getline(stat_file, line);
@@ -144,10 +118,7 @@ void SystemMonitor::update_cpu_usage() {
 
 void SystemMonitor::update_mem_info() {
     std::ifstream meminfo_file("/proc/meminfo");
-    if (!meminfo_file.is_open()) {
-        LOGW("Failed to open /proc/meminfo");
-        return;
-    }
+    if (!meminfo_file.is_open()) return;
 
     std::string line;
     long mem_total = 0, mem_available = 0;
@@ -157,14 +128,9 @@ void SystemMonitor::update_mem_info() {
         long value;
         std::stringstream ss(line);
         ss >> key >> value;
-        if (key == "MemTotal:") {
-            mem_total = value;
-        } else if (key == "MemAvailable:") {
-            mem_available = value;
-        }
-        if (mem_total > 0 && mem_available > 0) {
-            break;
-        }
+        if (key == "MemTotal:") mem_total = value;
+        else if (key == "MemAvailable:") mem_available = value;
+        if (mem_total > 0 && mem_available > 0) break;
     }
     meminfo_file.close();
 
@@ -173,25 +139,21 @@ void SystemMonitor::update_mem_info() {
     current_stats_.avail_mem_kb = mem_available;
 }
 
+// 【核心修改】加固网络速度计算逻辑
 void SystemMonitor::update_network_stats() {
     std::ifstream net_stats_file("/proc/net/xt_qtaguid/stats");
-    if (!net_stats_file.is_open()) {
-        return;
-    }
+    if (!net_stats_file.is_open()) { return; }
 
     long long current_total_rx = 0;
     long long current_total_tx = 0;
-
     std::string line;
     std::getline(net_stats_file, line); 
-
     while (std::getline(net_stats_file, line)) {
         std::string iface, tag_hex;
         int idx, uid, cnt_set;
         long long rx_bytes, tx_bytes;
         std::stringstream ss(line);
         ss >> idx >> iface >> tag_hex >> uid >> cnt_set >> rx_bytes >> line >> tx_bytes;
-        
         current_total_rx += rx_bytes;
         current_total_tx += tx_bytes;
     }
@@ -200,14 +162,15 @@ void SystemMonitor::update_network_stats() {
     auto now = std::chrono::steady_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_net_time_).count();
 
-    if (is_first_net_read_) {
-        is_first_net_read_ = false;
-    } else if (duration_ms > 100) {
+    if (prev_total_rx_ > 0 && duration_ms > 100) { // 只有在有旧数据且时间间隔足够时才计算
         long long delta_rx = current_total_rx - prev_total_rx_;
         long long delta_tx = current_total_tx - prev_total_tx_;
 
-        long long down_speed = delta_rx >= 0 ? (delta_rx * 8 * 1000 / duration_ms) : 0;
-        long long up_speed = delta_tx >= 0 ? (delta_tx * 8 * 1000 / duration_ms) : 0;
+        long long down_speed = delta_rx >= 0 ? (delta_rx * 8000 / duration_ms) : 0; // * 8 * 1000 / ms
+        long long up_speed = delta_tx >= 0 ? (delta_tx * 8000 / duration_ms) : 0;
+        
+        // 添加日志用于调试
+        // LOGI("NetStats: delta_rx=%lld, delta_tx=%lld, duration=%lldms, down_speed=%lldbps, up_speed=%lldbps", delta_rx, delta_tx, duration_ms, down_speed, up_speed);
 
         std::lock_guard<std::mutex> lock(data_mutex_);
         current_stats_.net_down_speed_bps = down_speed;

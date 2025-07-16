@@ -32,13 +32,25 @@ import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
 
+fun formatMemory(kb: Long): String {
+    if (kb <= 0) return "0 MB"
+    val mb = kb / 1024.0
+    val gb = mb / 1024.0
+    return when {
+        gb >= 1 -> "%.2f GB".format(Locale.US, gb)
+        mb >= 1 -> "%.1f MB".format(Locale.US, mb)
+        else -> "$kb KB"
+    }
+}
+
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
     viewModel: DashboardViewModel = viewModel(factory = DashboardViewModelFactory(LocalContext.current.applicationContext as Application))
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    var showMenu by remember { mutableStateOf(false) } // 【新增】菜单状态
+    var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -47,7 +59,6 @@ fun DashboardScreen(
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
                 ),
-                // 【新增】右上角菜单
                 actions = {
                     Box {
                         IconButton(onClick = { showMenu = true }) {
@@ -91,7 +102,7 @@ class DashboardViewModelFactory(private val application: Application) : ViewMode
 fun DashboardContent(uiState: DashboardUiState, modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxSize()) {
         when {
-            uiState.isLoading || !uiState.appInfoLoaded -> {
+            uiState.isLoading -> {
                 StatusIndicator("正在连接并加载应用信息...", showProgress = true)
             }
             !uiState.isConnected -> {
@@ -100,7 +111,6 @@ fun DashboardContent(uiState: DashboardUiState, modifier: Modifier = Modifier) {
             else -> {
                 GlobalStatusArea(stats = uiState.globalStats)
                 HorizontalDivider()
-                // 【修改】使用新的 displayedApps 列表
                 RuntimeStatusList(apps = uiState.displayedApps)
             }
         }
@@ -209,7 +219,6 @@ fun AppStatusCard(app: UiApp) {
 
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // 【核心修复】显示应用名，如果为空则显示包名作为后备
                     val displayName = app.appInfo?.appName ?: app.runtimeState.packageName
                     Text(
                         text = displayName,
@@ -222,8 +231,23 @@ fun AppStatusCard(app: UiApp) {
                     Spacer(Modifier.width(8.dp))
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
+                    // 【新增】分身图标
+                    if (app.runtimeState.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone), // 你需要准备一个图标
+                            contentDescription = "分身应用",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+
+                    Spacer(Modifier.weight(1f)) // 把状态图标推到最右边
+                    AppStatusIndicatorIcons(app = app.runtimeState)
+                }
                 Text(
-                    text = "MEM: ${app.runtimeState.memUsageKb / 1024} MB | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
+                    // 【修改】使用新的格式化函数
+                    text = "MEM: ${formatMemory(app.runtimeState.memUsageKb)} | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -288,7 +312,6 @@ fun DashboardContentPreview() {
         val previewState = DashboardUiState(
             isLoading = false,
             isConnected = true,
-            appInfoLoaded = true,
             globalStats = GlobalStats(
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,

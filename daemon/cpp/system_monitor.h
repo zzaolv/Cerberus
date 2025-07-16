@@ -17,7 +17,8 @@ struct GlobalStatsData {
 
 struct AppStatsData {
     float cpu_usage_percent = 0.0f;
-    long mem_usage_kb = 0;
+    // 【修改】这个现在代表 PSS 内存
+    long mem_usage_kb = 0; 
 };
 
 struct CpuTimes {
@@ -33,16 +34,13 @@ public:
     
     void update_all_stats();
     GlobalStatsData get_stats() const;
-    AppStatsData get_app_stats(int uid, const std::string& package_name);
+    AppStatsData get_app_stats(int pid); // 【修改】直接通过 pid 获取，更高效
 
 private:
     void update_cpu_usage();
     void update_mem_info();
     void update_network_stats();
     
-    // 【注意】移除了这个未使用的私有声明
-    // void update_app_stats(int uid, const std::string& package_name); 
-
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
     CpuTimes prev_cpu_times_;
@@ -51,9 +49,6 @@ private:
     long long prev_total_tx_ = 0;
     std::chrono::steady_clock::time_point prev_net_time_;
     
-    // 【核心修复】在这里声明 is_first_net_read_ 成员变量
-    bool is_first_net_read_; 
-
     struct AppCpuState {
         long long prev_app_jiffies = 0;
         long long prev_total_jiffies = 0;
