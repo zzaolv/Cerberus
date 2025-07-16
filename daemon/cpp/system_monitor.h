@@ -11,13 +11,10 @@ struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
     long total_mem_kb = 0;
     long avail_mem_kb = 0;
-    long long net_down_speed_bps = 0;
-    long long net_up_speed_bps = 0;
 };
 
 struct AppStatsData {
     float cpu_usage_percent = 0.0f;
-    // 【修改】这个现在代表 PSS 内存
     long mem_usage_kb = 0; 
 };
 
@@ -34,20 +31,15 @@ public:
     
     void update_all_stats();
     GlobalStatsData get_stats() const;
-    AppStatsData get_app_stats(int pid); // 【修改】直接通过 pid 获取，更高效
+    AppStatsData get_app_stats(int pid);
 
 private:
     void update_cpu_usage();
     void update_mem_info();
-    void update_network_stats();
     
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
     CpuTimes prev_cpu_times_;
-
-    long long prev_total_rx_ = 0;
-    long long prev_total_tx_ = 0;
-    std::chrono::steady_clock::time_point prev_net_time_;
     
     struct AppCpuState {
         long long prev_app_jiffies = 0;

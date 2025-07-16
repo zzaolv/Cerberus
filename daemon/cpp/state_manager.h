@@ -19,11 +19,10 @@ struct AppRuntimeState {
     std::string package_name;
     std::string app_name;
     int uid;
-    int user_id; // 【新增】用于分身应用识别
+    int user_id;
 
     AppConfig config;
 
-    // 【新增】 STOPPED 状态
     enum class Status {
         STOPPED, FOREGROUND, BACKGROUND_ACTIVE, BACKGROUND_IDLE, AWAITING_FREEZE, FROZEN, EXEMPTED
     } current_status = Status::STOPPED;
@@ -44,7 +43,7 @@ public:
 private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
-    int get_pid_for_package(const std::string& package_name); // 【新增】辅助函数
+    int get_pid_for_package(const std::string& package_name);
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;

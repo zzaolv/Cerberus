@@ -13,6 +13,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -23,14 +24,15 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.DisplayStatus
 import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.model.Policy
+import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
-
 
 fun formatMemory(kb: Long): String {
     if (kb <= 0) return "0 MB"
@@ -42,7 +44,6 @@ fun formatMemory(kb: Long): String {
         else -> "$kb KB"
     }
 }
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -109,7 +110,7 @@ fun DashboardContent(uiState: DashboardUiState, modifier: Modifier = Modifier) {
                 StatusIndicator("连接守护进程失败！\n请检查模块是否正常运行。", showProgress = false)
             }
             else -> {
-                GlobalStatusArea(stats = uiState.globalStats)
+                GlobalStatusArea(stats = uiState.globalStats, speed = uiState.networkSpeed)
                 HorizontalDivider()
                 RuntimeStatusList(apps = uiState.displayedApps)
             }
@@ -138,13 +139,13 @@ fun StatusIndicator(text: String, showProgress: Boolean) {
 }
 
 @Composable
-fun GlobalStatusArea(stats: GlobalStats) {
+fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
         100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
     } else 0.0
 
-    val downSpeed = formatSpeed(stats.netDownSpeedBps)
-    val upSpeed = formatSpeed(stats.netUpSpeedBps)
+    val downSpeed = formatSpeed(speed.downloadSpeedBps)
+    val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
     Card(
         modifier = Modifier
@@ -186,7 +187,6 @@ fun InfoChip(label: String, value: String, unit: String) {
     }
 }
 
-
 @Composable
 fun RuntimeStatusList(apps: List<UiApp>) {
     LazyColumn(
@@ -194,7 +194,7 @@ fun RuntimeStatusList(apps: List<UiApp>) {
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        items(items = apps, key = { it.runtimeState.packageName }) { app ->
+        items(items = apps, key = { "${it.runtimeState.packageName}-${it.runtimeState.userId}" }) { app ->
             AppStatusCard(app = app)
         }
     }
@@ -214,7 +214,7 @@ fun AppStatusCard(app: UiApp) {
                 contentDescription = "${app.appInfo?.appName} icon",
                 modifier = Modifier.size(48.dp)
             )
-            
+
             Spacer(Modifier.width(12.dp))
 
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -225,28 +225,21 @@ fun AppStatusCard(app: UiApp) {
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(Modifier.width(8.dp))
-                    AppStatusIndicatorIcons(app = app.runtimeState)
-                }
-                    // 【新增】分身图标
                     if (app.runtimeState.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
-                            painter = painterResource(id = R.drawable.ic_clone), // 你需要准备一个图标
+                            painter = painterResource(id = R.drawable.ic_clone),
                             contentDescription = "分身应用",
                             modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.secondary
                         )
                     }
-
-                    Spacer(Modifier.weight(1f)) // 把状态图标推到最右边
+                    Spacer(Modifier.weight(1f))
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
                 Text(
-                    // 【修改】使用新的格式化函数
                     text = "MEM: ${formatMemory(app.runtimeState.memUsageKb)} | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -293,14 +286,15 @@ fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
 
 fun getStatusText(app: AppRuntimeState): String {
     return when (app.displayStatus) {
+        DisplayStatus.STOPPED -> "未运行"
         DisplayStatus.FOREGROUND -> "前台运行"
         DisplayStatus.FOREGROUND_GAME -> "前台游戏"
         DisplayStatus.BACKGROUND_ACTIVE -> "后台活动"
         DisplayStatus.BACKGROUND_IDLE -> "后台空闲"
         DisplayStatus.AWAITING_FREEZE -> "等待冻结中"
-        DisplayStatus.FROZEN -> "已冻结"
+        DisplayStatus.FROZEN -> "已冻结 (后台超时)"
         DisplayStatus.KILLED -> "已结束"
-        DisplayStatus.EXEMPTED -> "自由后台"
+        DisplayStatus.EXEMPTED -> "自由后台 (豁免)"
         DisplayStatus.UNKNOWN -> "状态未知"
     }
 }
@@ -316,10 +310,9 @@ fun DashboardContentPreview() {
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,
                 availMemKb = 3000000,
-                netDownSpeedBps = 12_582_912,
-                netUpSpeedBps = 1_310_720,
                 activeProfileName = "🎮 游戏模式"
             ),
+            networkSpeed = NetworkSpeed(downloadSpeedBps = 12_582_912, uploadSpeedBps = 1_310_720),
             displayedApps = listOf(
                 UiApp(
                     runtimeState = AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, memUsageKb = 512000, displayStatus = DisplayStatus.FOREGROUND),
