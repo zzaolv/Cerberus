@@ -12,7 +12,7 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
-#include <filesystem>
+#include <filesystem> // <-- 已包含头文件
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -20,6 +20,8 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using json = nlohmann::json;
+// 【核心修复】添加缺失的命名空间别名定义
+namespace fs = std::filesystem;
 
 const std::string SOCKET_NAME = "cerberus_socket";
 const std::string DATA_DIR = "/data/adb/cerberus";
@@ -30,7 +32,6 @@ std::shared_ptr<StateManager> g_state_manager;
 std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::atomic<bool> g_is_running = true;
 
-// 【修复】提供完整的 handle_ui_message 实现
 void handle_ui_message(const std::string& message_str) {
     LOGI("Received UI message: %s", message_str.c_str());
     try {
@@ -38,10 +39,8 @@ void handle_ui_message(const std::string& message_str) {
         std::string type = msg.value("type", "");
 
         if (type.rfind("cmd.", 0) == 0) {
-            // Placeholder for command handling
             LOGI("Handling command: %s", type.c_str());
         } else if (type.rfind("query.", 0) == 0) {
-            // Placeholder for query handling
             LOGI("Handling query: %s", type.c_str());
         }
     } catch (const json::parse_error& e) {
@@ -88,6 +87,7 @@ int main() {
     try {
         if (!fs::exists(DATA_DIR)) {
             fs::create_directories(DATA_DIR);
+            LOGI("Created data directory: %s", DATA_DIR.c_str());
         }
     } catch (const fs::filesystem_error& e) {
         LOGE("Failed to create data directory: %s", e.what());
