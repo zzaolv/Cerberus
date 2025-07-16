@@ -34,7 +34,9 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
-// 【核心修改】修改内存格式化函数，只输出 MB 和 GB
+/**
+ * 将KB转换为可读的MB或GB字符串
+ */
 fun formatMemory(kb: Long): String {
     if (kb <= 0) return "0 MB"
     val mb = kb / 1024.0
@@ -144,7 +146,6 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
         100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
     } else 0.0
     
-    // 【新增】计算SWAP使用率
     val swapUsedPercent = if (stats.swapTotalKb > 0) {
         100.0 * (stats.swapTotalKb - stats.swapFreeKb) / stats.swapTotalKb
     } else 0.0
@@ -174,7 +175,6 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
             ) {
                 InfoChip("CPU", "${"%.1f".format(Locale.US, stats.totalCpuUsagePercent)}", "%")
                 InfoChip("MEM", "${"%.0f".format(memUsedPercent)}", "%")
-                // 【新增】显示SWAP的InfoChip
                 InfoChip("SWAP", "${"%.0f".format(swapUsedPercent)}", "%")
                 InfoChip("↓", downSpeed.first, downSpeed.second)
                 InfoChip("↑", upSpeed.first, upSpeed.second)
@@ -201,6 +201,7 @@ fun RuntimeStatusList(apps: List<UiApp>) {
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
+        // 使用 runtimeState 的 package 和 userId 作为复合键，确保唯一性
         items(items = apps, key = { "${it.runtimeState.packageName}-${it.runtimeState.userId}" }) { app ->
             AppStatusCard(app = app)
         }
@@ -234,11 +235,12 @@ fun AppStatusCard(app: UiApp) {
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    // 如果 userId 不为0，显示分身图标
                     if (app.runtimeState.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
                             painter = painterResource(id = R.drawable.ic_clone),
-                            contentDescription = "分身应用",
+                            contentDescription = "分身应用 (User ${app.runtimeState.userId})",
                             modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.secondary
                         )
@@ -246,12 +248,20 @@ fun AppStatusCard(app: UiApp) {
                     Spacer(Modifier.weight(1f))
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
+
+                // 构造资源占用字符串，如果SWAP>0才显示
+                val memText = "MEM: ${formatMemory(app.runtimeState.memUsageKb)}"
+                val swapText = if (app.runtimeState.swapUsageKb > 0) " | SWAP: ${formatMemory(app.runtimeState.swapUsageKb)}" else ""
+                val cpuText = " | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%"
+                
                 Text(
-                    // 【修改】使用新的格式化函数
-                    text = "MEM: ${formatMemory(app.runtimeState.memUsageKb)} | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
+                    text = memText + swapText + cpuText,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                
                 Text(
                     text = "STATUS: ${getStatusText(app.runtimeState)}",
                     style = MaterialTheme.typography.bodySmall,
@@ -318,19 +328,29 @@ fun DashboardContentPreview() {
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,
                 availMemKb = 3000000,
-                swapTotalKb = 4096000, // 4GB Swap
-                swapFreeKb = 2048000,  // 2GB Free
+                swapTotalKb = 4096000,
+                swapFreeKb = 2048000,
                 activeProfileName = "🎮 游戏模式"
             ),
             networkSpeed = NetworkSpeed(downloadSpeedBps = 12_582_912, uploadSpeedBps = 1_310_720),
             displayedApps = listOf(
+                // 模拟主应用
                 UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.tencent.mm", appName = "微信", isForeground = true, memUsageKb = 512000, displayStatus = DisplayStatus.FOREGROUND),
+                    runtimeState = AppRuntimeState(
+                        packageName = "com.tencent.mm", appName = "微信", userId = 0,
+                        isForeground = true, memUsageKb = 512000, swapUsageKb = 102400,
+                        displayStatus = DisplayStatus.FOREGROUND
+                    ),
                     appInfo = AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT, icon = null)
                 ),
+                // 模拟分身应用
                 UiApp(
-                    runtimeState = AppRuntimeState(packageName = "com.bilibili.app.in", appName = "哔哩哔哩", isWhitelisted = true, memUsageKb = 256000, displayStatus = DisplayStatus.EXEMPTED),
-                    appInfo = AppInfo("com.bilibili.app.in", "哔哩哔哩", Policy.STANDARD, icon = null)
+                    runtimeState = AppRuntimeState(
+                        packageName = "com.tencent.mm", appName = "微信", userId = 999,
+                        memUsageKb = 256000, swapUsageKb = 0,
+                        displayStatus = DisplayStatus.BACKGROUND_IDLE
+                    ),
+                    appInfo = AppInfo("com.tencent.mm", "微信 (分身)", Policy.IMPORTANT, icon = null)
                 )
             )
         )

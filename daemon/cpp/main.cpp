@@ -13,11 +13,13 @@
 #include <atomic>
 #include <filesystem>
 
+// ... (宏定义不变) ...
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// ... (全局变量不变) ...
 using json = nlohmann::json;
 
 const std::string SOCKET_NAME = "cerberus_socket";
@@ -29,34 +31,40 @@ std::shared_ptr<StateManager> g_state_manager;
 std::shared_ptr<SystemMonitor> g_sys_monitor;
 std::atomic<bool> g_is_running = true;
 
-void signal_handler(int signum) {
-    LOGI("Caught signal %d, initiating shutdown...", signum);
-    g_is_running = false;
-    if (g_server) g_server->stop();
-}
-
-// 【新增】消息处理函数
+// 【核心重构】更新消息处理器以解析 user_id
 void handle_message(const std::string& message_str) {
     LOGI("Received message: %s", message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
-        if (type.rfind("event.", 0) == 0) { // if type starts with "event."
+
+        if (type.rfind("event.", 0) == 0) {
             json payload = msg.value("payload", json::object());
             std::string pkg_name = payload.value("package_name", "");
-            if (pkg_name.empty()) return;
+            // -1 是一个无效的 user_id，用于判断是否收到了该字段
+            int user_id = payload.value("user_id", -1);
+
+            if (pkg_name.empty() || user_id == -1) {
+                LOGW("Received event with missing package_name or user_id. Ignoring.");
+                return;
+            }
             
             if (type == "event.app_start") {
-                g_state_manager->on_app_started(pkg_name);
+                g_state_manager->on_app_started(pkg_name, user_id);
             } else if (type == "event.app_killed") {
-                g_state_manager->on_app_killed(pkg_name);
+                g_state_manager->on_app_killed(pkg_name, user_id);
             }
-            // ...可以扩展其他事件
         }
-        // ...可以扩展处理 "cmd." 或 "query."
     } catch (const json::parse_error& e) {
         LOGW("JSON parse error: %s", e.what());
     }
+}
+
+// ... (其余函数 signal_handler, monitor_thread, broadcaster_thread, main 不变) ...
+void signal_handler(int signum) {
+    LOGI("Caught signal %d, initiating shutdown...", signum);
+    g_is_running = false;
+    if (g_server) g_server->stop();
 }
 
 void monitor_thread() {
@@ -94,7 +102,7 @@ int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v1.5 (Select-IO-Fix) starting...");
+    LOGI("Cerberus Daemon v1.6 (Multi-User Refactor) starting...");
 
     try {
         if (!std::filesystem::exists(DATA_DIR)) {
@@ -111,7 +119,6 @@ int main() {
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor);
     
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
-    // 【核心修复】设置消息处理器
     g_server->set_message_handler(handle_message);
     
     std::thread monitor(monitor_thread);

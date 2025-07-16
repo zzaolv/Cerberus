@@ -29,26 +29,39 @@ GlobalStatsData SystemMonitor::get_stats() const {
     return current_stats_;
 }
 
+// 【健壮性修复】重写 get_app_stats，改用 /proc/[pid]/status
 AppStatsData SystemMonitor::get_app_stats(int pid) {
     AppStatsData stats;
     if (pid <= 0) return stats;
 
-    std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
-    std::ifstream smaps_file(smaps_path);
-    if (smaps_file.is_open()) {
+    // --- 读取内存和交换区信息 ---
+    std::string status_path = "/proc/" + std::to_string(pid) + "/status";
+    std::ifstream status_file(status_path);
+    if (status_file.is_open()) {
         std::string line;
-        while(std::getline(smaps_file, line)) {
-            if (line.rfind("Pss_Total:", 0) == 0) {
+        int found_count = 0;
+        while (std::getline(status_file, line) && found_count < 2) {
+            if (line.rfind("VmRSS:", 0) == 0) {
                 std::stringstream ss(line);
                 std::string key;
                 long value;
                 ss >> key >> value;
                 stats.mem_usage_kb = value;
-                break;
+                found_count++;
+            } else if (line.rfind("VmSwap:", 0) == 0) {
+                std::stringstream ss(line);
+                std::string key;
+                long value;
+                ss >> key >> value;
+                stats.swap_usage_kb = value;
+                found_count++;
             }
         }
+    } else {
+        // LOGW("Could not open %s for PID %d", status_path.c_str(), pid);
     }
 
+    // --- 读取和计算CPU使用率 (逻辑不变) ---
     std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream stat_file(stat_path);
     if (stat_file.is_open()) {
@@ -64,7 +77,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
         long long current_total_jiffies = prev_cpu_times_.total();
         auto& cpu_state = app_cpu_states_[pid];
 
-        if (cpu_state.prev_app_jiffies > 0) {
+        if (cpu_state.prev_app_jiffies > 0 && current_total_jiffies > cpu_state.prev_total_jiffies) {
             long long app_delta = current_app_jiffies - cpu_state.prev_app_jiffies;
             long long total_delta = current_total_jiffies - cpu_state.prev_total_jiffies;
             if (total_delta > 0 && app_delta >= 0) {
@@ -125,26 +138,16 @@ void SystemMonitor::update_mem_info() {
         long value;
         std::stringstream ss(line);
         ss >> key >> value;
-        if (key == "MemTotal:") {
-            mem_total = value;
-            found_count++;
-        } else if (key == "MemAvailable:") {
-            mem_available = value;
-            found_count++;
-        } else if (key == "SwapTotal:") { // 【新增】
-            swap_total = value;
-            found_count++;
-        } else if (key == "SwapFree:") { // 【新增】
-            swap_free = value;
-            found_count++;
-        }
+        if (key == "MemTotal:") { mem_total = value; found_count++; }
+        else if (key == "MemAvailable:") { mem_available = value; found_count++; }
+        else if (key == "SwapTotal:") { swap_total = value; found_count++; }
+        else if (key == "SwapFree:") { swap_free = value; found_count++; }
     }
     meminfo_file.close();
 
     std::lock_guard<std::mutex> lock(data_mutex_);
     current_stats_.total_mem_kb = mem_total;
     current_stats_.avail_mem_kb = mem_available;
-    // 【新增】
     current_stats_.swap_total_kb = swap_total;
     current_stats_.swap_free_kb = swap_free;
 }

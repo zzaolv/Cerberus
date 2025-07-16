@@ -8,7 +8,8 @@
 #include <sstream>
 #include <filesystem>
 #include <fstream>
-#include <algorithm> // For std::all_of
+#include <algorithm>
+#include <sys/stat.h> // For stat()
 
 #define LOG_TAG "cerberusd_state"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -18,6 +19,7 @@
 namespace fs = std::filesystem;
 
 static std::string status_to_string_local(AppRuntimeState::Status status) {
+    // ... (此函数内容不变)
     switch (status) {
         case AppRuntimeState::Status::STOPPED: return "STOPPED";
         case AppRuntimeState::Status::FOREGROUND: return "FOREGROUND";
@@ -30,7 +32,8 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-int StateManager::get_pid_for_package(const std::string& package_name) {
+// 【核心重构】新的PID查找函数，通过UID进行精确匹配
+int StateManager::get_pid_for_app_instance(int target_uid) {
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
         
@@ -39,11 +42,9 @@ int StateManager::get_pid_for_package(const std::string& package_name) {
             continue;
         }
 
-        std::ifstream cmdline_file(entry.path() / "cmdline");
-        if (cmdline_file.is_open()) {
-            std::string cmdline;
-            std::getline(cmdline_file, cmdline, '\0');
-            if (!cmdline.empty() && cmdline == package_name) {
+        struct stat st;
+        if (stat(entry.path().c_str(), &st) == 0) {
+            if (st.st_uid == target_uid) {
                 try {
                     return std::stoi(pid_str);
                 } catch (const std::invalid_argument&) {
@@ -66,8 +67,8 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::sha
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status) {
     if (app.current_status == new_status) return;
     
-    LOGI("State transition for %s: %s -> %s", 
-         app.package_name.c_str(), 
+    LOGI("State transition for %s (user %d): %s -> %s", 
+         app.package_name.c_str(), app.user_id,
          status_to_string_local(app.current_status).c_str(), 
          status_to_string_local(new_status).c_str());
 
@@ -96,12 +97,13 @@ void StateManager::refresh_installed_apps() {
 
         try {
             int full_uid = std::stoi(uid_str);
+            int user_id = full_uid / 100000;
             
             AppRuntimeState app_state;
             app_state.package_name = package_name;
             app_state.app_name = package_name;
             app_state.uid = full_uid;
-            app_state.user_id = full_uid / 100000;
+            app_state.user_id = user_id;
 
             auto config_opt = db_manager_->get_app_config(package_name);
             if (config_opt) {
@@ -112,18 +114,23 @@ void StateManager::refresh_installed_apps() {
             }
             
             transition_state(app_state, AppRuntimeState::Status::STOPPED);
-            managed_apps_[package_name] = app_state;
+            
+            // 【核心重构】使用复合键
+            managed_apps_[{package_name, user_id}] = app_state;
 
         } catch (const std::exception& e) {
             LOGW("Failed to parse line in packages.list: %s", line.c_str());
         }
     }
-    LOGI("Found and loaded %zu installed apps from packages.list.", managed_apps_.size());
+    LOGI("Found and loaded %zu app instances from packages.list.", managed_apps_.size());
 }
 
-void StateManager::on_app_killed(const std::string& package_name) {
+// 【核心重构】事件处理函数现在使用复合键
+void StateManager::on_app_killed(const std::string& package_name, int user_id) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    auto it = managed_apps_.find(package_name);
+    AppInstanceKey key = {package_name, user_id};
+    auto it = managed_apps_.find(key);
+
     if (it != managed_apps_.end()) {
         if(it->second.current_status == AppRuntimeState::Status::FROZEN){
              action_executor_->unfreeze_uid(it->second.uid);
@@ -131,12 +138,15 @@ void StateManager::on_app_killed(const std::string& package_name) {
         transition_state(it->second, AppRuntimeState::Status::STOPPED);
         it->second.mem_usage_kb = 0;
         it->second.cpu_usage_percent = 0.0f;
+        it->second.swap_usage_kb = 0;
     }
 }
 
-void StateManager::on_app_started(const std::string& package_name) {
+void StateManager::on_app_started(const std::string& package_name, int user_id) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    auto it = managed_apps_.find(package_name);
+    AppInstanceKey key = {package_name, user_id};
+    auto it = managed_apps_.find(key);
+
     if (it != managed_apps_.end()) {
         if(it->second.current_status == AppRuntimeState::Status::FROZEN){
             action_executor_->unfreeze_uid(it->second.uid);
@@ -150,15 +160,17 @@ void StateManager::update_all_states() {
     global_stats_ = sys_monitor_->get_stats();
     auto now = std::chrono::steady_clock::now();
 
-    for (auto& [pkg, app] : managed_apps_) {
+    for (auto& [key, app] : managed_apps_) {
         if (app.config.policy == AppPolicy::EXEMPTED) {
             transition_state(app, AppRuntimeState::Status::EXEMPTED);
             app.mem_usage_kb = 0;
             app.cpu_usage_percent = 0.0f;
+            app.swap_usage_kb = 0;
             continue;
         }
 
-        int pid = get_pid_for_package(pkg);
+        // 【核心重构】调用新的PID查找函数
+        int pid = get_pid_for_app_instance(app.uid);
 
         if (pid <= 0) {
             if (app.current_status == AppRuntimeState::Status::FROZEN) {
@@ -167,12 +179,14 @@ void StateManager::update_all_states() {
             transition_state(app, AppRuntimeState::Status::STOPPED);
             app.mem_usage_kb = 0;
             app.cpu_usage_percent = 0.0f;
+            app.swap_usage_kb = 0;
             continue;
         }
         
         AppStatsData app_stats = sys_monitor_->get_app_stats(pid);
         app.cpu_usage_percent = app_stats.cpu_usage_percent;
         app.mem_usage_kb = app_stats.mem_usage_kb;
+        app.swap_usage_kb = app_stats.swap_usage_kb; // 保存应用swap占用
 
         if(app.current_status == AppRuntimeState::Status::STOPPED){
             transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
@@ -217,9 +231,7 @@ nlohmann::json StateManager::get_dashboard_payload() {
     };
     
     json apps_state = json::array();
-    for (const auto& [pkg, app] : managed_apps_) {
-        // 【核心修复】移除未定义的 'is_foreground_for_display'。
-        // 现在的逻辑是：只要应用的状态不是 STOPPED，就将其信息推送到UI。
+    for (const auto& [key, app] : managed_apps_) {
         if (app.current_status != AppRuntimeState::Status::STOPPED) {
             json app_json;
             app_json["package_name"] = app.package_name;
@@ -227,6 +239,7 @@ nlohmann::json StateManager::get_dashboard_payload() {
             app_json["user_id"] = app.user_id;
             app_json["display_status"] = status_to_string_local(app.current_status);
             app_json["mem_usage_kb"] = app.mem_usage_kb;
+            app_json["swap_usage_kb"] = app.swap_usage_kb; // 上报应用swap占用
             app_json["cpu_usage_percent"] = app.cpu_usage_percent;
             app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
             app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
