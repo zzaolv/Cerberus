@@ -1,7 +1,7 @@
 // daemon/cpp/database_manager.cpp
 #include "database_manager.h"
 #include <android/log.h>
-#include <chrono>
+#include <chrono> // 确保包含了 chrono 头文件
 
 #define LOG_TAG "cerberusd_db"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -39,7 +39,7 @@ void DatabaseManager::initialize_database() {
                     app_name TEXT
                 )
             )");
-             db_.exec("CREATE INDEX idx_logs_timestamp ON logs(timestamp DESC);");
+             db_.exec("CREATE INDEX idx_logs_timestamp ON logs(timestamp DESC);"); // 优化查询
         }
 
     } catch (const std::exception& e) {
@@ -51,13 +51,15 @@ bool DatabaseManager::log_event(LogLevel level, const std::string& message, cons
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
         SQLite::Statement query(db_, "INSERT INTO logs (timestamp, level, message, app_name) VALUES (?, ?, ?, ?)");
-        query.bind(1, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        
+        // 【核心修复】将时间戳显式转换为 int64_t 来解决类型歧义
+        auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        query.bind(1, static_cast<int64_t>(timestamp_ms));
+        
         query.bind(2, static_cast<int>(level));
         query.bind(3, message);
         if (!app_name.empty()) {
             query.bind(4, app_name);
-        } else {
-            query.bind(4); // Bind NULL
         }
         query.exec();
         return true;
@@ -87,6 +89,7 @@ std::vector<LogEntry> DatabaseManager::get_logs(int limit, int offset) {
     }
     return entries;
 }
+
 
 std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
     std::lock_guard<std::mutex> lock(db_mutex_);
