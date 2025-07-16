@@ -10,6 +10,7 @@
 #include <mutex>
 #include <chrono>
 #include <utility>
+#include <set> // 【新增】
 
 #include "system_monitor.h"
 #include "database_manager.h"
@@ -34,12 +35,13 @@ struct AppRuntimeState {
     long swap_usage_kb = 0;
 };
 
-// 【新增】定义Cgroup状态和进程信息结构体
 enum class CgroupState { FOREGROUND, BACKGROUND, UNKNOWN };
 
+// 【修改】ProcessInfo现在包含包名
 struct ProcessInfo {
     int pid;
     int uid;
+    std::string package_name;
     CgroupState cgroup_state;
 };
 
@@ -56,7 +58,10 @@ public:
 private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
-    void build_process_cache_from_cgroups(); // 【修改】方法名，体现新策略
+    void build_process_cache_from_cgroups();
+    // 【新增】帮助函数，用于动态创建App实例
+    AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
+
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
@@ -70,7 +75,6 @@ private:
 
     std::map<std::string, bool> app_is_system_map_;
 
-    // 【修改】缓存结构，现在以PID为键，存储更丰富的ProcessInfo
     std::map<int, ProcessInfo> process_info_cache_;
 };
 
