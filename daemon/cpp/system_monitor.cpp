@@ -29,19 +29,22 @@ GlobalStatsData SystemMonitor::get_stats() const {
     return current_stats_;
 }
 
-// 【核心修复】回归smaps_rollup，获取最准确的 PSS 和 SwapPSS
+/**
+ * 【核心修复】获取应用统计信息，采用两层方法获取PSS内存，确保健壮性。
+ */
 AppStatsData SystemMonitor::get_app_stats(int pid) {
     AppStatsData stats;
     if (pid <= 0) return stats;
 
-    // --- 读取内存和交换区信息 ---
-    std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
-    std::ifstream smaps_file(smaps_path);
-    if (smaps_file.is_open()) {
+    // --- 1. PSS和Swap内存获取 ---
+    
+    // --- 第一层 (Fast Path): 尝试读取 smaps_rollup ---
+    std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
+    std::ifstream rollup_file(smaps_rollup_path);
+    if (rollup_file.is_open()) {
         std::string line;
         int found_count = 0;
-        while (std::getline(smaps_file, line) && found_count < 2) {
-            // Pss_Total 是所有 PSS 条目的总和，比单个 Pss: 行更准确
+        while (std::getline(rollup_file, line) && found_count < 2) {
             if (line.rfind("Pss_Total:", 0) == 0) {
                 std::stringstream ss(line);
                 std::string key;
@@ -60,7 +63,33 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
         }
     }
 
-    // --- 读取和计算CPU使用率 (逻辑不变) ---
+    // --- 第二层 (Fallback Path): 如果快速路径结果为0，则读取完整的 smaps 文件 ---
+    if (stats.mem_usage_kb == 0) {
+        // LOGI("PID %d: smaps_rollup gave 0 PSS. Falling back to full smaps parsing.", pid);
+        std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps";
+        std::ifstream smaps_file(smaps_path);
+        if (smaps_file.is_open()) {
+            long long total_pss_kb = 0;
+            std::string line;
+            while (std::getline(smaps_file, line)) {
+                // 累加所有独立的 Pss 条目
+                if (line.rfind("Pss:", 0) == 0) {
+                    std::stringstream ss(line);
+                    std::string key;
+                    long value;
+                    ss >> key >> value;
+                    total_pss_kb += value;
+                }
+            }
+            stats.mem_usage_kb = total_pss_kb;
+        } else {
+            // 如果两个文件都读取失败，则内存为0
+            // LOGW("PID %d: Failed to open both smaps_rollup and smaps.", pid);
+        }
+    }
+
+
+    // --- 2. CPU使用率获取 (逻辑不变) ---
     std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
     std::ifstream stat_file(stat_path);
     if (stat_file.is_open()) {
@@ -91,7 +120,6 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
     return stats;
 }
 
-// ... (update_cpu_usage 和 update_mem_info 两个函数保持不变) ...
 void SystemMonitor::update_cpu_usage() {
     std::ifstream stat_file("/proc/stat");
     if (!stat_file.is_open()) return;
