@@ -12,11 +12,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -34,15 +38,12 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
-/**
- * 将KB转换为可读的MB或GB字符串
- */
 fun formatMemory(kb: Long): String {
-    if (kb <= 0) return "0 MB"
+    if (kb <= 1024) return "${kb} KB" // 小于1MB显示KB
     val mb = kb / 1024.0
     val gb = mb / 1024.0
     return when {
-        gb >= 1 -> "%.2f GB".format(Locale.US, gb)
+        gb >= 1 -> "%.1f GB".format(Locale.US, gb)
         else -> "%.1f MB".format(Locale.US, mb)
     }
 }
@@ -201,12 +202,12 @@ fun RuntimeStatusList(apps: List<UiApp>) {
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // 使用 runtimeState 的 package 和 userId 作为复合键，确保唯一性
         items(items = apps, key = { "${it.runtimeState.packageName}-${it.runtimeState.userId}" }) { app ->
             AppStatusCard(app = app)
         }
     }
 }
+
 
 @Composable
 fun AppStatusCard(app: UiApp) {
@@ -226,6 +227,7 @@ fun AppStatusCard(app: UiApp) {
             Spacer(Modifier.width(12.dp))
 
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                // App Name and Clone Icon
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val displayName = app.appInfo?.appName ?: app.runtimeState.packageName
                     Text(
@@ -235,7 +237,6 @@ fun AppStatusCard(app: UiApp) {
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    // 如果 userId 不为0，显示分身图标
                     if (app.runtimeState.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
@@ -249,19 +250,27 @@ fun AppStatusCard(app: UiApp) {
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
 
-                // 构造资源占用字符串，如果SWAP>0才显示
-                val memText = "MEM: ${formatMemory(app.runtimeState.memUsageKb)}"
-                val swapText = if (app.runtimeState.swapUsageKb > 0) " | SWAP: ${formatMemory(app.runtimeState.swapUsageKb)}" else ""
-                val cpuText = " | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%"
-                
+                // 【核心修复】构造优雅的内存和CPU显示文本
+                val resourceText = buildAnnotatedString {
+                    append("MEM: ${formatMemory(app.runtimeState.memUsageKb)}")
+                    // 如果Swap占用大于1MB，才显示
+                    if (app.runtimeState.swapUsageKb > 1024) {
+                        withStyle(style = SpanStyle(color = Color.Gray)) {
+                            append(" (+${formatMemory(app.runtimeState.swapUsageKb)} S)")
+                        }
+                    }
+                    append(" | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%")
+                }
+
                 Text(
-                    text = memText + swapText + cpuText,
+                    text = resourceText,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 
+                // Status Text
                 Text(
                     text = "STATUS: ${getStatusText(app.runtimeState)}",
                     style = MaterialTheme.typography.bodySmall,
@@ -334,20 +343,18 @@ fun DashboardContentPreview() {
             ),
             networkSpeed = NetworkSpeed(downloadSpeedBps = 12_582_912, uploadSpeedBps = 1_310_720),
             displayedApps = listOf(
-                // 模拟主应用
                 UiApp(
                     runtimeState = AppRuntimeState(
                         packageName = "com.tencent.mm", appName = "微信", userId = 0,
-                        isForeground = true, memUsageKb = 512000, swapUsageKb = 102400,
+                        isForeground = true, memUsageKb = 512000, swapUsageKb = 128000, // 125MB Swap
                         displayStatus = DisplayStatus.FOREGROUND
                     ),
                     appInfo = AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT, icon = null)
                 ),
-                // 模拟分身应用
                 UiApp(
                     runtimeState = AppRuntimeState(
                         packageName = "com.tencent.mm", appName = "微信", userId = 999,
-                        memUsageKb = 256000, swapUsageKb = 0,
+                        memUsageKb = 256000, swapUsageKb = 0, // No Swap
                         displayStatus = DisplayStatus.BACKGROUND_IDLE
                     ),
                     appInfo = AppInfo("com.tencent.mm", "微信 (分身)", Policy.IMPORTANT, icon = null)

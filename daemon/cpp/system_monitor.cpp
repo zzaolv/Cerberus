@@ -29,26 +29,27 @@ GlobalStatsData SystemMonitor::get_stats() const {
     return current_stats_;
 }
 
-// 【健壮性修复】重写 get_app_stats，改用 /proc/[pid]/status
+// 【核心修复】回归smaps_rollup，获取最准确的 PSS 和 SwapPSS
 AppStatsData SystemMonitor::get_app_stats(int pid) {
     AppStatsData stats;
     if (pid <= 0) return stats;
 
     // --- 读取内存和交换区信息 ---
-    std::string status_path = "/proc/" + std::to_string(pid) + "/status";
-    std::ifstream status_file(status_path);
-    if (status_file.is_open()) {
+    std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
+    std::ifstream smaps_file(smaps_path);
+    if (smaps_file.is_open()) {
         std::string line;
         int found_count = 0;
-        while (std::getline(status_file, line) && found_count < 2) {
-            if (line.rfind("VmRSS:", 0) == 0) {
+        while (std::getline(smaps_file, line) && found_count < 2) {
+            // Pss_Total 是所有 PSS 条目的总和，比单个 Pss: 行更准确
+            if (line.rfind("Pss_Total:", 0) == 0) {
                 std::stringstream ss(line);
                 std::string key;
                 long value;
                 ss >> key >> value;
                 stats.mem_usage_kb = value;
                 found_count++;
-            } else if (line.rfind("VmSwap:", 0) == 0) {
+            } else if (line.rfind("SwapPss:", 0) == 0) {
                 std::stringstream ss(line);
                 std::string key;
                 long value;
@@ -57,8 +58,6 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
                 found_count++;
             }
         }
-    } else {
-        // LOGW("Could not open %s for PID %d", status_path.c_str(), pid);
     }
 
     // --- 读取和计算CPU使用率 (逻辑不变) ---
@@ -92,6 +91,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
     return stats;
 }
 
+// ... (update_cpu_usage 和 update_mem_info 两个函数保持不变) ...
 void SystemMonitor::update_cpu_usage() {
     std::ifstream stat_file("/proc/stat");
     if (!stat_file.is_open()) return;

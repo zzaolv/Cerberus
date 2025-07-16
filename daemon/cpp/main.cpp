@@ -32,6 +32,9 @@ std::shared_ptr<SystemMonitor> g_sys_monitor;
 std::atomic<bool> g_is_running = true;
 
 // 【核心重构】更新消息处理器以解析 user_id
+// daemon/cpp/main.cpp
+// ... includes and other definitions ...
+
 void handle_message(const std::string& message_str) {
     LOGI("Received message: %s", message_str.c_str());
     try {
@@ -41,7 +44,6 @@ void handle_message(const std::string& message_str) {
         if (type.rfind("event.", 0) == 0) {
             json payload = msg.value("payload", json::object());
             std::string pkg_name = payload.value("package_name", "");
-            // -1 是一个无效的 user_id，用于判断是否收到了该字段
             int user_id = payload.value("user_id", -1);
 
             if (pkg_name.empty() || user_id == -1) {
@@ -50,9 +52,9 @@ void handle_message(const std::string& message_str) {
             }
             
             if (type == "event.app_start") {
-                g_state_manager->on_app_started(pkg_name, user_id);
+                g_state_manager->handle_app_event(pkg_name, user_id, true); // true for start
             } else if (type == "event.app_killed") {
-                g_state_manager->on_app_killed(pkg_name, user_id);
+                g_state_manager->handle_app_event(pkg_name, user_id, false); // false for kill
             }
         }
     } catch (const json::parse_error& e) {
@@ -60,7 +62,6 @@ void handle_message(const std::string& message_str) {
     }
 }
 
-// ... (其余函数 signal_handler, monitor_thread, broadcaster_thread, main 不变) ...
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;

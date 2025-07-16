@@ -9,7 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
-#include <utility> // For std::pair
+#include <utility> 
 
 #include "system_monitor.h" 
 #include "database_manager.h" 
@@ -19,7 +19,7 @@ class ActionExecutor;
 struct AppRuntimeState {
     std::string package_name;
     std::string app_name;
-    int uid;
+    int uid = -1;
     int user_id;
 
     AppConfig config;
@@ -31,7 +31,7 @@ struct AppRuntimeState {
     std::chrono::steady_clock::time_point last_state_change_time;
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
-    long swap_usage_kb = 0; // 【新增】应用占用的交换空间
+    long swap_usage_kb = 0;
 };
 
 class StateManager {
@@ -40,15 +40,13 @@ public:
     void update_all_states();
     nlohmann::json get_dashboard_payload();
 
-    // 【核心重构】事件处理函数现在需要 user_id
-    void on_app_killed(const std::string& package_name, int user_id);
-    void on_app_started(const std::string& package_name, int user_id);
+    // 新的统一事件处理器
+    void handle_app_event(const std::string& package_name, int user_id, bool is_start);
 
 private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
     
-    // 【核心重构】查找PID的函数现在需要完整的UID
     int get_pid_for_app_instance(int uid);
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -58,7 +56,6 @@ private:
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
     
-    // 【核心重构】使用复合键 (package_name, user_id) 来唯一标识应用实例
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
 };
