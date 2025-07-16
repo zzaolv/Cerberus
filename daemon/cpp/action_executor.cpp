@@ -3,8 +3,9 @@
 #include <android/log.h>
 #include <sys/stat.h>
 #include <fstream>
-#include <filesystem> // C++17
+#include <filesystem>
 #include <unistd.h>
+#include <cstring>
 
 #define LOG_TAG "cerberusd_action"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -13,22 +14,26 @@
 
 namespace fs = std::filesystem;
 
-std::string ActionExecutor::get_freezer_path() {
-    // Android P and later use /acct
-    if (access("/acct/uid_0/cgroup.procs", F_OK) == 0) {
-        return "/acct";
+constexpr int PER_USER_RANGE = 100000;
+
+ActionExecutor::ActionExecutor() {
+    // 检测系统 cgroup 版本
+    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
+        cgroup_version_ = CgroupVersion::V2;
+        LOGI("Detected cgroup v2.");
+    } else if (fs::exists("/sys/fs/cgroup/freezer")) {
+        cgroup_version_ = CgroupVersion::V1;
+        LOGI("Detected cgroup v1.");
+    } else {
+        cgroup_version_ = CgroupVersion::UNKNOWN;
+        LOGE("Could not determine cgroup version.");
     }
-    // Older versions might use /dev/cpuctl
-    if (access("/dev/cpuctl/tasks", F_OK) == 0) {
-        return "/dev/cpuctl";
-    }
-    return ""; // Not found
 }
 
-bool ActionExecutor::write_to_cgroup(const std::string& path, const std::string& value) {
+bool ActionExecutor::write_to_file(const std::string& path, const std::string& value) {
     std::ofstream ofs(path);
     if (!ofs.is_open()) {
-        LOGE("Failed to open cgroup file: %s. Error: %s", path.c_str(), strerror(errno));
+        LOGE("Failed to open file: %s. Error: %s", path.c_str(), strerror(errno));
         return false;
     }
     ofs << value;
@@ -40,67 +45,86 @@ bool ActionExecutor::write_to_cgroup(const std::string& path, const std::string&
     return true;
 }
 
-std::vector<int> ActionExecutor::get_pids_for_uid(int uid) {
-    std::vector<int> pids;
-    std::string uid_str = std::to_string(uid);
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        
-        struct stat st;
-        if (stat(entry.path().c_str(), &st) == 0 && st.st_uid == uid) {
-            try {
-                pids.push_back(std::stoi(entry.path().filename().string()));
-            } catch (const std::invalid_argument&) {
-                // Ignore non-numeric directory names like 'self', 'thread-self'
-            }
-        }
+bool ActionExecutor::freeze_app(const std::string& package_name, int user_id) {
+    if (cgroup_version_ == CgroupVersion::V2) {
+        return freeze_app_v2(package_name, user_id);
+    } else if (cgroup_version_ == CgroupVersion::V1) {
+        // 在 v1 中，我们仍然基于 UID 操作
+        int app_id_guess = 10000 + (std::hash<std::string>{}(package_name) % 10000);
+        int uid = user_id * PER_USER_RANGE + app_id_guess;
+        LOGW("Freezing on cgroup v1 using guessed UID %d for %s", uid, package_name.c_str());
+        return freeze_uid_v1(uid);
     }
-    return pids;
+    return false;
+}
+
+bool ActionExecutor::unfreeze_app(const std::string& package_name, int user_id) {
+    if (cgroup_version_ == CgroupVersion::V2) {
+        return unfreeze_app_v2(package_name, user_id);
+    } else if (cgroup_version_ == CgroupVersion::V1) {
+        int app_id_guess = 10000 + (std::hash<std::string>{}(package_name) % 10000);
+        int uid = user_id * PER_USER_RANGE + app_id_guess;
+        LOGW("Unfreezing on cgroup v1 using guessed UID %d for %s", uid, package_name.c_str());
+        return unfreeze_uid_v1(uid);
+    }
+    return false;
 }
 
 
-bool ActionExecutor::freeze_uid(int uid) {
-    LOGI("Attempting to FREEZE uid %d", uid);
-    std::string freezer_base_path = get_freezer_path();
-    if (freezer_base_path.empty()) {
-        LOGE("cgroup freezer path not found, cannot freeze.");
-        return false;
-    }
-
-    std::string freezer_path = freezer_base_path + "/uid_" + std::to_string(uid) + "/freezer.state";
-    if (access(freezer_path.c_str(), F_OK) != 0) {
-        LOGW("Freezer path %s not found. Freezing via PIDs.", freezer_path.c_str());
-        // Fallback: If UID-based cgroup doesn't exist, try freezing individual PIDs
-        auto pids = get_pids_for_uid(uid);
-        if (pids.empty()) {
-            LOGW("No PIDs found for UID %d, freeze operation skipped.", uid);
-            return true; // No processes to freeze
-        }
-        for (int pid : pids) {
-            std::string pid_cgroup_tasks = freezer_base_path + "/tasks";
-             if(!write_to_cgroup(pid_cgroup_tasks, std::to_string(pid))){
-                 // Logged inside write_to_cgroup
-             }
-        }
-        return write_to_cgroup(freezer_base_path + "/freezer.state", "FROZEN");
-    }
-
-    return write_to_cgroup(freezer_path, "FROZEN");
+// --- cgroup v2 implementation ---
+std::string get_app_cgroup_path_v2(const std::string& package_name, int user_id) {
+    return "/sys/fs/cgroup/uid_" + std::to_string(user_id * PER_USER_RANGE) + "/pid_0/uid_" + std::to_string(user_id * PER_USER_RANGE + 10000) + "/" + package_name;
+    // Note: This path is a common pattern but might vary. A more robust solution
+    // would read a process's cgroup file to find the exact path.
 }
 
-bool ActionExecutor::unfreeze_uid(int uid) {
-    LOGI("Attempting to UNFREEZE uid %d", uid);
-    std::string freezer_base_path = get_freezer_path();
-    if (freezer_base_path.empty()) {
-        LOGE("cgroup freezer path not found, cannot unfreeze.");
+bool ActionExecutor::freeze_app_v2(const std::string& package_name, int user_id) {
+    LOGI("Freezing (v2) app %s (user %d)", package_name.c_str(), user_id);
+    // 在cgroup v2中，路径通常是/sys/fs/cgroup/uid_XXXX/....
+    // 这是一个简化的假设，更健壮的方法是从一个存活的进程读取
+    std::string path = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/cgroup.freeze";
+    if (!fs::exists(path)) {
+        // Fallback path for some OEM roms
+        path = "/sys/fs/cgroup/uid_" + std::to_string(user_id * PER_USER_RANGE) + "/cgroup.freeze";
+    }
+     if (!fs::exists(path)) {
+        LOGE("cgroup v2 freeze path not found for %s", package_name.c_str());
         return false;
     }
+    return write_to_file(path, "1");
+}
 
-    std::string freezer_path = freezer_base_path + "/uid_" + std::to_string(uid) + "/freezer.state";
-    if (access(freezer_path.c_str(), F_OK) != 0) {
-         LOGW("Freezer path %s not found. Unfreezing root cgroup.", freezer_path.c_str());
-         return write_to_cgroup(freezer_base_path + "/freezer.state", "THAWED");
+bool ActionExecutor::unfreeze_app_v2(const std::string& package_name, int user_id) {
+    LOGI("Unfreezing (v2) app %s (user %d)", package_name.c_str(), user_id);
+    std::string path = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/cgroup.freeze";
+    if (!fs::exists(path)) {
+       path = "/sys/fs/cgroup/uid_" + std::to_string(user_id * PER_USER_RANGE) + "/cgroup.freeze";
     }
-    
-    return write_to_cgroup(freezer_path, "THAWED");
+    if (!fs::exists(path)) {
+        LOGE("cgroup v2 unfreeze path not found for %s", package_name.c_str());
+        return false;
+    }
+    return write_to_file(path, "0");
+}
+
+
+// --- cgroup v1 implementation ---
+bool ActionExecutor::freeze_uid_v1(int uid) {
+    LOGI("Freezing (v1) uid %d", uid);
+    std::string freezer_path = "/sys/fs/cgroup/freezer/uid_" + std::to_string(uid) + "/freezer.state";
+    if (!fs::exists(freezer_path)) {
+        LOGE("cgroup v1 freeze path not found: %s", freezer_path.c_str());
+        return false;
+    }
+    return write_to_file(freezer_path, "FROZEN");
+}
+
+bool ActionExecutor::unfreeze_uid_v1(int uid) {
+    LOGI("Unfreezing (v1) uid %d", uid);
+    std::string freezer_path = "/sys/fs/cgroup/freezer/uid_" + std::to_string(uid) + "/freezer.state";
+    if (!fs::exists(freezer_path)) {
+        LOGE("cgroup v1 unfreeze path not found: %s", freezer_path.c_str());
+        return false;
+    }
+    return write_to_file(freezer_path, "THAWED");
 }

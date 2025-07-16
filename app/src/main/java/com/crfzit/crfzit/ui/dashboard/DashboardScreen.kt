@@ -8,6 +8,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
+// 【核心修复】导入 CircleShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -40,7 +42,9 @@ import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
-import java.util.Locale
+// 【核心修复】导入我们自己的图标
+import com.crfzit.crfzit.ui.icons.AppIcons
+import java.util.Locale 
 
 // 内存格式化工具函数
 fun formatMemory(kb: Long): String {
@@ -172,10 +176,9 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                 .padding(bottom = 12.dp)
         )
         
-        // 使用网格布局，每行2个
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
-            modifier = Modifier.height(180.dp), // 固定高度
+            modifier = Modifier.height(180.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             userScrollEnabled = false
@@ -185,7 +188,8 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                     label = "CPU",
                     value = "%.1f".format(Locale.US, stats.totalCpuUsagePercent) + "%",
                     progress = cpuUsedPercent,
-                    icon = Icons.Default.Memory
+                    // 【核心修复】使用我们自己的图标
+                    icon = AppIcons.Memory
                 )
             }
             item {
@@ -193,7 +197,8 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                     label = "内存 (MEM)",
                     value = formatMemory(stats.totalMemKb - stats.availMemKb),
                     progress = memUsedPercent,
-                    icon = Icons.Default.SdStorage
+                    // 【核心修复】使用我们自己的图标
+                    icon = AppIcons.SdStorage
                 )
             }
             item {
@@ -201,7 +206,8 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                     label = "交换 (SWAP)",
                     value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
                     progress = swapUsedPercent,
-                    icon = Icons.Default.SwapHoriz
+                    // 【核心修复】使用我们自己的图标
+                    icon = AppIcons.SwapHoriz
                 )
             }
             item {
@@ -209,7 +215,8 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                     label = "网络",
                     value = "↓${downSpeed.first} | ↑${upSpeed.first}",
                     subValue = "${downSpeed.second} / ${upSpeed.second}",
-                    icon = Icons.Default.Wifi
+                    // 【核心修复】使用我们自己的图标
+                    icon = AppIcons.Wifi
                 )
             }
         }
@@ -246,6 +253,7 @@ fun StatusGridItem(
                 Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
                     progress = { progress },
+                    // 【核心修复】使用 clip(CircleShape)
                     modifier = Modifier.fillMaxWidth().clip(CircleShape)
                 )
             }

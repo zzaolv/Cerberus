@@ -18,7 +18,6 @@ struct GlobalStatsData {
 struct AppStatsData {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
-    // 【新增】应用占用的交换空间
     long swap_usage_kb = 0;
 };
 
@@ -33,19 +32,23 @@ class SystemMonitor {
 public:
     SystemMonitor();
     
-    void update_all_stats();
-    GlobalStatsData get_stats() const;
-    AppStatsData get_app_stats(int pid);
+    void update_global_stats();
+    GlobalStatsData get_global_stats() const;
+
+    // 【核心修改】获取应用统计信息的方法签名改变
+    AppStatsData get_app_stats(int pid, const std::string& package_name, int user_id);
 
 private:
     void update_cpu_usage();
     void update_mem_info();
+
+    enum class CgroupVersion { V1, V2, UNKNOWN };
+    CgroupVersion cgroup_version_ = CgroupVersion::UNKNOWN;
     
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
     CpuTimes prev_cpu_times_;
     
-    // 用于计算单个应用的CPU使用率
     struct AppCpuState {
         long long prev_app_jiffies = 0;
         long long prev_total_jiffies = 0;

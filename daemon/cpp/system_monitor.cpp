@@ -3,89 +3,96 @@
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
-#include <chrono>
 #include <unistd.h>
-#include <array>
-#include <memory>
-#include <string>
-#include <vector>
+#include <filesystem>
 
 #define LOG_TAG "cerberusd_monitor"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
+namespace fs = std::filesystem;
+constexpr int PER_USER_RANGE = 100000;
+
 SystemMonitor::SystemMonitor() {
-    update_all_stats();
+    // 检测 cgroup 版本
+    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
+        cgroup_version_ = CgroupVersion::V2;
+    } else if (fs::exists("/sys/fs/cgroup/freezer")) {
+        cgroup_version_ = CgroupVersion::V1;
+    } else {
+        cgroup_version_ = CgroupVersion::UNKNOWN;
+    }
+    update_global_stats();
 }
 
-void SystemMonitor::update_all_stats() {
+void SystemMonitor::update_global_stats() {
     update_cpu_usage();
     update_mem_info();
 }
 
-GlobalStatsData SystemMonitor::get_stats() const {
+GlobalStatsData SystemMonitor::get_global_stats() const {
     std::lock_guard<std::mutex> lock(data_mutex_);
     return current_stats_;
 }
 
 /**
- * 【核心修复】获取应用统计信息，采用两层方法获取PSS内存，确保健壮性。
+ * 【核心重构】获取应用统计信息
+ * 优先使用cgroup v2的memory.current，解决MEM为0的问题。
+ * 回退到smaps_rollup作为备用方案。
  */
-AppStatsData SystemMonitor::get_app_stats(int pid) {
+AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_name, int user_id) {
     AppStatsData stats;
     if (pid <= 0) return stats;
 
-    // --- 1. PSS和Swap内存获取 ---
-    
-    // --- 第一层 (Fast Path): 尝试读取 smaps_rollup，效率最高 ---
-    std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
-    std::ifstream rollup_file(smaps_rollup_path);
-    if (rollup_file.is_open()) {
-        std::string line;
-        int found_count = 0;
-        while (std::getline(rollup_file, line) && found_count < 2) {
-            if (line.rfind("Pss_Total:", 0) == 0) {
-                std::stringstream ss(line);
-                std::string key;
-                long value;
-                ss >> key >> value;
-                stats.mem_usage_kb = value;
-                found_count++;
-            } else if (line.rfind("SwapPss:", 0) == 0) {
-                std::stringstream ss(line);
-                std::string key;
-                long value;
-                ss >> key >> value;
-                stats.swap_usage_kb = value;
-                found_count++;
+    // --- 1. 内存获取 ---
+    if (cgroup_version_ == CgroupVersion::V2) {
+        // --- cgroup v2 路径：更可靠的内存统计 ---
+        std::string mem_path = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/memory.current";
+        std::ifstream mem_file(mem_path);
+        if (mem_file.is_open()) {
+            long long mem_bytes = 0;
+            mem_file >> mem_bytes;
+            stats.mem_usage_kb = mem_bytes / 1024;
+        } else {
+            // Fallback for PSS
+            std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
+            std::ifstream rollup_file(smaps_rollup_path);
+             if (rollup_file.is_open()) {
+                std::string line;
+                while (std::getline(rollup_file, line)) {
+                    if (line.rfind("Pss_Total:", 0) == 0) {
+                        std::stringstream ss(line);
+                        std::string key;
+                        long value;
+                        ss >> key >> value;
+                        stats.mem_usage_kb = value;
+                        break;
+                    }
+                }
             }
         }
-    }
-
-    // --- 第二层 (Fallback Path): 如果快速路径结果为0，则读取完整的 smaps 文件 ---
-    // 这对于获取“缓存”应用的精确内存至关重要
-    if (stats.mem_usage_kb == 0) {
-        // LOGI("PID %d: smaps_rollup gave 0 PSS. Falling back to full smaps parsing.", pid);
-        std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps";
-        std::ifstream smaps_file(smaps_path);
-        if (smaps_file.is_open()) {
-            long long total_pss_kb = 0;
+    } else {
+        // --- cgroup v1 路径：使用 smaps_rollup ---
+        std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
+        std::ifstream rollup_file(smaps_rollup_path);
+        if (rollup_file.is_open()) {
             std::string line;
-            while (std::getline(smaps_file, line)) {
-                // 累加所有独立的 Pss 条目
-                if (line.rfind("Pss:", 0) == 0) {
+            while (std::getline(rollup_file, line)) {
+                if (line.rfind("Pss_Total:", 0) == 0) {
                     std::stringstream ss(line);
                     std::string key;
                     long value;
                     ss >> key >> value;
-                    total_pss_kb += value;
+                    stats.mem_usage_kb = value;
+                } else if (line.rfind("SwapPss:", 0) == 0) {
+                     std::stringstream ss(line);
+                     std::string key;
+                     long value;
+                     ss >> key >> value;
+                     stats.swap_usage_kb = value;
                 }
             }
-            stats.mem_usage_kb = total_pss_kb;
-        } else {
-            // 如果两个文件都读取失败，则内存为0
-            // LOGW("PID %d: Failed to open both smaps_rollup and smaps.", pid);
         }
     }
 
@@ -98,7 +105,6 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
         std::getline(stat_file, line);
         std::stringstream ss(line);
         std::string value;
-        // utime和stime是第14和15个字段
         for(int i=0; i<13; ++i) ss >> value; 
         long long utime, stime;
         ss >> utime >> stime;
@@ -125,29 +131,23 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
 void SystemMonitor::update_cpu_usage() {
     std::ifstream stat_file("/proc/stat");
     if (!stat_file.is_open()) return;
-
     std::string line;
     std::getline(stat_file, line);
     stat_file.close();
-
     std::string cpu_label;
     CpuTimes current_times;
     std::stringstream ss(line);
     ss >> cpu_label >> current_times.user >> current_times.nice >> current_times.system >> current_times.idle
        >> current_times.iowait >> current_times.irq >> current_times.softirq >> current_times.steal;
-
     if (cpu_label == "cpu") {
         long long prev_total = prev_cpu_times_.total();
         long long current_total = current_times.total();
         long long delta_total = current_total - prev_total;
-
         if (delta_total > 0) {
             long long prev_idle = prev_cpu_times_.idle_total();
             long long current_idle = current_times.idle_total();
             long long delta_idle = current_idle - prev_idle;
-            
             float cpu_usage = 100.0f * (1.0f - static_cast<float>(delta_idle) / static_cast<float>(delta_total));
-            
             std::lock_guard<std::mutex> lock(data_mutex_);
             current_stats_.total_cpu_usage_percent = cpu_usage >= 0.0f ? cpu_usage : 0.0f;
         }
@@ -158,11 +158,9 @@ void SystemMonitor::update_cpu_usage() {
 void SystemMonitor::update_mem_info() {
     std::ifstream meminfo_file("/proc/meminfo");
     if (!meminfo_file.is_open()) return;
-
     std::string line;
     long mem_total = 0, mem_available = 0, swap_total = 0, swap_free = 0;
     int found_count = 0;
-
     while (std::getline(meminfo_file, line) && found_count < 4) {
         std::string key;
         long value;
@@ -174,7 +172,6 @@ void SystemMonitor::update_mem_info() {
         else if (key == "SwapFree:") { swap_free = value; found_count++; }
     }
     meminfo_file.close();
-
     std::lock_guard<std::mutex> lock(data_mutex_);
     current_stats_.total_mem_kb = mem_total;
     current_stats_.avail_mem_kb = mem_available;

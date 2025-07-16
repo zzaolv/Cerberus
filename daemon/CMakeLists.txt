@@ -23,7 +23,7 @@ target_include_directories(sqlitecpp_lib PUBLIC ${THIRDPARTY_DIR}/sqlitecpp/incl
 target_link_libraries(sqlitecpp_lib PUBLIC sqlite3_lib)
 
 # --- 4. 定义最终的可执行文件 ---
-# 【核心修改】添加新的源文件
+# 【核心修改】添加新的源文件 process_monitor.cpp
 add_executable(cerberusd
     cpp/main.cpp
     cpp/uds_server.cpp
@@ -31,6 +31,7 @@ add_executable(cerberusd
     cpp/database_manager.cpp
     cpp/state_manager.cpp
     cpp/action_executor.cpp
+    cpp/process_monitor.cpp
 )
 
 # --- 5. 添加头文件搜索路径 ---
@@ -39,10 +40,12 @@ target_include_directories(cerberusd PRIVATE
 )
 
 # --- 6. 链接最终的可执行文件 ---
+# 【核心修改】链接 libdiag 库
 target_link_libraries(cerberusd
     PRIVATE
-    sqlitecpp_lib # 链接我们自己构建的 SQLiteCpp
-    log           # 链接安卓日志库
+    sqlitecpp_lib
+    log
+    diag # Netlink Connector 库
 )
 
 # --- 7. 设置 C++ 标准 ---

@@ -1,15 +1,12 @@
 // app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
 package com.crfzit.crfzit.ui.configuration
 
-import com.crfzit.crfzit.ui.icons.AppIcons // 导入我们自己的图标
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Style
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -21,6 +18,7 @@ import androidx.navigation.NavController
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.navigation.Screen
+import com.crfzit.crfzit.ui.icons.AppIcons
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -48,7 +46,7 @@ fun ConfigurationScreen(
                 title = { Text("应用配置") },
                 actions = {
                     IconButton(onClick = { navController.navigate(Screen.ProfileManagement.route) }) {
-                        Icon(Icons.Default.Style, contentDescription = "情景模式管理")
+                        Icon(AppIcons.Style, contentDescription = "情景模式管理")
                     }
                     var showMenu by remember { mutableStateOf(false) }
                     IconButton(onClick = { showMenu = !showMenu }) {
@@ -106,15 +104,13 @@ fun ConfigurationScreen(
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
             sheetState = sheetState,
-            // 【全面屏适配】确保BottomSheet避开系统导航栏
-            windowInsets = WindowInsets(0, 0, 0, 0)
+            // 【核心修复】移除错误的 windowInsets 参数
         ) {
             AppPolicyBottomSheetContent(
                 app = selectedApp!!,
                 viewModel = viewModel,
                 onPolicyChange = { newPolicy ->
                     viewModel.setPolicy(selectedApp!!.packageName, newPolicy)
-                    // 选择后自动关闭 BottomSheet
                     scope.launch { sheetState.hide() }.invokeOnCompletion {
                         if (!sheetState.isVisible) {
                             selectedApp = null
@@ -125,7 +121,6 @@ fun ConfigurationScreen(
         }
     }
 }
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
