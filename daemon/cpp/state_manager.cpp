@@ -18,7 +18,6 @@
 
 namespace fs = std::filesystem;
 
-// Android User ID 分隔符, 用于计算UID
 constexpr int PER_USER_RANGE = 100000;
 
 static std::string status_to_string_local(AppRuntimeState::Status status) {
@@ -34,29 +33,6 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-int StateManager::get_pid_for_app_instance(int target_uid) {
-    // 这个函数的实现保持不变，但现在只在极少数情况下作为后备
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        
-        std::string pid_str = entry.path().filename().string();
-        if (pid_str.empty() || !std::all_of(pid_str.begin(), pid_str.end(), ::isdigit)) {
-            continue;
-        }
-
-        struct stat st;
-        if (stat(entry.path().c_str(), &st) == 0) {
-            if (st.st_uid == target_uid) {
-                try {
-                    return std::stoi(pid_str);
-                } catch (const std::invalid_argument&) {
-                    return -1;
-                }
-            }
-        }
-    }
-    return -1;
-}
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor)
     : db_manager_(std::move(db_manager)), 
@@ -82,6 +58,7 @@ void StateManager::refresh_installed_apps() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     LOGI("Refreshing installed apps list...");
     managed_apps_.clear();
+    app_is_system_map_.clear();
 
     std::ifstream packages_file("/data/system/packages.list");
     if (!packages_file.is_open()) {
@@ -92,18 +69,20 @@ void StateManager::refresh_installed_apps() {
     std::string line;
     while (std::getline(packages_file, line)) {
         std::stringstream ss(line);
-        std::string package_name, app_id_str;
+        std::string package_name, app_id_str, seinfo, data_dir_path;
         
-        ss >> package_name >> app_id_str;
-        if (package_name.empty() || app_id_str.empty()) continue;
+        ss >> package_name >> app_id_str >> seinfo >> data_dir_path;
+        if (package_name.empty() || app_id_str.empty() || data_dir_path.empty()) continue;
 
         try {
-            // packages.list 中的是 AppID，不是完整的 UID
             int app_id = std::stoi(app_id_str);
-            
-            // 我们只为 User 0 (主用户) 创建实例
-            int user_id = 0;
+            int user_id = 0; // 只预加载主用户
             int full_uid = user_id * PER_USER_RANGE + app_id;
+
+            // 【新增】通过数据目录路径判断是否为系统应用
+            // 第三方应用路径通常以 /data/app/ 开头
+            bool is_system = (data_dir_path.rfind("/data/app/", 0) != 0);
+            app_is_system_map_[package_name] = is_system;
 
             AppRuntimeState app_state;
             app_state.package_name = package_name;
@@ -129,72 +108,7 @@ void StateManager::refresh_installed_apps() {
     LOGI("Pre-loaded %zu app instances for User 0.", managed_apps_.size());
 }
 
-void StateManager::handle_app_event(const std::string& package_name, int user_id, bool is_start) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    AppInstanceKey key = {package_name, user_id};
-    auto it = managed_apps_.find(key);
 
-    // 如果实例不存在 (比如是一个分身应用首次启动)
-    if (it == managed_apps_.end()) {
-        // 如果是停止事件，但我们本来就不知道它，直接忽略
-        if (!is_start) {
-            LOGI("Ignoring kill event for unknown instance %s (user %d)", package_name.c_str(), user_id);
-            return;
-        }
-
-        LOGI("Detected new app instance: %s (user %d). Creating state dynamically.", package_name.c_str(), user_id);
-        
-        // 动态创建新的 AppRuntimeState
-        AppRuntimeState new_app_state;
-        new_app_state.package_name = package_name;
-        new_app_state.app_name = package_name;
-        new_app_state.user_id = user_id;
-
-        // 计算它的 UID
-        auto main_user_it = managed_apps_.find({package_name, 0});
-        if (main_user_it != managed_apps_.end()) {
-            int app_id = main_user_it->second.uid % PER_USER_RANGE;
-            new_app_state.uid = user_id * PER_USER_RANGE + app_id;
-        } else {
-            LOGW("Cannot determine UID for clone app %s, as main app is not found.", package_name.c_str());
-            // 暂时给一个无效UID，后续可能需要更鲁棒的方法
-            new_app_state.uid = -1; 
-        }
-
-        // 加载配置
-        auto config_opt = db_manager_->get_app_config(package_name);
-        if (config_opt) {
-            new_app_state.config = *config_opt;
-        } else {
-            new_app_state.config.package_name = package_name;
-            db_manager_->set_app_config(new_app_state.config);
-        }
-
-        // 插入到 map 中
-        auto result = managed_apps_.emplace(key, new_app_state);
-        it = result.first; // it现在指向新创建的元素
-    }
-
-    // --- 后续逻辑与之前类似 ---
-    AppRuntimeState& app = it->second;
-
-    if (is_start) {
-        if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            action_executor_->unfreeze_uid(app.uid);
-        }
-        transition_state(app, AppRuntimeState::Status::FOREGROUND);
-    } else { // is_kill
-        if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            action_executor_->unfreeze_uid(app.uid);
-        }
-        transition_state(app, AppRuntimeState::Status::STOPPED);
-        app.mem_usage_kb = 0;
-        app.cpu_usage_percent = 0.0f;
-        app.swap_usage_kb = 0;
-    }
-}
-
-// 【新增】高效的缓存构建函数
 void StateManager::build_process_cache() {
     uid_to_pids_map_.clear();
     for (const auto& entry : fs::directory_iterator("/proc")) {
@@ -206,7 +120,6 @@ void StateManager::build_process_cache() {
         }
 
         struct stat st;
-        // 使用 stat 而不是 lstat 来获取实际的用户ID
         if (stat(entry.path().c_str(), &st) == 0) {
             try {
                 int pid = std::stoi(pid_str);
@@ -218,51 +131,36 @@ void StateManager::build_process_cache() {
     }
 }
 
-
-// 【核心修改】重写 update_all_states 以使用缓存
-void StateManager::update_all_states() {
+void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    global_stats_ = sys_monitor_->get_stats();
     auto now = std::chrono::steady_clock::now();
 
-    // 1. 每秒只遍历一次 /proc，构建缓存
     build_process_cache();
 
-    // 2. 遍历所有受管理的应用
     for (auto& [key, app] : managed_apps_) {
         if (app.uid == -1) continue;
 
         if (app.config.policy == AppPolicy::EXEMPTED) {
             transition_state(app, AppRuntimeState::Status::EXEMPTED);
-            app.mem_usage_kb = 0;
-            app.cpu_usage_percent = 0.0f;
-            app.swap_usage_kb = 0;
             continue;
         }
 
-        // 3. 从缓存中高效查找 PID
         auto it = uid_to_pids_map_.find(app.uid);
         bool is_running = (it != uid_to_pids_map_.end() && !it->second.empty());
 
         if (!is_running) {
-            if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                action_executor_->unfreeze_uid(app.uid);
+             if (app.current_status != AppRuntimeState::Status::STOPPED) {
+                if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                    action_executor_->unfreeze_uid(app.uid);
+                }
+                transition_state(app, AppRuntimeState::Status::STOPPED);
+                app.mem_usage_kb = 0;
+                app.cpu_usage_percent = 0.0f;
+                app.swap_usage_kb = 0;
             }
-            transition_state(app, AppRuntimeState::Status::STOPPED);
-            app.mem_usage_kb = 0;
-            app.cpu_usage_percent = 0.0f;
-            app.swap_usage_kb = 0;
             continue;
         }
-        
-        // 如果一个UID有多个PID（多进程应用），我们以第一个PID为准来获取统计信息。
-        // 一个更完善的方案是聚合所有PID的统计数据，但为了简化，先用第一个。
-        int representative_pid = it->second.front();
-        AppStatsData app_stats = sys_monitor_->get_app_stats(representative_pid);
-        app.cpu_usage_percent = app_stats.cpu_usage_percent;
-        app.mem_usage_kb = app_stats.mem_usage_kb;
-        app.swap_usage_kb = app_stats.swap_usage_kb;
-        
+
         if (app.current_status == AppRuntimeState::Status::STOPPED) {
             transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
         }
@@ -270,18 +168,17 @@ void StateManager::update_all_states() {
         switch (app.current_status) {
             case AppRuntimeState::Status::BACKGROUND_IDLE: {
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                if (elapsed_seconds > 15) { // 后台空闲15秒
+                if (elapsed_seconds > 15) {
                     transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
                 }
                 break;
             }
             case AppRuntimeState::Status::AWAITING_FREEZE: {
                  auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                 if (elapsed_seconds > 5) { // 等待冻结5秒
+                 if (elapsed_seconds > 5) {
                     if (action_executor_->freeze_uid(app.uid)) {
                         transition_state(app, AppRuntimeState::Status::FROZEN);
                     } else {
-                        // 如果冻结失败，回到后台空闲状态，避免死循环
                         transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
                     }
                  }
@@ -290,6 +187,93 @@ void StateManager::update_all_states() {
             default:
                 break;
         }
+    }
+}
+
+void StateManager::update_resource_stats(bool update_user, bool update_system) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    sys_monitor_->update_all_stats();
+    global_stats_ = sys_monitor_->get_stats();
+
+    for (auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::STOPPED || app.current_status == AppRuntimeState::Status::EXEMPTED) {
+            continue;
+        }
+        
+        bool is_system = app_is_system_map_[app.package_name];
+        if (!((is_system && update_system) || (!is_system && update_user))) {
+            continue;
+        }
+
+        auto it = uid_to_pids_map_.find(app.uid);
+        if (it == uid_to_pids_map_.end() || it->second.empty()) {
+            continue;
+        }
+        
+        int representative_pid = it->second.front();
+        AppStatsData app_stats = sys_monitor_->get_app_stats(representative_pid);
+        app.cpu_usage_percent = app_stats.cpu_usage_percent;
+        app.mem_usage_kb = app_stats.mem_usage_kb;
+        app.swap_usage_kb = app_stats.swap_usage_kb;
+    }
+}
+
+
+void StateManager::handle_app_event(const std::string& package_name, int user_id, bool is_start) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    AppInstanceKey key = {package_name, user_id};
+    auto it = managed_apps_.find(key);
+
+    if (it == managed_apps_.end()) {
+        if (!is_start) {
+            LOGI("Ignoring kill event for unknown instance %s (user %d)", package_name.c_str(), user_id);
+            return;
+        }
+
+        LOGI("Detected new app instance: %s (user %d). Creating state dynamically.", package_name.c_str(), user_id);
+        
+        AppRuntimeState new_app_state;
+        new_app_state.package_name = package_name;
+        new_app_state.app_name = package_name;
+        new_app_state.user_id = user_id;
+
+        auto main_user_it = managed_apps_.find({package_name, 0});
+        if (main_user_it != managed_apps_.end()) {
+            int app_id = main_user_it->second.uid % PER_USER_RANGE;
+            new_app_state.uid = user_id * PER_USER_RANGE + app_id;
+        } else {
+            LOGW("Cannot determine UID for clone app %s, as main app is not found.", package_name.c_str());
+            new_app_state.uid = -1; 
+        }
+
+        auto config_opt = db_manager_->get_app_config(package_name);
+        if (config_opt) {
+            new_app_state.config = *config_opt;
+        } else {
+            new_app_state.config.package_name = package_name;
+            db_manager_->set_app_config(new_app_state.config);
+        }
+
+        auto result = managed_apps_.emplace(key, new_app_state);
+        it = result.first;
+    }
+
+    AppRuntimeState& app = it->second;
+
+    if (is_start) {
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            action_executor_->unfreeze_uid(app.uid);
+        }
+        transition_state(app, AppRuntimeState::Status::FOREGROUND);
+    } else { 
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            action_executor_->unfreeze_uid(app.uid);
+        }
+        transition_state(app, AppRuntimeState::Status::STOPPED);
+        app.mem_usage_kb = 0;
+        app.cpu_usage_percent = 0.0f;
+        app.swap_usage_kb = 0;
     }
 }
 
@@ -325,4 +309,28 @@ nlohmann::json StateManager::get_dashboard_payload() {
     }
     payload["apps_runtime_state"] = apps_state;
     return payload;
+}
+
+
+int StateManager::get_pid_for_app_instance(int target_uid) {
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        
+        std::string pid_str = entry.path().filename().string();
+        if (pid_str.empty() || !std::all_of(pid_str.begin(), pid_str.end(), ::isdigit)) {
+            continue;
+        }
+
+        struct stat st;
+        if (stat(entry.path().c_str(), &st) == 0) {
+            if (st.st_uid == target_uid) {
+                try {
+                    return std::stoi(pid_str);
+                } catch (const std::invalid_argument&) {
+                    return -1;
+                }
+            }
+        }
+    }
+    return -1;
 }

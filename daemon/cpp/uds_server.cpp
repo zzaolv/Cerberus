@@ -29,6 +29,13 @@ void UdsServer::set_message_handler(std::function<void(const std::string&)> hand
     on_message_received_ = std::move(handler);
 }
 
+// 【新增】实现 has_clients 方法
+bool UdsServer::has_clients() {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    return !client_fds_.empty();
+}
+
+
 void UdsServer::add_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     client_fds_.push_back(client_fd);
@@ -89,12 +96,11 @@ void UdsServer::handle_client_data(int client_fd) {
     
     std::vector<std::string> messages_to_process;
     
-    // 1. 加锁，从缓冲区提取完整的消息
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
         auto it = client_buffers_.find(client_fd);
         if (it == client_buffers_.end()) {
-            return; // 客户端可能刚刚断开
+            return;
         }
 
         it->second += buffer;
@@ -108,9 +114,8 @@ void UdsServer::handle_client_data(int client_fd) {
             }
             client_buffer.erase(0, pos + 1);
         }
-    } // 2. 锁在这里被自动释放
+    }
 
-    // 3. 在没有锁的情况下，处理消息
     if (on_message_received_ && !messages_to_process.empty()) {
         for (const auto& msg : messages_to_process) {
             on_message_received_(msg);
@@ -196,7 +201,6 @@ void UdsServer::run() {
 
         if (!is_running_) break;
 
-        // 【核心修改】仅当有活动时才处理，避免在超时后忙等待
         if (activity > 0) {
             if (FD_ISSET(server_fd_, &read_fds)) {
                 int new_socket = accept(server_fd_, nullptr, nullptr);

@@ -37,19 +37,26 @@ struct AppRuntimeState {
 class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
-    void update_all_states();
-    nlohmann::json get_dashboard_payload();
 
-    // 新的统一事件处理器
+    /**
+     * @brief 轻量级的状态机轮询，每秒执行。负责处理应用状态转移（如超时冻结）。
+     */
+    void tick();
+
+    /**
+     * @brief 按需更新应用的资源使用情况（CPU, 内存等）。这是一个耗时操作。
+     * @param update_user 是否更新第三方应用的信息。
+     * @param update_system 是否更新系统应用的信息。
+     */
+    void update_resource_stats(bool update_user, bool update_system);
+    
+    nlohmann::json get_dashboard_payload();
     void handle_app_event(const std::string& package_name, int user_id, bool is_start);
 
 private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
-    
-    // 【新增】构建进程缓存的私有方法
     void build_process_cache();
-    // 【修改】此方法不再应该被外部直接调用，作为内部实现
     int get_pid_for_app_instance(int uid);
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -62,8 +69,10 @@ private:
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
 
-    // 【新增】用于缓存 UID 和 PID 映射的成员变量
     std::map<int, std::vector<int>> uid_to_pids_map_;
+    
+    // 【新增】缓存应用是否为系统应用
+    std::map<std::string, bool> app_is_system_map_;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H

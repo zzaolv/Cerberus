@@ -7,8 +7,8 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <functional> // 【新增】
-#include <map>        // 【新增】
+#include <functional>
+#include <map>
 
 class UdsServer {
 public:
@@ -18,14 +18,18 @@ public:
     void run();
     void stop();
     void broadcast_message(const std::string& message);
-
-    // 【新增】设置消息处理回调函数
     void set_message_handler(std::function<void(const std::string&)> handler);
+
+    /**
+     * @brief 检查当前是否有任何客户端连接。
+     * @return 如果至少有一个客户端连接，则返回 true，否则返回 false。
+     */
+    bool has_clients();
 
 private:
     void add_client(int client_fd);
     void remove_client(int client_fd);
-    void handle_client_data(int client_fd); // 【新增】
+    void handle_client_data(int client_fd);
 
     std::string socket_path_;
     int server_fd_;
@@ -34,9 +38,7 @@ private:
     std::vector<int> client_fds_;
     std::mutex client_mutex_;
 
-    // 【新增】消息处理回调
     std::function<void(const std::string&)> on_message_received_;
-    // 【新增】为每个客户端维护一个缓冲区，处理不完整的消息
     std::map<int, std::string> client_buffers_;
 };
 
