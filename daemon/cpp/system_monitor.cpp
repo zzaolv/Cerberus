@@ -5,6 +5,7 @@
 #include <android/log.h>
 #include <unistd.h>
 #include <filesystem>
+#include <sys/stat.h> // 【核心修复】添加缺失的头文件
 
 #define LOG_TAG "cerberusd_monitor"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
@@ -48,14 +49,12 @@ AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_na
     if (!fs::exists(proc_stat_path)) return stats; // 进程已不存在
 
     // --- 1. 内存获取 ---
-    // 【核心修复】重构内存获取逻辑，增加多种路径尝试和日志
     long long mem_bytes = -1;
     if (cgroup_version_ == CgroupVersion::V2) {
-        // 尝试 cgroup v2 的多个可能路径
         // Path 1: 标准用户应用路径
         std::string mem_path_1 = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/memory.current";
         // Path 2: 基于UID的路径 (常用于系统服务)
-        int uid = user_id * PER_USER_RANGE + 10000; // 这是一个猜测值，真实值从stat获取
+        int uid = user_id * PER_USER_RANGE + 10000; 
         struct stat p_stat;
         if(stat(proc_stat_path.c_str(), &p_stat) == 0) uid = p_stat.st_uid;
         std::string mem_path_2 = "/sys/fs/cgroup/uid_" + std::to_string(uid) + "/memory.current";
@@ -95,7 +94,6 @@ AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_na
                 }
             }
         } else {
-             // 如果 cgroup 和 smaps_rollup 都失败，记录一个警告
              LOGW("Cannot read memory for pid %d (%s), cgroup v2 path and smaps_rollup failed.", pid, package_name.c_str());
         }
     }
