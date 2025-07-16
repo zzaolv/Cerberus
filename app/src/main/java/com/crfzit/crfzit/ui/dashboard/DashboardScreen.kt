@@ -311,15 +311,17 @@ fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     }
 }
 
+// 【UI优化】修改 getStatusText 函数以提供更清晰的状态描述
 fun getStatusText(app: AppRuntimeState): String {
     return when (app.displayStatus) {
         DisplayStatus.STOPPED -> "未运行"
         DisplayStatus.FOREGROUND -> "前台运行"
-        DisplayStatus.FOREGROUND_GAME -> "前台游戏"
+        Display_status.FOREGROUND_GAME -> "前台游戏"
         DisplayStatus.BACKGROUND_ACTIVE -> "后台活动"
-        DisplayStatus.BACKGROUND_IDLE -> "后台空闲"
-        DisplayStatus.AWAITING_FREEZE -> "等待冻结中"
-        DisplayStatus.FROZEN -> "已冻结 (后台超时)"
+        // 【核心修改】将 BACKGROUND_IDLE 的显示文本改为更精确的描述
+        DisplayStatus.BACKGROUND_IDLE -> "后台运行 (缓存)"
+        DisplayStatus.AWAITING_FREEZE -> "等待冻结中 (${app.pendingFreezeSec}s)" // 假设未来会填充这个时间
+        DisplayStatus.FROZEN -> "已冻结 (Cgroup)"
         DisplayStatus.KILLED -> "已结束"
         DisplayStatus.EXEMPTED -> "自由后台 (豁免)"
         DisplayStatus.UNKNOWN -> "状态未知"

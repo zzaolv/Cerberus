@@ -32,38 +32,9 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-
-// 【恢复】恢复被误删的 get_pid_for_app_instance 函数定义
-// 虽然当前主逻辑不直接调用它，但为了代码完整性和防止链接错误，必须保留其实现。
-int StateManager::get_pid_for_app_instance(int target_uid) {
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        
-        std::string pid_str = entry.path().filename().string();
-        if (pid_str.empty() || !std::all_of(pid_str.begin(), pid_str.end(), ::isdigit)) {
-            continue;
-        }
-
-        struct stat st;
-        if (stat(entry.path().c_str(), &st) == 0) {
-            if (st.st_uid == target_uid) {
-                try {
-                    return std::stoi(pid_str);
-                } catch (const std::invalid_argument&) {
-                    return -1;
-                }
-            }
-        }
-    }
-    return -1;
-}
-
-
 void read_pids_from_cgroup(const std::string& path, std::vector<int>& pids) {
     std::ifstream file(path);
-    if (!file.is_open()) {
-        return;
-    }
+    if (!file.is_open()) return;
     int pid;
     while (file >> pid) {
         pids.push_back(pid);
@@ -82,7 +53,6 @@ void StateManager::build_process_cache_from_cgroups() {
     auto process_pid = [&](int pid, CgroupState state) {
         struct stat st;
         std::string proc_path = "/proc/" + std::to_string(pid);
-
         if (stat(proc_path.c_str(), &st) == 0) {
             if (st.st_uid >= 10000) {
                 process_info_cache_[pid] = {pid, static_cast<int>(st.st_uid), state};
@@ -90,119 +60,93 @@ void StateManager::build_process_cache_from_cgroups() {
         }
     };
 
-    for (int pid : foreground_pids) {
-        process_pid(pid, CgroupState::FOREGROUND);
-    }
-    for (int pid : background_pids) {
-        process_pid(pid, CgroupState::BACKGROUND);
-    }
+    for (int pid : foreground_pids) process_pid(pid, CgroupState::FOREGROUND);
+    for (int pid : background_pids) process_pid(pid, CgroupState::BACKGROUND);
 }
 
+
+// 【核心重构】使用全新的、更健壮的tick逻辑
 void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
 
+    // 1. 从cgroup获取当前所有正在运行的应用进程的真实信息
     build_process_cache_from_cgroups();
 
-    std::map<int, CgroupState> uid_cgroup_state_map;
-    for (const auto& [pid, info] : process_info_cache_) {
-        auto it = uid_cgroup_state_map.find(info.uid);
-        if (it == uid_cgroup_state_map.end() || info.cgroup_state == CgroupState::FOREGROUND) {
-            uid_cgroup_state_map[info.uid] = info.cgroup_state;
-        }
+    // 2. 创建一个临时的UID到App状态的映射，用于快速查找
+    std::map<AppInstanceKey, AppRuntimeState*> live_apps_map;
+    for (auto& [key, app] : managed_apps_) {
+        live_apps_map[key] = &app;
     }
 
+    // 3. 将所有应用的状态先“重置”为STOPPED，除非它们被豁免或已被我们冻结
     for (auto& [key, app] : managed_apps_) {
-        if (app.uid == -1) continue;
-
         if (app.config.policy == AppPolicy::EXEMPTED) {
             transition_state(app, AppRuntimeState::Status::EXEMPTED);
-            continue;
-        }
-
-        auto it = uid_cgroup_state_map.find(app.uid);
-
-        if (it == uid_cgroup_state_map.end()) {
-            if (app.current_status != AppRuntimeState::Status::STOPPED) {
-                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    action_executor_->unfreeze_uid(app.uid);
-                }
-                transition_state(app, AppRuntimeState::Status::STOPPED);
-                app.mem_usage_kb = 0;
-                app.cpu_usage_percent = 0.0f;
-                app.swap_usage_kb = 0;
-            }
-        } else {
-            CgroupState current_cgroup_state = it->second;
-
-            if (app.current_status != AppRuntimeState::Status::FOREGROUND) {
-                if (current_cgroup_state == CgroupState::BACKGROUND) {
-                    if(app.current_status == AppRuntimeState::Status::STOPPED) {
-                         transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
-                    }
-                }
-
-                switch (app.current_status) {
-                    case AppRuntimeState::Status::BACKGROUND_IDLE: {
-                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                        if (elapsed_seconds > 15) {
-                            transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
-                        }
-                        break;
-                    }
-                    case AppRuntimeState::Status::AWAITING_FREEZE: {
-                        auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                        if (elapsed_seconds > 5) {
-                            if (action_executor_->freeze_uid(app.uid)) {
-                                transition_state(app, AppRuntimeState::Status::FROZEN);
-                            } else {
-                                transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
-                            }
-                        }
-                        break;
-                    }
-                    default:
-                        break;
-                }
-            }
+        } else if (app.current_status != AppRuntimeState::Status::FROZEN) {
+            // 如果应用不是FROZEN状态，我们就先假定它是STOPPED
+            transition_state(app, AppRuntimeState::Status::STOPPED);
         }
     }
-}
 
-void StateManager::update_resource_stats(bool update_user, bool update_system) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-
-    sys_monitor_->update_all_stats();
-    global_stats_ = sys_monitor_->get_stats();
-
-    for (auto& [key, app] : managed_apps_) {
-        if (app.current_status == AppRuntimeState::Status::STOPPED || app.current_status == AppRuntimeState::Status::EXEMPTED) {
-            continue;
+    // 4. 遍历cgroup缓存中的“事实”，同步更新应用状态
+    for (const auto& [pid, info] : process_info_cache_) {
+        AppInstanceKey key = {"", -1};
+        // 找到这个UID对应的主应用（我们暂时只管理主用户）
+        for(const auto& [managed_key, managed_app] : managed_apps_) {
+            if (managed_app.uid == info.uid) {
+                key = managed_key;
+                break;
+            }
         }
 
-        bool is_system = app_is_system_map_[app.package_name];
-        if (!((is_system && update_system) || (!is_system && update_user))) {
-            continue;
-        }
-
-        int representative_pid = -1;
-        for(const auto& [pid, info] : process_info_cache_) {
-            if (info.uid == app.uid) {
-                representative_pid = pid;
+        if (live_apps_map.count(key)) {
+            AppRuntimeState* app = live_apps_map[key];
+            // 只要不是被Probe强制设为前台，就同步cgroup状态
+            if (app->current_status != AppRuntimeState::Status::FOREGROUND) {
                 if (info.cgroup_state == CgroupState::FOREGROUND) {
-                    break;
+                    transition_state(*app, AppRuntimeState::Status::FOREGROUND);
+                } else if (info.cgroup_state == CgroupState::BACKGROUND) {
+                    transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE);
                 }
             }
         }
-        
-        if (representative_pid != -1) {
-            AppStatsData app_stats = sys_monitor_->get_app_stats(representative_pid);
-            app.cpu_usage_percent = app_stats.cpu_usage_percent;
-            app.mem_usage_kb = app_stats.mem_usage_kb;
-            app.swap_usage_kb = app_stats.swap_usage_kb;
+    }
+
+    // 5. 现在，在状态完全同步的基础上，执行我们的超时冻结逻辑
+    for (auto& [key, app] : managed_apps_) {
+        // Probe事件 > 冻结逻辑
+        if (app.current_status == AppRuntimeState::Status::FOREGROUND) {
+            continue;
+        }
+
+        switch (app.current_status) {
+            case AppRuntimeState::Status::BACKGROUND_IDLE: {
+                auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                if (elapsed_seconds > 15) {
+                    transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
+                }
+                break;
+            }
+            case AppRuntimeState::Status::AWAITING_FREEZE: {
+                auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                if (elapsed_seconds > 5) {
+                    if (action_executor_->freeze_uid(app.uid)) {
+                        transition_state(app, AppRuntimeState::Status::FROZEN);
+                    } else {
+                        transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
         }
     }
 }
+
+
+// ============== 以下函数均无需修改 ==============
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor)
     : db_manager_(std::move(db_manager)),
@@ -220,6 +164,36 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
          status_to_string_local(new_status).c_str());
     app.current_status = new_status;
     app.last_state_change_time = std::chrono::steady_clock::now();
+}
+
+void StateManager::update_resource_stats(bool update_user, bool update_system) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    sys_monitor_->update_all_stats();
+    global_stats_ = sys_monitor_->get_stats();
+    for (auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::STOPPED || app.current_status == AppRuntimeState::Status::EXEMPTED) {
+            continue;
+        }
+        bool is_system = app_is_system_map_[app.package_name];
+        if (!((is_system && update_system) || (!is_system && update_user))) {
+            continue;
+        }
+        int representative_pid = -1;
+        for(const auto& [pid, info] : process_info_cache_) {
+            if (info.uid == app.uid) {
+                representative_pid = pid;
+                if (info.cgroup_state == CgroupState::FOREGROUND) {
+                    break;
+                }
+            }
+        }
+        if (representative_pid != -1) {
+            AppStatsData app_stats = sys_monitor_->get_app_stats(representative_pid);
+            app.cpu_usage_percent = app_stats.cpu_usage_percent;
+            app.mem_usage_kb = app_stats.mem_usage_kb;
+            app.swap_usage_kb = app_stats.swap_usage_kb;
+        }
+    }
 }
 
 void StateManager::refresh_installed_apps() {
