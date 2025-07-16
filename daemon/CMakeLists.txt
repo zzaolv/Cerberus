@@ -23,7 +23,6 @@ target_include_directories(sqlitecpp_lib PUBLIC ${THIRDPARTY_DIR}/sqlitecpp/incl
 target_link_libraries(sqlitecpp_lib PUBLIC sqlite3_lib)
 
 # --- 4. 定义最终的可执行文件 ---
-# 【核心修改】添加新的源文件 process_monitor.cpp
 add_executable(cerberusd
     cpp/main.cpp
     cpp/uds_server.cpp
@@ -40,12 +39,11 @@ target_include_directories(cerberusd PRIVATE
 )
 
 # --- 6. 链接最终的可执行文件 ---
-# 【核心修改】链接 libdiag 库
+# 【核心修复】移除对 'diag' 库的依赖，因为它在标准NDK中不存在
 target_link_libraries(cerberusd
     PRIVATE
     sqlitecpp_lib
     log
-    diag # Netlink Connector 库
 )
 
 # --- 7. 设置 C++ 标准 ---

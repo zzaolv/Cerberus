@@ -46,25 +46,25 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
         return;
     }
 
-    struct __attribute__((aligned(NLMSG_ALIGNTO))) {
-        struct nlmsghdr nl_hdr;
-        struct __attribute__((aligned(NLMSG_ALIGNTO))) {
-            struct cn_msg cn_msg;
-            enum proc_cn_mcast_op op;
-        } cn_req;
-    } req;
+    // 【核心修复】使用更标准的、非嵌套的方式构造Netlink消息，以消除GNU扩展警告
+    char msg_buf[NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))];
+    struct nlmsghdr* nl_hdr = (struct nlmsghdr*)msg_buf;
+    struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
+    enum proc_cn_mcast_op* op = (enum proc_cn_mcast_op*)(cn_msg + 1);
 
-    memset(&req, 0, sizeof(req));
-    req.nl_hdr.nlmsg_len = sizeof(req);
-    req.nl_hdr.nlmsg_pid = getpid();
-    req.nl_hdr.nlmsg_type = NLMSG_DONE;
+    memset(msg_buf, 0, sizeof(msg_buf));
 
-    req.cn_req.cn_msg.id.idx = CN_IDX_PROC;
-    req.cn_req.cn_msg.id.val = CN_VAL_PROC;
-    req.cn_req.cn_msg.len = sizeof(enum proc_cn_mcast_op);
-    req.cn_req.op = PROC_CN_MCAST_LISTEN;
+    nl_hdr->nlmsg_len = sizeof(msg_buf);
+    nl_hdr->nlmsg_pid = getpid();
+    nl_hdr->nlmsg_type = NLMSG_DONE;
 
-    if (send(netlink_socket_, &req, sizeof(req), 0) < 0) {
+    cn_msg->id.idx = CN_IDX_PROC;
+    cn_msg->id.val = CN_VAL_PROC;
+    cn_msg->len = sizeof(enum proc_cn_mcast_op);
+
+    *op = PROC_CN_MCAST_LISTEN;
+
+    if (send(netlink_socket_, nl_hdr, nl_hdr->nlmsg_len, 0) < 0) {
         LOGE("Failed to send listen request to kernel: %s", strerror(errno));
         close(netlink_socket_);
         netlink_socket_ = -1;
@@ -81,7 +81,6 @@ void ProcessMonitor::stop() {
 
     is_running_ = false;
     if (netlink_socket_ >= 0) {
-        // 使用 shutdown 来唤醒可能阻塞在 recvmsg 的线程
         shutdown(netlink_socket_, SHUT_RDWR);
         close(netlink_socket_);
         netlink_socket_ = -1;
@@ -102,7 +101,6 @@ void ProcessMonitor::monitor_loop() {
         ssize_t len = recvmsg(netlink_socket_, &msg_hdr, 0);
         if (len <= 0) {
             if (errno == EINTR) continue;
-            // 如果 is_running_ 已经是 false，说明是正常关闭，不用报错
             if(is_running_.load()) {
                 LOGE("Error receiving from netlink socket: %s. Stopping monitor.", strerror(errno));
             }
@@ -114,7 +112,6 @@ void ProcessMonitor::monitor_loop() {
                 struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
                 struct proc_event* ev = (struct proc_event*)cn_msg->data;
 
-                // 【核心修复】直接使用全局的枚举常量，而不是作为 proc_event 的成员
                 switch (ev->what) {
                     case PROC_EVENT_FORK:
                         if (callback_) {
@@ -123,18 +120,15 @@ void ProcessMonitor::monitor_loop() {
                         break;
                     case PROC_EVENT_EXEC:
                          if (callback_) {
-                            // 【核心修复】exec 事件没有ppid，我们传递pid作为占位符
                             callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_pid);
                         }
                         break;
                     case PROC_EVENT_EXIT:
                          if (callback_) {
-                            // 【核心修复】exit 事件没有ppid，我们传递pid作为占位符
                             callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_pid);
                         }
                         break;
                     default:
-                        // 其他我们不关心的事件
                         break;
                 }
             }
