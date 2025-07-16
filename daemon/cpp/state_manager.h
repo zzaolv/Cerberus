@@ -10,7 +10,7 @@
 #include <mutex>
 #include <chrono>
 #include <utility>
-#include <set> // 【新增】
+#include <set>
 
 #include "system_monitor.h"
 #include "database_manager.h"
@@ -33,11 +33,13 @@ struct AppRuntimeState {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
+
+    // 【新增】“心跳标记”，用于标记-清扫算法
+    bool is_live_this_tick = false;
 };
 
 enum class CgroupState { FOREGROUND, BACKGROUND, UNKNOWN };
 
-// 【修改】ProcessInfo现在包含包名
 struct ProcessInfo {
     int pid;
     int uid;
@@ -59,9 +61,7 @@ private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
     void build_process_cache_from_cgroups();
-    // 【新增】帮助函数，用于动态创建App实例
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
-
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;

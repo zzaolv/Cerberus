@@ -33,46 +33,64 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-void read_pids_from_cgroup(const std::string& path, std::vector<int>& pids) {
+void read_pids_from_cgroup_tasks(const std::string& path, std::vector<int>& pids) {
     std::ifstream file(path);
     if (!file.is_open()) return;
     int pid;
     while (file >> pid) pids.push_back(pid);
 }
 
-// 【新增】帮助函数，从cgroup文件内容解析包名
+// 【优化】更健壮的包名解析，处理 _u999 这样的后缀
 std::string parse_package_name_from_cgroup_line(const std::string& line) {
-    // 典型行: 5:memory:/apps/com.coolapk.market
-    // 或者 1:blkio:/uid_10369/pid_29941 (这种我们不关心)
     auto pos = line.find("apps/");
     if (pos == std::string::npos) return "";
 
-    std::string sub = line.substr(pos + 5); // 5 is length of "apps/"
-    // 有些行可能是 /apps/uid_10369/pid_29941
-    if (sub.rfind("uid_", 0) == 0) return "";
+    std::string sub = line.substr(pos + 5);
+    auto end_pos = sub.find('/');
+    if (end_pos != std::string::npos) {
+        sub = sub.substr(0, end_pos);
+    }
+    
+    // 移除可能的 _uXXX 后缀
+    auto suffix_pos = sub.rfind("_u");
+    if (suffix_pos != std::string::npos) {
+        // 确保后面是数字
+        bool is_user_suffix = true;
+        for(size_t i = suffix_pos + 2; i < sub.length(); ++i) {
+            if(!isdigit(sub[i])) {
+                is_user_suffix = false;
+                break;
+            }
+        }
+        if(is_user_suffix) {
+            sub = sub.substr(0, suffix_pos);
+        }
+    }
+
+    // 检查是否是有效的包名（简单检查）
+    if (sub.find('.') == std::string::npos) return "";
 
     return sub;
 }
 
+
 void StateManager::build_process_cache_from_cgroups() {
     process_info_cache_.clear();
-
     std::vector<int> pids;
-    read_pids_from_cgroup("/dev/cpuset/foreground/tasks", pids);
-    read_pids_from_cgroup("/dev/cpuset/background/tasks", pids);
+    read_pids_from_cgroup_tasks("/dev/cpuset/foreground/tasks", pids);
+    read_pids_from_cgroup_tasks("/dev/cpuset/background/tasks", pids);
+    // 使用set去重
+    std::set<int> unique_pids(pids.begin(), pids.end());
 
-    for (int pid : pids) {
+    for (int pid : unique_pids) {
         struct stat st;
         std::string proc_path_str = "/proc/" + std::to_string(pid);
-        if (stat(proc_path_str.c_str(), &st) != 0 || st.st_uid < 10000) {
-            continue;
-        }
+        if (stat(proc_path_str.c_str(), &st) != 0 || st.st_uid < 10000) continue;
 
         std::ifstream cgroup_file(proc_path_str + "/cgroup");
         if (!cgroup_file.is_open()) continue;
 
-        std::string line;
-        std::string package_name;
+        std::string line, package_name;
         while (std::getline(cgroup_file, line)) {
             package_name = parse_package_name_from_cgroup_line(line);
             if (!package_name.empty()) break;
@@ -80,28 +98,25 @@ void StateManager::build_process_cache_from_cgroups() {
 
         if (package_name.empty()) continue;
 
-        // 判断是在前台还是后台cgroup
-        bool is_foreground = (fs::exists("/dev/cpuset/foreground/" + std::to_string(pid)));
+        bool is_foreground = fs::exists("/dev/cpuset/foreground/tasks") && 
+                             std::ifstream("/dev/cpuset/foreground/tasks").peek() != EOF &&
+                             find(pids.begin(), pids.end(), pid) != pids.end();
         CgroupState cgroup_state = is_foreground ? CgroupState::FOREGROUND : CgroupState::BACKGROUND;
         
         process_info_cache_[pid] = {pid, static_cast<int>(st.st_uid), package_name, cgroup_state};
     }
 }
 
-// 【新增】get_or_create_app_state 帮助函数
 AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) {
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
-    if (it != managed_apps_.end()) {
-        return &it->second;
-    }
+    if (it != managed_apps_.end()) return &it->second;
 
-    // 动态创建
     LOGI("Dynamically discovered new instance: %s (user %d). Creating state.", package_name.c_str(), user_id);
     AppRuntimeState new_app_state;
     new_app_state.package_name = package_name;
     new_app_state.user_id = user_id;
-    new_app_state.app_name = package_name; // 暂时用包名作为名字
+    new_app_state.app_name = package_name;
 
     auto main_app_it = managed_apps_.find({package_name, 0});
     if (main_app_it != managed_apps_.end()) {
@@ -109,7 +124,7 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         new_app_state.uid = user_id * PER_USER_RANGE + app_id;
         new_app_state.app_name = main_app_it->second.app_name;
     } else {
-        new_app_state.uid = -1; // UID暂时未知
+        new_app_state.uid = -1;
     }
 
     auto config_opt = db_manager_->get_app_config(package_name);
@@ -128,29 +143,26 @@ void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
 
+    // 1. 准备阶段：将所有心跳标记设为false
+    for (auto& [key, app] : managed_apps_) {
+        app.is_live_this_tick = false;
+    }
+
+    // 2. 标记阶段：遍历事实，标记存活的应用
     build_process_cache_from_cgroups();
-
-    std::set<AppInstanceKey> live_apps_keys;
-
-    // 1. 遍历事实（cgroup缓存），同步状态并标记存活的应用
     for (const auto& [pid, info] : process_info_cache_) {
         int user_id = info.uid / PER_USER_RANGE;
         AppRuntimeState* app = get_or_create_app_state(info.package_name, user_id);
         if (!app) continue;
 
-        // 如果UID是后面才确定的，现在更新它
+        app->is_live_this_tick = true;
         if (app->uid == -1) app->uid = info.uid;
 
-        live_apps_keys.insert({app->package_name, app->user_id});
-        
-        // 优先级：Probe事件 > cgroup状态
-        // 如果Probe已将其设为FOREGROUND，我们就不再用cgroup状态覆盖它
+        // 状态同步
         if (app->current_status != AppRuntimeState::Status::FOREGROUND) {
-            CgroupState new_cgroup_state = info.cgroup_state;
-            if (new_cgroup_state == CgroupState::FOREGROUND) {
+            if (info.cgroup_state == CgroupState::FOREGROUND) {
                 transition_state(*app, AppRuntimeState::Status::FOREGROUND);
-            } else if (new_cgroup_state == CgroupState::BACKGROUND) {
-                // 只有当应用当前不是任何后台活动状态时，才将其设为IDLE
+            } else if (info.cgroup_state == CgroupState::BACKGROUND) {
                 if (app->current_status != AppRuntimeState::Status::AWAITING_FREEZE &&
                     app->current_status != AppRuntimeState::Status::FROZEN) {
                     transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE);
@@ -159,17 +171,17 @@ void StateManager::tick() {
         }
     }
 
-    // 2. 清理已经不存在的或者豁免的应用
+    // 3. 清扫与逻辑执行阶段
     for (auto& [key, app] : managed_apps_) {
         if (app.config.policy == AppPolicy::EXEMPTED) {
             transition_state(app, AppRuntimeState::Status::EXEMPTED);
             continue;
         }
 
-        if (live_apps_keys.find(key) == live_apps_keys.end()) {
-            // 如果应用不在存活列表中
-             if (app.current_status != AppRuntimeState::Status::STOPPED) {
-                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
+        if (!app.is_live_this_tick) {
+            // 清扫未被标记的应用
+            if (app.current_status != AppRuntimeState::Status::STOPPED) {
+                if (app.current_status == AppRuntimeState::Status::FROZEN) {
                     action_executor_->unfreeze_uid(app.uid);
                 }
                 transition_state(app, AppRuntimeState::Status::STOPPED);
@@ -177,32 +189,25 @@ void StateManager::tick() {
                 app.cpu_usage_percent = 0.0f;
                 app.swap_usage_kb = 0;
             }
-        }
-    }
-    
-    // 3. 执行上层状态机逻辑
-    for (auto& [key, app] : managed_apps_) {
-        if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE) {
-            auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-            if (elapsed_seconds > 15) {
-                transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
-            }
-        } else if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
-            auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-            if (elapsed_seconds > 5) {
-                if (action_executor_->freeze_uid(app.uid)) {
-                    transition_state(app, AppRuntimeState::Status::FROZEN);
-                } else {
-                    transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
+        } else {
+            // 对存活的应用执行上层逻辑
+            if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                if (elapsed > 15) transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
+            } else if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
+                if (elapsed > 5) {
+                    if (action_executor_->freeze_uid(app.uid)) transition_state(app, AppRuntimeState::Status::FROZEN);
+                    else transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
                 }
             }
         }
     }
 }
 
-
 // ============== 以下函数均无需修改 ==============
-
+// StateManager 构造函数, transition_state, update_resource_stats, refresh_installed_apps, handle_app_event, get_dashboard_payload
+// ... (这些函数的代码与上一版本完全相同，此处省略以节约篇幅) ...
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor)
     : db_manager_(std::move(db_manager)),
       sys_monitor_(std::move(sys_monitor)),
