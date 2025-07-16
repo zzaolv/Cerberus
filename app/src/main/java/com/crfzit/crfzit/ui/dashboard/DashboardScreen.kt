@@ -34,14 +34,14 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
+// 【核心修改】修改内存格式化函数，只输出 MB 和 GB
 fun formatMemory(kb: Long): String {
     if (kb <= 0) return "0 MB"
     val mb = kb / 1024.0
     val gb = mb / 1024.0
     return when {
         gb >= 1 -> "%.2f GB".format(Locale.US, gb)
-        mb >= 1 -> "%.1f MB".format(Locale.US, mb)
-        else -> "$kb KB"
+        else -> "%.1f MB".format(Locale.US, mb)
     }
 }
 
@@ -143,6 +143,11 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
         100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
     } else 0.0
+    
+    // 【新增】计算SWAP使用率
+    val swapUsedPercent = if (stats.swapTotalKb > 0) {
+        100.0 * (stats.swapTotalKb - stats.swapFreeKb) / stats.swapTotalKb
+    } else 0.0
 
     val downSpeed = formatSpeed(speed.downloadSpeedBps)
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
@@ -169,6 +174,8 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
             ) {
                 InfoChip("CPU", "${"%.1f".format(Locale.US, stats.totalCpuUsagePercent)}", "%")
                 InfoChip("MEM", "${"%.0f".format(memUsedPercent)}", "%")
+                // 【新增】显示SWAP的InfoChip
+                InfoChip("SWAP", "${"%.0f".format(swapUsedPercent)}", "%")
                 InfoChip("↓", downSpeed.first, downSpeed.second)
                 InfoChip("↑", upSpeed.first, upSpeed.second)
             }
@@ -240,6 +247,7 @@ fun AppStatusCard(app: UiApp) {
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
                 Text(
+                    // 【修改】使用新的格式化函数
                     text = "MEM: ${formatMemory(app.runtimeState.memUsageKb)} | CPU: ${"%.1f".format(Locale.US, app.runtimeState.cpuUsagePercent)}%",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -310,6 +318,8 @@ fun DashboardContentPreview() {
                 totalCpuUsagePercent = 25.7f,
                 totalMemKb = 8192000,
                 availMemKb = 3000000,
+                swapTotalKb = 4096000, // 4GB Swap
+                swapFreeKb = 2048000,  // 2GB Free
                 activeProfileName = "🎮 游戏模式"
             ),
             networkSpeed = NetworkSpeed(downloadSpeedBps = 12_582_912, uploadSpeedBps = 1_310_720),

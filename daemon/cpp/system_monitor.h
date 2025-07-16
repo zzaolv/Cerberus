@@ -11,6 +11,9 @@ struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
     long total_mem_kb = 0;
     long avail_mem_kb = 0;
+    // 【新增】
+    long swap_total_kb = 0;
+    long swap_free_kb = 0;
 };
 
 struct AppStatsData {

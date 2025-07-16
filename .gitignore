@@ -21,3 +21,4 @@ local.properties
 daemon.py
 collo.py
 tree.py
+project_context.txt

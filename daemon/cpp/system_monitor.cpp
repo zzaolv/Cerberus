@@ -117,20 +117,34 @@ void SystemMonitor::update_mem_info() {
     if (!meminfo_file.is_open()) return;
 
     std::string line;
-    long mem_total = 0, mem_available = 0;
+    long mem_total = 0, mem_available = 0, swap_total = 0, swap_free = 0;
+    int found_count = 0;
 
-    while (std::getline(meminfo_file, line)) {
+    while (std::getline(meminfo_file, line) && found_count < 4) {
         std::string key;
         long value;
         std::stringstream ss(line);
         ss >> key >> value;
-        if (key == "MemTotal:") mem_total = value;
-        else if (key == "MemAvailable:") mem_available = value;
-        if (mem_total > 0 && mem_available > 0) break;
+        if (key == "MemTotal:") {
+            mem_total = value;
+            found_count++;
+        } else if (key == "MemAvailable:") {
+            mem_available = value;
+            found_count++;
+        } else if (key == "SwapTotal:") { // 【新增】
+            swap_total = value;
+            found_count++;
+        } else if (key == "SwapFree:") { // 【新增】
+            swap_free = value;
+            found_count++;
+        }
     }
     meminfo_file.close();
 
     std::lock_guard<std::mutex> lock(data_mutex_);
     current_stats_.total_mem_kb = mem_total;
     current_stats_.avail_mem_kb = mem_available;
+    // 【新增】
+    current_stats_.swap_total_kb = swap_total;
+    current_stats_.swap_free_kb = swap_free;
 }
