@@ -35,7 +35,7 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
 }
 
 int StateManager::get_pid_for_app_instance(int target_uid) {
-    // ... (此函数逻辑不变)
+    // 这个函数的实现保持不变，但现在只在极少数情况下作为后备
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
         
@@ -129,7 +129,6 @@ void StateManager::refresh_installed_apps() {
     LOGI("Pre-loaded %zu app instances for User 0.", managed_apps_.size());
 }
 
-// 【核心修复】handle_app_event 现在可以动态创建应用实例
 void StateManager::handle_app_event(const std::string& package_name, int user_id, bool is_start) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     AppInstanceKey key = {package_name, user_id};
@@ -195,15 +194,42 @@ void StateManager::handle_app_event(const std::string& package_name, int user_id
     }
 }
 
+// 【新增】高效的缓存构建函数
+void StateManager::build_process_cache() {
+    uid_to_pids_map_.clear();
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
 
+        std::string pid_str = entry.path().filename().string();
+        if (pid_str.empty() || !std::all_of(pid_str.begin(), pid_str.end(), ::isdigit)) {
+            continue;
+        }
+
+        struct stat st;
+        // 使用 stat 而不是 lstat 来获取实际的用户ID
+        if (stat(entry.path().c_str(), &st) == 0) {
+            try {
+                int pid = std::stoi(pid_str);
+                uid_to_pids_map_[st.st_uid].push_back(pid);
+            } catch (const std::exception&) {
+                // Ignore conversion errors
+            }
+        }
+    }
+}
+
+
+// 【核心修改】重写 update_all_states 以使用缓存
 void StateManager::update_all_states() {
-    // ... (此函数逻辑不变)
     std::lock_guard<std::mutex> lock(state_mutex_);
     global_stats_ = sys_monitor_->get_stats();
     auto now = std::chrono::steady_clock::now();
 
+    // 1. 每秒只遍历一次 /proc，构建缓存
+    build_process_cache();
+
+    // 2. 遍历所有受管理的应用
     for (auto& [key, app] : managed_apps_) {
-        // 如果UID无效，则跳过
         if (app.uid == -1) continue;
 
         if (app.config.policy == AppPolicy::EXEMPTED) {
@@ -214,9 +240,11 @@ void StateManager::update_all_states() {
             continue;
         }
 
-        int pid = get_pid_for_app_instance(app.uid);
+        // 3. 从缓存中高效查找 PID
+        auto it = uid_to_pids_map_.find(app.uid);
+        bool is_running = (it != uid_to_pids_map_.end() && !it->second.empty());
 
-        if (pid <= 0) {
+        if (!is_running) {
             if (app.current_status == AppRuntimeState::Status::FROZEN) {
                 action_executor_->unfreeze_uid(app.uid);
             }
@@ -227,29 +255,33 @@ void StateManager::update_all_states() {
             continue;
         }
         
-        AppStatsData app_stats = sys_monitor_->get_app_stats(pid);
+        // 如果一个UID有多个PID（多进程应用），我们以第一个PID为准来获取统计信息。
+        // 一个更完善的方案是聚合所有PID的统计数据，但为了简化，先用第一个。
+        int representative_pid = it->second.front();
+        AppStatsData app_stats = sys_monitor_->get_app_stats(representative_pid);
         app.cpu_usage_percent = app_stats.cpu_usage_percent;
         app.mem_usage_kb = app_stats.mem_usage_kb;
         app.swap_usage_kb = app_stats.swap_usage_kb;
-
-        if(app.current_status == AppRuntimeState::Status::STOPPED){
+        
+        if (app.current_status == AppRuntimeState::Status::STOPPED) {
             transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
         }
         
         switch (app.current_status) {
             case AppRuntimeState::Status::BACKGROUND_IDLE: {
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                if (elapsed_seconds > 15) {
+                if (elapsed_seconds > 15) { // 后台空闲15秒
                     transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
                 }
                 break;
             }
             case AppRuntimeState::Status::AWAITING_FREEZE: {
                  auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                 if (elapsed_seconds > 5) {
+                 if (elapsed_seconds > 5) { // 等待冻结5秒
                     if (action_executor_->freeze_uid(app.uid)) {
                         transition_state(app, AppRuntimeState::Status::FROZEN);
                     } else {
+                        // 如果冻结失败，回到后台空闲状态，避免死循环
                         transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
                     }
                  }
@@ -261,8 +293,8 @@ void StateManager::update_all_states() {
     }
 }
 
+
 nlohmann::json StateManager::get_dashboard_payload() {
-    // ... (此函数逻辑不变)
     std::lock_guard<std::mutex> lock(state_mutex_);
     using json = nlohmann::json;
     json payload;

@@ -76,7 +76,6 @@ void UdsServer::broadcast_message(const std::string& message) {
     }
 }
 
-// 【核心重写】修复死锁风险
 void UdsServer::handle_client_data(int client_fd) {
     char buffer[4096];
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
@@ -184,7 +183,6 @@ void UdsServer::run() {
             }
         }
         
-        // 【新增】为 select 添加1秒的超时，使其不会永久阻塞
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
@@ -197,23 +195,25 @@ void UdsServer::run() {
         }
 
         if (!is_running_) break;
-        if (activity == 0) continue; // 超时，继续下一次循环
 
-        if (FD_ISSET(server_fd_, &read_fds)) {
-            int new_socket = accept(server_fd_, nullptr, nullptr);
-            if (new_socket >= 0) {
-                add_client(new_socket);
+        // 【核心修改】仅当有活动时才处理，避免在超时后忙等待
+        if (activity > 0) {
+            if (FD_ISSET(server_fd_, &read_fds)) {
+                int new_socket = accept(server_fd_, nullptr, nullptr);
+                if (new_socket >= 0) {
+                    add_client(new_socket);
+                }
             }
-        }
-        
-        std::vector<int> current_clients;
-        {
-            std::lock_guard<std::mutex> lock(client_mutex_);
-            current_clients = client_fds_;
-        }
-        for (int fd : current_clients) {
-            if (FD_ISSET(fd, &read_fds)) {
-                handle_client_data(fd);
+            
+            std::vector<int> current_clients;
+            {
+                std::lock_guard<std::mutex> lock(client_mutex_);
+                current_clients = client_fds_;
+            }
+            for (int fd : current_clients) {
+                if (FD_ISSET(fd, &read_fds)) {
+                    handle_client_data(fd);
+                }
             }
         }
     }

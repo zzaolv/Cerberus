@@ -47,6 +47,9 @@ private:
     void refresh_installed_apps();
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status);
     
+    // 【新增】构建进程缓存的私有方法
+    void build_process_cache();
+    // 【修改】此方法不再应该被外部直接调用，作为内部实现
     int get_pid_for_app_instance(int uid);
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -58,6 +61,9 @@ private:
     
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
+
+    // 【新增】用于缓存 UID 和 PID 映射的成员变量
+    std::map<int, std::vector<int>> uid_to_pids_map_;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H
