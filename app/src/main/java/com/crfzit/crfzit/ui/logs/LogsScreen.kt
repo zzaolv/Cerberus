@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
 package com.crfzit.crfzit.ui.logs
 
+import android.app.Application
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,16 +11,36 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogEntry
 import com.crfzit.crfzit.data.model.LogLevel
 import java.text.SimpleDateFormat
 import java.util.*
 
+// 【核心修复】为 LogsViewModel 添加工厂
+class LogsViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
+    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(LogsViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return LogsViewModel(application) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
+fun LogsScreen(
+    // 【核心修复】使用工厂创建 ViewModel
+    viewModel: LogsViewModel = viewModel(
+        factory = LogsViewModelFactory(LocalContext.current.applicationContext as Application)
+    )
+) {
+    // ... rest of the screen is unchanged ...
     val uiState by viewModel.uiState.collectAsState()
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("事件时间线", "资源统计")
@@ -47,7 +68,7 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
         }
     }
 }
-
+// ... rest of the screen is unchanged ...
 @Composable
 fun EventTimeline(state: LogsUiState, onLoadMore: () -> Unit) {
     val listState = rememberLazyListState()

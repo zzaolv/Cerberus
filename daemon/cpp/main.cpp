@@ -37,6 +37,8 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
+        LOGI("Handling message of type: %s", type.c_str()); // 增加日志用于调试
+
         if (type.rfind("event.", 0) == 0) {
             if (g_state_manager) g_state_manager->handle_probe_event(msg);
 
@@ -45,7 +47,10 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             if (type == "cmd.set_policy") {
                 AppConfig new_config;
                 new_config.package_name = payload.value("package_name", "");
-                new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
+                // 【健壮性修复】从int转换为enum
+                int policy_int = payload.value("policy", 2);
+                new_config.policy = (policy_int >= 0 && policy_int <= 3) ? static_cast<AppPolicy>(policy_int) : AppPolicy::STANDARD;
+                
                 new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
                 new_config.force_network_exempt = payload.value("force_network_exempt", false);
                 if (g_state_manager) g_state_manager->update_app_config_from_ui(new_config);
@@ -61,16 +66,19 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 json configs_json = json::array();
                 for (const auto& cfg : configs) {
                     configs_json.push_back({
-                        {"package_name", cfg.package_name},
-                        {"policy", static_cast<int>(cfg.policy)},
-                        {"force_playback_exempt", cfg.force_playback_exempt},
-                        {"force_network_exempt", cfg.force_network_exempt},
+                        {"packageName", cfg.package_name}, // 修复驼峰命名以匹配 AppInfo
+                        {"appName", ""}, // appName 由客户端填充
+                        {"policy", cfg.policy},
+                        {"forcePlaybackExemption", cfg.force_playback_exempt},
+                        {"forceNetworkExemption", cfg.force_network_exempt}
                     });
                 }
-                response_payload["policies"] = configs_json;
+                // 【核心修复】直接将数组赋值给 payload
+                response_payload = configs_json; 
             } else if (type == "query.get_safety_net") {
                 response_type = "resp.safety_net";
-                response_payload["packages"] = g_state_manager->get_safety_net_list();
+                // 【核心修复】直接将数组赋值给 payload
+                response_payload = g_state_manager->get_safety_net_list();
             } else if (type == "query.get_logs") {
                 response_type = "resp.logs";
                 int limit = msg["payload"].value("limit", 50);
@@ -82,10 +90,11 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                         {"timestamp", log.timestamp},
                         {"level", static_cast<int>(log.level)},
                         {"message", log.message},
-                        {"app_name", log.app_name},
+                        {"appName", log.app_name}, // 修复驼峰命名以匹配 LogEntry
                     });
                 }
-                response_payload["logs"] = logs_json;
+                // 【核心修复】直接将数组赋值给 payload
+                response_payload = logs_json;
             }
             
             if (!response_type.empty()) {
@@ -95,6 +104,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     {"req_id", msg.value("req_id", "")},
                     {"payload", response_payload}
                 };
+                LOGI("Sending response of type: %s", response_type.c_str()); // 增加日志用于调试
                 g_server->send_message_to_client(client_fd, response_msg.dump());
             }
         }

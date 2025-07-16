@@ -11,10 +11,11 @@ import java.io.IOException
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
-class UdsClient(private val scope: CoroutineScope) {
+// 【核心修复】构造函数私有化，防止外部直接实例化
+class UdsClient private constructor(private val scope: CoroutineScope) {
 
     private var socket: LocalSocket? = null
-    private var outputStream: OutputStream? = null // 【新增】
+    private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     private val _incomingMessages = MutableSharedFlow<String>(replay = 1)
     val incomingMessages = _incomingMessages.asSharedFlow()
@@ -23,21 +24,36 @@ class UdsClient(private val scope: CoroutineScope) {
         private const val TAG = "CerberusUdsClient"
         private const val SOCKET_NAME = "cerberus_socket"
         private const val RECONNECT_DELAY_MS = 5000L
+
+        // 【核心修复】使用 @Volatile 确保多线程可见性
+        @Volatile
+        private var INSTANCE: UdsClient? = null
+
+        // 【核心修复】提供获取单例的公共方法
+        fun getInstance(scope: CoroutineScope): UdsClient {
+            // 双重检查锁定，确保线程安全且高效
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: UdsClient(scope).also {
+                    INSTANCE = it
+                    // 只要创建了实例，就立即启动它
+                    it.start()
+                }
+            }
+        }
     }
 
-    fun start() {
+    private fun start() {
         if (connectionJob?.isActive == true) {
             Log.d(TAG, "UDS client is already running.")
             return
         }
-        Log.i(TAG, "UDS client start() called.")
+        Log.i(TAG, "Starting UDS client connection loop.")
         connectionJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
                     Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
                     socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
                         it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
-                        // 【新增】连接成功后获取输出流
                         outputStream = it.outputStream
                     }
                     Log.i(TAG, "Successfully connected to daemon.")
@@ -53,9 +69,7 @@ class UdsClient(private val scope: CoroutineScope) {
         }
     }
     
-    // 【新增】发送消息的方法
     fun sendMessage(message: String) {
-        // 在IO线程中执行发送操作，避免阻塞调用者
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
             if (stream == null || socket?.isConnected != true) {
@@ -63,12 +77,10 @@ class UdsClient(private val scope: CoroutineScope) {
                 return@launch
             }
             try {
-                // JSON Lines 协议，每条消息后加换行符
                 stream.write((message + "\n").toByteArray(StandardCharsets.UTF_8))
                 stream.flush()
             } catch (e: IOException) {
                 Log.e(TAG, "Failed to send message: ${e.message}")
-                // 发送失败通常意味着连接已断开，触发重连
                 cleanupSocket()
             }
         }
@@ -96,7 +108,7 @@ class UdsClient(private val scope: CoroutineScope) {
         }
     }
 
-    fun stop() {
+    private fun stop() {
         connectionJob?.cancel()
         connectionJob = null
         cleanupSocket()
@@ -104,12 +116,8 @@ class UdsClient(private val scope: CoroutineScope) {
     }
 
     private fun cleanupSocket() {
-        try {
-            outputStream?.close()
-        } catch (e: IOException) { /* ignore */ }
-        try {
-            socket?.close()
-        } catch (e: IOException) { /* ignore */ }
+        try { outputStream?.close() } catch (e: IOException) { /* ignore */ }
+        try { socket?.close() } catch (e: IOException) { /* ignore */ }
         socket = null
         outputStream = null
     }

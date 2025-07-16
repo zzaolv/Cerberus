@@ -2,13 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- ================================================== -->
-    <!--        【核心修复】声明查询所有应用的权限          -->
-    <!-- ================================================== -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
     <application
+        android:name=".CerberusApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -30,9 +28,6 @@
             </intent-filter>
         </activity>
 
-        <!-- ================================================== -->
-        <!--        LSPosed 模块元数据 (集成到主APK)          -->
-        <!-- ================================================== -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
@@ -43,7 +38,7 @@
 
         <meta-data
             android:name="xposedminversion"
-            android:value="93" /> <!-- 93 对应 LSPosed 1.x -->
+            android:value="93" />
 
         <meta-data
             android:name="xposedscope"

@@ -4,6 +4,7 @@ package com.crfzit.crfzit.ui.configuration
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.crfzit.crfzit.CerberusApplication
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.AppInfoRepository
@@ -19,20 +20,22 @@ data class ConfigurationUiState(
     val allApps: List<AppInfo> = emptyList(),
     val searchQuery: String = "",
     val showSystemApps: Boolean = false,
-    val safetyNet: Set<String> = emptySet() // 【新增】安全网列表
+    val safetyNet: Set<String> = emptySet()
 )
 
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appInfoRepository = AppInfoRepository.getInstance(application)
-    private val udsClient = UdsClient(viewModelScope)
+
+    private val appScope = (application as CerberusApplication).applicationScope
+    private val udsClient = UdsClient.getInstance(appScope)
+
     private val gson = Gson()
 
     private val _uiState = MutableStateFlow(ConfigurationUiState())
     val uiState: StateFlow<ConfigurationUiState> = _uiState.asStateFlow()
 
     init {
-        udsClient.start()
         observeDaemonResponses()
         loadInitialData()
     }
@@ -40,23 +43,19 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     private fun loadInitialData() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            // 1. 先加载本地安装的应用列表
             appInfoRepository.loadAllInstalledApps(forceRefresh = true)
-            
-            // 2. 同时向daemon请求安全网和所有应用的策略配置
             querySafetyNet()
             queryAllPolicies()
         }
     }
-    
-    // 【新增】监听来自daemon的响应
+
     private fun observeDaemonResponses() {
         viewModelScope.launch {
             udsClient.incomingMessages.filter { it.contains("\"type\":\"resp.") }.collect { jsonLine ->
                 try {
                     val msg = gson.fromJson(jsonLine, Map::class.java)
                     val payloadJson = gson.toJson(msg["payload"])
-                    
+
                     when (msg["type"]) {
                         "resp.safety_net" -> {
                             val listType = object : TypeToken<Set<String>>() {}.type
@@ -65,12 +64,17 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                         }
                         "resp.all_policies" -> {
                             val listType = object : TypeToken<List<AppInfo>>() {}.type
-                            val policies: List<AppInfo> = gson.fromJson(payloadJson, listType)
-                            
+                            val daemonPolicies: List<AppInfo> = gson.fromJson(payloadJson, listType)
+
                             val localApps = appInfoRepository.getCachedApps()
+                            // 将 daemon 的配置合并到本地应用列表
                             val mergedApps = localApps.values.map { localApp ->
-                                policies.find { it.packageName == localApp.packageName }
-                                    ?: localApp.copy(policy = Policy.EXEMPTED) // 默认豁免
+                                val daemonConfig = daemonPolicies.find { it.packageName == localApp.packageName }
+                                localApp.copy(
+                                    policy = daemonConfig?.policy ?: Policy.EXEMPTED,
+                                    forcePlaybackExemption = daemonConfig?.forcePlaybackExemption ?: false,
+                                    forceNetworkExemption = daemonConfig?.forceNetworkExemption ?: false
+                                )
                             }.sortedBy { it.appName }
 
                             _uiState.update { it.copy(allApps = mergedApps, isLoading = false) }
@@ -80,8 +84,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
         }
     }
-    
-    // 【新增】查询方法
+
     private fun querySafetyNet() {
         val request = mapOf("v" to 1, "type" to "query.get_safety_net", "req_id" to UUID.randomUUID().toString())
         udsClient.sendMessage(gson.toJson(request))
@@ -102,10 +105,10 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         val message = mapOf("v" to 1, "type" to "cmd.set_policy", "payload" to payload)
         udsClient.sendMessage(gson.toJson(message))
     }
-    
+
     fun onSearchQueryChanged(query: String) { _uiState.update { it.copy(searchQuery = query) } }
     fun onShowSystemAppsChanged(show: Boolean) { _uiState.update { it.copy(showSystemApps = show) } }
-    
+
     fun setPolicy(packageName: String, policy: Policy) {
         updateAppInfo(packageName) { it.copy(policy = policy) }
     }
@@ -133,8 +136,9 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         updatedApp?.let { sendPolicyUpdate(it) }
     }
 
-    override fun onCleared() {
-        super.onCleared()
-        udsClient.stop()
-    }
+    // 【核心修复】移除 onCleared 方法，因为它不应再管理 UDS Client 的生命周期
+    // override fun onCleared() {
+    //     super.onCleared()
+    //     udsClient.stop() // <-- This was the error
+    // }
 }

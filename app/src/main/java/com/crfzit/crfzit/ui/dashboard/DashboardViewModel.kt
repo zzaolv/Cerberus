@@ -5,17 +5,15 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.AppRuntimeState
-import com.crfzit.crfzit.data.model.GlobalStats
-import com.crfzit.crfzit.data.repository.AppInfoRepository
-import com.crfzit.crfzit.data.repository.DashboardRepository
-import com.crfzit.crfzit.data.repository.UdsDashboardRepository
+import com.crfzit.crfzit.CerberusApplication
+import com.crfzit.crfzit.data.model.*
+import com.crfzit.crfzit.data.repository.*
 import com.crfzit.crfzit.data.system.NetworkMonitor
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
+// ... data classes UiApp, DashboardUiState remain the same ...
 data class UiApp(
     val runtimeState: AppRuntimeState,
     val appInfo: AppInfo?
@@ -30,9 +28,13 @@ data class DashboardUiState(
     val showSystemApps: Boolean = false
 )
 
+
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val udsRepository: DashboardRepository = UdsDashboardRepository(viewModelScope)
+    // 【核心修复】从 Application 获取全局 scope，并传递给 Repository
+    private val appScope = (application as CerberusApplication).applicationScope
+    private val udsRepository: DashboardRepository = UdsDashboardRepository(appScope)
+
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
 
@@ -46,6 +48,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         loadAppInfo()
     }
 
+    // ... rest of the ViewModel remains the same ...
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.value = _uiState.value.copy(showSystemApps = show)
     }
