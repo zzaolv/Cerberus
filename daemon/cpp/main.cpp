@@ -52,6 +52,7 @@ void handle_message(const std::string& message_str) {
                 g_state_manager->handle_app_event(pkg_name, user_id, false);
             }
         }
+        // TODO: Handle cmd.* and query.* messages from UI
     } catch (const json::parse_error& e) {
         LOGW("JSON parse error: %s", e.what());
     }
@@ -71,6 +72,7 @@ void worker_thread() {
     bool was_ui_connected_previously = false;
 
     while (g_is_running) {
+        // 主循环休眠1秒
         std::this_thread::sleep_for(std::chrono::seconds(1));
         counter++;
 
@@ -82,11 +84,13 @@ void worker_thread() {
         // 【核心修复】如果UI刚刚连接上，则立即触发一次数据更新
         bool new_client_just_connected = ui_is_connected && !was_ui_connected_previously;
 
+        // 只有当UI连接时，才进行消耗资源的统计和广播
         if (ui_is_connected) {
-            bool update_user_apps = (counter % 10 == 0);
-            bool update_system_apps = (counter % 15 == 0);
+            // 定义资源更新频率
+            bool update_user_apps = (counter % 10 == 0); // 每10秒更新用户应用
+            bool update_system_apps = (counter % 15 == 0); // 每15秒更新系统应用
             
-            // 如果是新连接，则强制刷新所有应用数据
+            // 如果是新连接，则强制刷新所有应用数据，提供即时反馈
             if (new_client_just_connected) {
                 LOGI("New UI client connected. Forcing immediate full resource scan.");
                 update_user_apps = true;
@@ -137,10 +141,11 @@ int main() {
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
     g_server->set_message_handler(handle_message);
     
+    // 启动统一的工作线程
     std::thread worker(worker_thread);
 
     LOGI("Main thread starting UDS server event loop...");
-    g_server->run();
+    g_server->run(); // 主线程阻塞在这里处理网络IO
 
     LOGI("UDS server event loop has finished. Cleaning up threads...");
     g_is_running = false;

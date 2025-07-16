@@ -1,12 +1,15 @@
+// app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
 package com.crfzit.crfzit.ui.configuration
 
+import com.crfzit.crfzit.ui.icons.AppIcons // 导入我们自己的图标
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Style // <-- 关键修正：添加 import
+import androidx.compose.material.icons.filled.Style
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -14,16 +17,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavController // <-- 关键修正：添加 import
+import androidx.navigation.NavController
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
-import com.crfzit.crfzit.navigation.Screen // <-- 关键修正：添加 import
+import com.crfzit.crfzit.navigation.Screen
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConfigurationScreen(
-    navController: NavController, // 定义 navController 参数
+    navController: NavController,
     viewModel: ConfigurationViewModel = viewModel()
 ) {
     val uiState by viewModel.uiState.collectAsState()
@@ -103,6 +106,8 @@ fun ConfigurationScreen(
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
             sheetState = sheetState,
+            // 【全面屏适配】确保BottomSheet避开系统导航栏
+            windowInsets = WindowInsets(0, 0, 0, 0)
         ) {
             AppPolicyBottomSheetContent(
                 app = selectedApp!!,
@@ -130,7 +135,7 @@ fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
             modifier = Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Spacer(Modifier.size(40.dp))
+            Spacer(Modifier.size(40.dp)) // Placeholder for icon
             Column(Modifier.weight(1f).padding(start = 8.dp)) {
                 Text(app.appName, fontWeight = FontWeight.Bold)
                 Text(app.packageName, style = MaterialTheme.typography.bodySmall)
@@ -150,10 +155,11 @@ fun AppPolicyBottomSheetContent(
     viewModel: ConfigurationViewModel,
     onPolicyChange: (Policy) -> Unit
 ) {
+    // 【全面屏适配】为内容应用导航栏内边距，防止被遮挡
     Column(
         modifier = Modifier
             .padding(16.dp)
-            .navigationBarsPadding(),
+            .navigationBarsPadding(), 
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text(app.appName, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.align(Alignment.CenterHorizontally))
@@ -187,6 +193,8 @@ fun AppPolicyBottomSheetContent(
                 onCheckedChange = { viewModel.setNetworkExemption(app.packageName, it) }
             )
         }
+        // 【全面屏适配】增加一个额外的间隔，让底部内容呼吸空间更大
+        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 

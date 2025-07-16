@@ -1,3 +1,4 @@
+// app/build.gradle.kts
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -22,6 +23,16 @@ android {
 
     buildTypes {
         release {
+            // 【核心优化】开启代码混淆和资源压缩
+            isMinifyEnabled = true
+            isShrinkResources = true // 开启资源压缩
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+        // debug构建类型保持原样，以便快速调试
+        debug {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -38,7 +49,6 @@ android {
     kotlin {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
-            // 明确告诉编译器不要将警告视为错误
             allWarningsAsErrors.set(false)
         }
     }
@@ -69,17 +79,22 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
-    implementation(libs.androidx.material.icons.extended)
+
+    // 【核心优化】移除 extended 依赖，改为依赖 core
+    // implementation(libs.androidx.material.icons.extended)
+    implementation(libs.androidx.material.icons.core)
+
 
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.annotation)
     implementation(libs.androidx.navigation.compose)
 
     implementation(libs.gson)
-
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    
+    // Xposed API 依赖保持不变
     compileOnly("de.robv.android.xposed:api:82")
     compileOnly("de.robv.android.xposed:api:82:sources")
-    implementation("io.coil-kt:coil-compose:2.6.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

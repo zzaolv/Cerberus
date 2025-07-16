@@ -5,14 +5,18 @@ import android.app.Application
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
@@ -38,8 +42,10 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.Locale
 
+// 内存格式化工具函数
 fun formatMemory(kb: Long): String {
-    if (kb <= 1024) return "${kb} KB" // 小于1MB显示KB
+    if (kb <= 0) return "0 KB"
+    if (kb < 1024) return "${kb} KB"
     val mb = kb / 1024.0
     val gb = mb / 1024.0
     return when {
@@ -57,12 +63,10 @@ fun DashboardScreen(
     var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
+        // 【UI美化】使用更紧凑的居中顶栏
         topBar = {
-            TopAppBar(
-                title = { Text("Cerberus Dashboard") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                ),
+            CenterAlignedTopAppBar(
+                title = { Text("Cerberus") },
                 actions = {
                     Box {
                         IconButton(onClick = { showMenu = true }) {
@@ -102,15 +106,16 @@ class DashboardViewModelFactory(private val application: Application) : ViewMode
     }
 }
 
+
 @Composable
 fun DashboardContent(uiState: DashboardUiState, modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxSize()) {
         when {
             uiState.isLoading -> {
-                StatusIndicator("正在连接并加载应用信息...", showProgress = true)
+                StatusIndicator("正在连接守护进程...", showProgress = true)
             }
             !uiState.isConnected -> {
-                StatusIndicator("连接守护进程失败！\n请检查模块是否正常运行。", showProgress = false)
+                StatusIndicator("连接失败！\n请检查模块是否正常运行。", showProgress = false)
             }
             else -> {
                 GlobalStatusArea(stats = uiState.globalStats, speed = uiState.networkSpeed)
@@ -141,59 +146,113 @@ fun StatusIndicator(text: String, showProgress: Boolean) {
     }
 }
 
+// 【UI美化】完全重构全局状态区域
 @Composable
 fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
-        100.0 * (stats.totalMemKb - stats.availMemKb) / stats.totalMemKb
-    } else 0.0
+        (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
+    } else 0f
     
     val swapUsedPercent = if (stats.swapTotalKb > 0) {
-        100.0 * (stats.swapTotalKb - stats.swapFreeKb) / stats.swapTotalKb
-    } else 0.0
-
+        (stats.swapTotalKb - stats.swapFreeKb).toFloat() / stats.swapTotalKb
+    } else 0f
+    
+    val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
+    
     val downSpeed = formatSpeed(speed.downloadSpeedBps)
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(12.dp),
-        elevation = CardDefaults.cardElevation(4.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                "MODE: ${stats.activeProfileName}",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.CenterHorizontally)
-            )
-            Spacer(Modifier.height(16.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceAround,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                InfoChip("CPU", "${"%.1f".format(Locale.US, stats.totalCpuUsagePercent)}", "%")
-                InfoChip("MEM", "${"%.0f".format(memUsedPercent)}", "%")
-                InfoChip("SWAP", "${"%.0f".format(swapUsedPercent)}", "%")
-                InfoChip("↓", downSpeed.first, downSpeed.second)
-                InfoChip("↑", upSpeed.first, upSpeed.second)
+    Column(modifier = Modifier.padding(12.dp)) {
+        Text(
+            text = "MODE: ${stats.activeProfileName}",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(bottom = 12.dp)
+        )
+        
+        // 使用网格布局，每行2个
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.height(180.dp), // 固定高度
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            userScrollEnabled = false
+        ) {
+            item {
+                StatusGridItem(
+                    label = "CPU",
+                    value = "%.1f".format(Locale.US, stats.totalCpuUsagePercent) + "%",
+                    progress = cpuUsedPercent,
+                    icon = Icons.Default.Memory
+                )
+            }
+            item {
+                StatusGridItem(
+                    label = "内存 (MEM)",
+                    value = formatMemory(stats.totalMemKb - stats.availMemKb),
+                    progress = memUsedPercent,
+                    icon = Icons.Default.SdStorage
+                )
+            }
+            item {
+                 StatusGridItem(
+                    label = "交换 (SWAP)",
+                    value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
+                    progress = swapUsedPercent,
+                    icon = Icons.Default.SwapHoriz
+                )
+            }
+            item {
+                StatusGridItem(
+                    label = "网络",
+                    value = "↓${downSpeed.first} | ↑${upSpeed.first}",
+                    subValue = "${downSpeed.second} / ${upSpeed.second}",
+                    icon = Icons.Default.Wifi
+                )
             }
         }
     }
 }
 
+// 【UI美化】新的网格项组件
 @Composable
-fun InfoChip(label: String, value: String, unit: String) {
-    Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(text = label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(text = value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Medium, lineHeight = 30.sp)
+fun StatusGridItem(
+    label: String,
+    value: String,
+    subValue: String? = null,
+    progress: Float? = null,
+    icon: ImageVector
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = MaterialTheme.shapes.large
+    ) {
+        Column(Modifier.padding(12.dp).fillMaxSize()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, contentDescription = label, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(label, style = MaterialTheme.typography.labelLarge)
+            }
+            Spacer(Modifier.weight(1f))
+            if (subValue != null) {
+                 Text(value, style = MaterialTheme.typography.titleMedium)
+                 Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            }
+            if (progress != null) {
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth().clip(CircleShape)
+                )
+            }
         }
-        Text(text = unit, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 4.dp))
     }
 }
+
 
 @Composable
 fun RuntimeStatusList(apps: List<UiApp>) {
@@ -207,7 +266,6 @@ fun RuntimeStatusList(apps: List<UiApp>) {
         }
     }
 }
-
 
 @Composable
 fun AppStatusCard(app: UiApp) {
@@ -227,7 +285,6 @@ fun AppStatusCard(app: UiApp) {
             Spacer(Modifier.width(12.dp))
 
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                // App Name and Clone Icon
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val displayName = app.appInfo?.appName ?: app.runtimeState.packageName
                     Text(
@@ -250,10 +307,8 @@ fun AppStatusCard(app: UiApp) {
                     AppStatusIndicatorIcons(app = app.runtimeState)
                 }
 
-                // 【核心修复】构造优雅的内存和CPU显示文本
                 val resourceText = buildAnnotatedString {
                     append("MEM: ${formatMemory(app.runtimeState.memUsageKb)}")
-                    // 如果Swap占用大于1MB，才显示
                     if (app.runtimeState.swapUsageKb > 1024) {
                         withStyle(style = SpanStyle(color = Color.Gray)) {
                             append(" (+${formatMemory(app.runtimeState.swapUsageKb)} S)")
@@ -270,7 +325,6 @@ fun AppStatusCard(app: UiApp) {
                     overflow = TextOverflow.Ellipsis
                 )
                 
-                // Status Text
                 Text(
                     text = "STATUS: ${getStatusText(app.runtimeState)}",
                     style = MaterialTheme.typography.bodySmall,
@@ -302,26 +356,27 @@ fun AppStatusIndicatorIcons(app: AppRuntimeState) {
     }
 }
 
+// 【低速率过滤】修改 formatSpeed 函数
 fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
+    // 如果速率低于 50 Kbps (50000 bps)，则直接显示为 0
+    if (bitsPerSecond < 50000) return Pair("0.0", "Kbps")
+
     return when {
-        bitsPerSecond < 1000 -> Pair(bitsPerSecond.toString(), "bps")
         bitsPerSecond < 1000 * 1000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
         bitsPerSecond < 1000 * 1000 * 1000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / (1000.0 * 1000.0)), "Mbps")
         else -> Pair("%.1f".format(Locale.US, bitsPerSecond / (1000.0 * 1000.0 * 1000.0)), "Gbps")
     }
 }
 
-// 【UI优化】修改 getStatusText 函数以提供更清晰的状态描述
 fun getStatusText(app: AppRuntimeState): String {
     return when (app.displayStatus) {
         DisplayStatus.STOPPED -> "未运行"
         DisplayStatus.FOREGROUND -> "前台运行"
-        Display_status.FOREGROUND_GAME -> "前台游戏"
+        DisplayStatus.FOREGROUND_GAME -> "前台游戏"
         DisplayStatus.BACKGROUND_ACTIVE -> "后台活动"
-        // 【核心修改】将 BACKGROUND_IDLE 的显示文本改为更精确的描述
         DisplayStatus.BACKGROUND_IDLE -> "后台运行 (缓存)"
-        DisplayStatus.AWAITING_FREEZE -> "等待冻结中 (${app.pendingFreezeSec}s)" // 假设未来会填充这个时间
-        DisplayStatus.FROZEN -> "已冻结 (Cgroup)"
+        DisplayStatus.AWAITING_FREEZE -> "等待冻结中 (${app.pendingFreezeSec}s)"
+        DisplayStatus.FROZEN -> "已冻结"
         DisplayStatus.KILLED -> "已结束"
         DisplayStatus.EXEMPTED -> "自由后台 (豁免)"
         DisplayStatus.UNKNOWN -> "状态未知"
@@ -345,10 +400,10 @@ fun DashboardContentPreview() {
             ),
             networkSpeed = NetworkSpeed(downloadSpeedBps = 12_582_912, uploadSpeedBps = 1_310_720),
             displayedApps = listOf(
-                UiApp(
+                 UiApp(
                     runtimeState = AppRuntimeState(
                         packageName = "com.tencent.mm", appName = "微信", userId = 0,
-                        isForeground = true, memUsageKb = 512000, swapUsageKb = 128000, // 125MB Swap
+                        isForeground = true, memUsageKb = 512000, swapUsageKb = 128000,
                         displayStatus = DisplayStatus.FOREGROUND
                     ),
                     appInfo = AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT, icon = null)
@@ -356,7 +411,7 @@ fun DashboardContentPreview() {
                 UiApp(
                     runtimeState = AppRuntimeState(
                         packageName = "com.tencent.mm", appName = "微信", userId = 999,
-                        memUsageKb = 256000, swapUsageKb = 0, // No Swap
+                        memUsageKb = 256000, swapUsageKb = 0,
                         displayStatus = DisplayStatus.BACKGROUND_IDLE
                     ),
                     appInfo = AppInfo("com.tencent.mm", "微信 (分身)", Policy.IMPORTANT, icon = null)

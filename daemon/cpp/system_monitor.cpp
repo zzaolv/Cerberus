@@ -38,7 +38,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
 
     // --- 1. PSS和Swap内存获取 ---
     
-    // --- 第一层 (Fast Path): 尝试读取 smaps_rollup ---
+    // --- 第一层 (Fast Path): 尝试读取 smaps_rollup，效率最高 ---
     std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
     std::ifstream rollup_file(smaps_rollup_path);
     if (rollup_file.is_open()) {
@@ -64,6 +64,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
     }
 
     // --- 第二层 (Fallback Path): 如果快速路径结果为0，则读取完整的 smaps 文件 ---
+    // 这对于获取“缓存”应用的精确内存至关重要
     if (stats.mem_usage_kb == 0) {
         // LOGI("PID %d: smaps_rollup gave 0 PSS. Falling back to full smaps parsing.", pid);
         std::string smaps_path = "/proc/" + std::to_string(pid) + "/smaps";
@@ -97,6 +98,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid) {
         std::getline(stat_file, line);
         std::stringstream ss(line);
         std::string value;
+        // utime和stime是第14和15个字段
         for(int i=0; i<13; ++i) ss >> value; 
         long long utime, stime;
         ss >> utime >> stime;

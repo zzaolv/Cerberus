@@ -22,14 +22,12 @@ struct AppStatsData {
     long swap_usage_kb = 0;
 };
 
-// ... (CpuTimes struct 不变) ...
 struct CpuTimes {
     long long user = 0, nice = 0, system = 0, idle = 0;
     long long iowait = 0, irq = 0, softirq = 0, steal = 0;
     long long total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
     long long idle_total() const { return idle + iowait; }
 };
-
 
 class SystemMonitor {
 public:
@@ -47,6 +45,7 @@ private:
     GlobalStatsData current_stats_;
     CpuTimes prev_cpu_times_;
     
+    // 用于计算单个应用的CPU使用率
     struct AppCpuState {
         long long prev_app_jiffies = 0;
         long long prev_total_jiffies = 0;

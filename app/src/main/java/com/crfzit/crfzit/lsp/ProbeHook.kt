@@ -32,10 +32,12 @@ class ProbeHook : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 只注入 system_server 进程
         if (lpparam.packageName != "android" || lpparam.processName != "android") {
             return
         }
         
+        // 启动UDS客户端
         udsClient.start()
         XposedBridge.log("$TAG: Attached to system_server (PID: ${Process.myPid()})")
         hookActivityManagerService(lpparam.classLoader)
@@ -58,7 +60,7 @@ class ProbeHook : IXposedHookLoadPackage {
                             val baseIntent = XposedHelpers.getObjectField(task, "mBaseIntent")
                             val componentName = XposedHelpers.callMethod(baseIntent, "getComponent") as ComponentName?
                             val packageName = componentName?.packageName
-                            // 【核心重构】从Task中获取发起者的UserID
+                            // 【核心重构】从Task中获取发起者的UserID，这是最可靠的方式
                             val userId = XposedHelpers.callMethod(task, "getUserId") as Int
                             
                             if (packageName != null) {
