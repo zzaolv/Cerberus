@@ -7,6 +7,7 @@
 #include <linux/cn_proc.h>
 #include <unistd.h>
 #include <cstring>
+#include <vector>
 
 #define LOG_TAG "cerberusd_procmon"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -26,14 +27,12 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
 
     callback_ = std::move(callback);
 
-    // 1. 创建Netlink Socket
     netlink_socket_ = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_CONNECTOR);
     if (netlink_socket_ < 0) {
         LOGE("Failed to create netlink socket: %s", strerror(errno));
         return;
     }
 
-    // 2. 绑定地址
     struct sockaddr_nl sa_nl;
     memset(&sa_nl, 0, sizeof(sa_nl));
     sa_nl.nl_family = AF_NETLINK;
@@ -47,7 +46,6 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
         return;
     }
 
-    // 3. 发送监听请求给内核
     struct __attribute__((aligned(NLMSG_ALIGNTO))) {
         struct nlmsghdr nl_hdr;
         struct __attribute__((aligned(NLMSG_ALIGNTO))) {
@@ -83,6 +81,8 @@ void ProcessMonitor::stop() {
 
     is_running_ = false;
     if (netlink_socket_ >= 0) {
+        // 使用 shutdown 来唤醒可能阻塞在 recvmsg 的线程
+        shutdown(netlink_socket_, SHUT_RDWR);
         close(netlink_socket_);
         netlink_socket_ = -1;
     }
@@ -93,39 +93,48 @@ void ProcessMonitor::stop() {
 }
 
 void ProcessMonitor::monitor_loop() {
-    char buf[8192];
+    std::vector<char> buf(8192);
     while (is_running_) {
-        struct iovec iov = { buf, sizeof(buf) };
+        struct iovec iov = { buf.data(), buf.size() };
         struct sockaddr_nl sa_nl;
         struct msghdr msg_hdr = { &sa_nl, sizeof(sa_nl), &iov, 1, nullptr, 0, 0 };
 
         ssize_t len = recvmsg(netlink_socket_, &msg_hdr, 0);
         if (len <= 0) {
             if (errno == EINTR) continue;
-            LOGE("Error receiving from netlink socket, stopping monitor.");
+            // 如果 is_running_ 已经是 false，说明是正常关闭，不用报错
+            if(is_running_.load()) {
+                LOGE("Error receiving from netlink socket: %s. Stopping monitor.", strerror(errno));
+            }
             break;
         }
 
-        for (struct nlmsghdr* nl_hdr = (struct nlmsghdr*)buf; NLMSG_OK(nl_hdr, len); nl_hdr = NLMSG_NEXT(nl_hdr, len)) {
+        for (struct nlmsghdr* nl_hdr = (struct nlmsghdr*)buf.data(); NLMSG_OK(nl_hdr, len); nl_hdr = NLMSG_NEXT(nl_hdr, len)) {
             if (nl_hdr->nlmsg_type == NLMSG_DONE) {
                 struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
                 struct proc_event* ev = (struct proc_event*)cn_msg->data;
 
+                // 【核心修复】直接使用全局的枚举常量，而不是作为 proc_event 的成员
                 switch (ev->what) {
-                    case proc_event::PROC_EVENT_FORK:
+                    case PROC_EVENT_FORK:
                         if (callback_) {
                             callback_(ProcessEventType::FORK, ev->event_data.fork.child_pid, ev->event_data.fork.parent_pid);
                         }
                         break;
-                    case proc_event::PROC_EVENT_EXEC:
+                    case PROC_EVENT_EXEC:
                          if (callback_) {
-                            callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_ppid);
+                            // 【核心修复】exec 事件没有ppid，我们传递pid作为占位符
+                            callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_pid);
                         }
                         break;
-                    case proc_event::PROC_EVENT_EXIT:
+                    case PROC_EVENT_EXIT:
                          if (callback_) {
-                            callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_ppid);
+                            // 【核心修复】exit 事件没有ppid，我们传递pid作为占位符
+                            callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_pid);
                         }
+                        break;
+                    default:
+                        // 其他我们不关心的事件
                         break;
                 }
             }
