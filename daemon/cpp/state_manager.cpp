@@ -18,6 +18,9 @@
 
 namespace fs = std::filesystem;
 
+// 【修复】添加缺失的常量定义
+constexpr int PER_USER_RANGE = 100000;
+
 // 帮助函数：从文件中快速读取第一个整数
 static inline bool quick_read_int(const fs::path& path, int& out_value) {
     std::ifstream file(path, std::ios_base::in);
@@ -58,35 +61,28 @@ void StateManager::build_process_cache() {
         }
 
         // --- 过滤阶段 2: oom_score_adj 快速路径检查 ---
-        // 应用进程的 oom_score_adj >= 0。这是一个非常快速的整数读取。
-        // 内核线程没有此文件，原生服务通常为负值。
         int oom_score;
         if (!quick_read_int(path / "oom_score_adj", oom_score) || oom_score < 0) {
             continue;
         }
 
         // --- 过滤阶段 3: cmdline 快速路径检查 ---
-        // 应用进程的 cmdline 文件通常非空且包含包名。
-        // 内核线程没有此文件，许多原生服务的 cmdline 文件大小为0。
         try {
             if (fs::file_size(path / "cmdline") == 0) {
                 continue;
             }
         } catch (const fs::filesystem_error&) {
-            // 文件不存在或无法访问，跳过
             continue;
         }
 
         // --- 最后的确认：通过所有过滤，现在执行 stat() 获取UID ---
         struct stat st;
         if (stat(path.c_str(), &st) == 0) {
-            // 我们只关心 UID >= 10000 的进程，这些是应用进程的UID范围。
             if (st.st_uid >= 10000) {
                  try {
                     int pid = std::stoi(filename_str);
                     uid_to_pids_map_[st.st_uid].push_back(pid);
                 } catch (const std::invalid_argument&) {
-                    // 理论上不会发生，因为我们已经检查了 filename_str 是纯数字
                 }
             }
         }
