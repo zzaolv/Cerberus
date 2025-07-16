@@ -32,6 +32,33 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
+
+// 【恢复】恢复被误删的 get_pid_for_app_instance 函数定义
+// 虽然当前主逻辑不直接调用它，但为了代码完整性和防止链接错误，必须保留其实现。
+int StateManager::get_pid_for_app_instance(int target_uid) {
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        
+        std::string pid_str = entry.path().filename().string();
+        if (pid_str.empty() || !std::all_of(pid_str.begin(), pid_str.end(), ::isdigit)) {
+            continue;
+        }
+
+        struct stat st;
+        if (stat(entry.path().c_str(), &st) == 0) {
+            if (st.st_uid == target_uid) {
+                try {
+                    return std::stoi(pid_str);
+                } catch (const std::invalid_argument&) {
+                    return -1;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+
 void read_pids_from_cgroup(const std::string& path, std::vector<int>& pids) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -58,7 +85,6 @@ void StateManager::build_process_cache_from_cgroups() {
 
         if (stat(proc_path.c_str(), &st) == 0) {
             if (st.st_uid >= 10000) {
-                // 【核心修复】对 st.st_uid 进行显式类型转换
                 process_info_cache_[pid] = {pid, static_cast<int>(st.st_uid), state};
             }
         }
