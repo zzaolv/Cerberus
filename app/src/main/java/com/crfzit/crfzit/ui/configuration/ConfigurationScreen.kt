@@ -1,6 +1,8 @@
 // app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
 package com.crfzit.crfzit.ui.configuration
 
+import android.app.Application
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,21 +13,39 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import coil.compose.rememberAsyncImagePainter
+import coil.request.ImageRequest
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.navigation.Screen
 import com.crfzit.crfzit.ui.icons.AppIcons
 import kotlinx.coroutines.launch
 
+// 【新增】ViewModel 工厂
+class ConfigurationViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
+    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(ConfigurationViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return ConfigurationViewModel(application) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConfigurationScreen(
     navController: NavController,
-    viewModel: ConfigurationViewModel = viewModel()
+    // 【核心修改】使用工厂来创建ViewModel
+    viewModel: ConfigurationViewModel = viewModel(
+        factory = ConfigurationViewModelFactory(LocalContext.current.applicationContext as Application)
+    )
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -104,7 +124,6 @@ fun ConfigurationScreen(
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
             sheetState = sheetState,
-            // 【核心修复】移除错误的 windowInsets 参数
         ) {
             AppPolicyBottomSheetContent(
                 app = selectedApp!!,
@@ -130,8 +149,18 @@ fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
             modifier = Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Spacer(Modifier.size(40.dp)) // Placeholder for icon
-            Column(Modifier.weight(1f).padding(start = 8.dp)) {
+            // 【UI改进】显示应用图标
+            Image(
+                painter = rememberAsyncImagePainter(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(app.icon)
+                        .crossfade(true)
+                        .build(),
+                ),
+                contentDescription = "${app.appName} icon",
+                modifier = Modifier.size(40.dp)
+            )
+            Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Text(app.appName, fontWeight = FontWeight.Bold)
                 Text(app.packageName, style = MaterialTheme.typography.bodySmall)
             }
@@ -144,13 +173,13 @@ fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
     }
 }
 
+
 @Composable
 fun AppPolicyBottomSheetContent(
     app: AppInfo,
     viewModel: ConfigurationViewModel,
     onPolicyChange: (Policy) -> Unit
 ) {
-    // 【全面屏适配】为内容应用导航栏内边距，防止被遮挡
     Column(
         modifier = Modifier
             .padding(16.dp)
@@ -188,7 +217,6 @@ fun AppPolicyBottomSheetContent(
                 onCheckedChange = { viewModel.setNetworkExemption(app.packageName, it) }
             )
         }
-        // 【全面屏适配】增加一个额外的间隔，让底部内容呼吸空间更大
         Spacer(modifier = Modifier.height(8.dp))
     }
 }

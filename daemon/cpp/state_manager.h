@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <unordered_set> // <-- 新增
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "process_monitor.h"
@@ -20,7 +21,7 @@ struct AppRuntimeState {
     std::string app_name;
     int uid = -1;
     int user_id;
-    std::vector<int> pids; // 【新增】存储该应用实例的所有PID
+    std::vector<int> pids; 
 
     AppConfig config;
 
@@ -40,10 +41,12 @@ public:
 
     void process_event_handler(ProcessEventType type, int pid, int ppid);
     
-    // 【核心修改】tick函数现在只负责上层逻辑，不再扫描系统
     void tick(); 
     void update_all_resource_stats();
     nlohmann::json get_dashboard_payload();
+
+    // 【新增】接收来自UI的配置更新
+    void update_app_config_from_ui(const AppConfig& new_config);
 
 private:
     void initial_scan();
@@ -57,6 +60,9 @@ private:
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
 
+    // 【新增】判断是否为关键系统应用
+    bool is_critical_system_app(const std::string& package_name) const;
+
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
@@ -67,8 +73,10 @@ private:
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     
-    // 【新增】反向索引，从pid快速找到AppRuntimeState
     std::map<int, AppRuntimeState*> pid_to_app_map_;
+    
+    // 【新增】核心系统应用白名单
+    std::unordered_set<std::string> critical_system_apps_;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H

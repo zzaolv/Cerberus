@@ -18,10 +18,13 @@ SystemMonitor::SystemMonitor() {
     // 检测 cgroup 版本
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
         cgroup_version_ = CgroupVersion::V2;
+        LOGI("Detected cgroup v2.");
     } else if (fs::exists("/sys/fs/cgroup/freezer")) {
         cgroup_version_ = CgroupVersion::V1;
+        LOGI("Detected cgroup v1.");
     } else {
         cgroup_version_ = CgroupVersion::UNKNOWN;
+        LOGW("Could not determine cgroup version.");
     }
     update_global_stats();
 }
@@ -36,56 +39,54 @@ GlobalStatsData SystemMonitor::get_global_stats() const {
     return current_stats_;
 }
 
-/**
- * 【核心重构】获取应用统计信息
- * 优先使用cgroup v2的memory.current，解决MEM为0的问题。
- * 回退到smaps_rollup作为备用方案。
- */
+
 AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_name, int user_id) {
     AppStatsData stats;
     if (pid <= 0) return stats;
 
+    std::string proc_stat_path = "/proc/" + std::to_string(pid) + "/stat";
+    if (!fs::exists(proc_stat_path)) return stats; // 进程已不存在
+
     // --- 1. 内存获取 ---
+    // 【核心修复】重构内存获取逻辑，增加多种路径尝试和日志
+    long long mem_bytes = -1;
     if (cgroup_version_ == CgroupVersion::V2) {
-        // --- cgroup v2 路径：更可靠的内存统计 ---
-        std::string mem_path = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/memory.current";
-        std::ifstream mem_file(mem_path);
-        if (mem_file.is_open()) {
-            long long mem_bytes = 0;
-            mem_file >> mem_bytes;
-            stats.mem_usage_kb = mem_bytes / 1024;
+        // 尝试 cgroup v2 的多个可能路径
+        // Path 1: 标准用户应用路径
+        std::string mem_path_1 = "/sys/fs/cgroup/user.slice/user-" + std::to_string(user_id) + ".slice/apps.slice/" + package_name + "/memory.current";
+        // Path 2: 基于UID的路径 (常用于系统服务)
+        int uid = user_id * PER_USER_RANGE + 10000; // 这是一个猜测值，真实值从stat获取
+        struct stat p_stat;
+        if(stat(proc_stat_path.c_str(), &p_stat) == 0) uid = p_stat.st_uid;
+        std::string mem_path_2 = "/sys/fs/cgroup/uid_" + std::to_string(uid) + "/memory.current";
+
+        std::ifstream mem_file_1(mem_path_1);
+        if (mem_file_1.is_open()) {
+            mem_file_1 >> mem_bytes;
         } else {
-            // Fallback for PSS
-            std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
-            std::ifstream rollup_file(smaps_rollup_path);
-             if (rollup_file.is_open()) {
-                std::string line;
-                while (std::getline(rollup_file, line)) {
-                    if (line.rfind("Pss_Total:", 0) == 0) {
-                        std::stringstream ss(line);
-                        std::string key;
-                        long value;
-                        ss >> key >> value;
-                        stats.mem_usage_kb = value;
-                        break;
-                    }
-                }
+            std::ifstream mem_file_2(mem_path_2);
+            if (mem_file_2.is_open()) {
+                 mem_file_2 >> mem_bytes;
             }
         }
+    }
+
+    if (mem_bytes != -1) {
+        stats.mem_usage_kb = mem_bytes / 1024;
     } else {
-        // --- cgroup v1 路径：使用 smaps_rollup ---
+        // Fallback for PSS for all cases (v1, or v2 failed)
         std::string smaps_rollup_path = "/proc/" + std::to_string(pid) + "/smaps_rollup";
         std::ifstream rollup_file(smaps_rollup_path);
         if (rollup_file.is_open()) {
             std::string line;
             while (std::getline(rollup_file, line)) {
-                if (line.rfind("Pss_Total:", 0) == 0) {
+                if (line.rfind("Pss:", 0) == 0) { // 使用 Pss 而非 Pss_Total 更通用
                     std::stringstream ss(line);
                     std::string key;
                     long value;
                     ss >> key >> value;
                     stats.mem_usage_kb = value;
-                } else if (line.rfind("SwapPss:", 0) == 0) {
+                } else if (line.rfind("Swap:", 0) == 0) {
                      std::stringstream ss(line);
                      std::string key;
                      long value;
@@ -93,13 +94,14 @@ AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_na
                      stats.swap_usage_kb = value;
                 }
             }
+        } else {
+             // 如果 cgroup 和 smaps_rollup 都失败，记录一个警告
+             LOGW("Cannot read memory for pid %d (%s), cgroup v2 path and smaps_rollup failed.", pid, package_name.c_str());
         }
     }
-
-
+    
     // --- 2. CPU使用率获取 (逻辑不变) ---
-    std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
-    std::ifstream stat_file(stat_path);
+    std::ifstream stat_file(proc_stat_path);
     if (stat_file.is_open()) {
         std::string line;
         std::getline(stat_file, line);

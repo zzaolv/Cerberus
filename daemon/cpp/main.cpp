@@ -12,7 +12,7 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
-#include <filesystem> // <-- 已包含头文件
+#include <filesystem>
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -20,7 +20,6 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using json = nlohmann::json;
-// 【核心修复】添加缺失的命名空间别名定义
 namespace fs = std::filesystem;
 
 const std::string SOCKET_NAME = "cerberus_socket";
@@ -32,19 +31,39 @@ std::shared_ptr<StateManager> g_state_manager;
 std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::atomic<bool> g_is_running = true;
 
+// 【核心修改】实现指令处理
 void handle_ui_message(const std::string& message_str) {
     LOGI("Received UI message: %s", message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        if (type.rfind("cmd.", 0) == 0) {
-            LOGI("Handling command: %s", type.c_str());
+        if (type == "cmd.set_policy") {
+            const auto& payload = msg["payload"];
+            std::string package_name = payload.value("package_name", "");
+            int policy_int = payload.value("policy", 2); // 默认为 STANDARD
+
+            if (!package_name.empty()) {
+                AppConfig new_config;
+                new_config.package_name = package_name;
+                new_config.policy = static_cast<AppPolicy>(policy_int);
+                // TODO: 从 payload 中读取豁免开关
+                new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
+                new_config.force_network_exempt = payload.value("force_network_exempt", false);
+
+                if (g_state_manager) {
+                    LOGI("Processing set_policy for %s to policy %d", package_name.c_str(), policy_int);
+                    g_state_manager->update_app_config_from_ui(new_config);
+                }
+            }
         } else if (type.rfind("query.", 0) == 0) {
-            LOGI("Handling query: %s", type.c_str());
+            LOGI("Handling query: %s (not implemented yet)", type.c_str());
         }
+
     } catch (const json::parse_error& e) {
         LOGW("JSON parse error from UI: %s", e.what());
+    } catch (const std::exception& e) {
+        LOGE("Error handling UI message: %s", e.what());
     }
 }
 
