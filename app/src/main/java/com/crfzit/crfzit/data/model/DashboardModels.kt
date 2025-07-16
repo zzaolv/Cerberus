@@ -26,6 +26,11 @@ data class GlobalStats(
     val totalMemKb: Long = 0L,
     @SerializedName("avail_mem_kb")
     val availMemKb: Long = 0L,
+    // 【核心修复】确保这里的字段与 C++ 端和 UI 使用端完全一致
+    @SerializedName("swap_total_kb")
+    val swapTotalKb: Long = 0L,
+    @SerializedName("swap_free_kb")
+    val swapFreeKb: Long = 0L,
     @SerializedName("active_profile_name")
     val activeProfileName: String = "等待连接..."
 )
