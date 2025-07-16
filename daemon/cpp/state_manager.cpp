@@ -17,8 +17,6 @@
 
 namespace fs = std::filesystem;
 
-// 【核心修复】将 status_to_string_local 函数的定义移到文件顶部，并移除 StateManager:: 作用域
-// 使其成为一个本文件内可见的静态辅助函数。
 static std::string status_to_string_local(AppRuntimeState::Status status) {
     switch (status) {
         case AppRuntimeState::Status::STOPPED: return "STOPPED";
@@ -44,7 +42,7 @@ int StateManager::get_pid_for_package(const std::string& package_name) {
         std::ifstream cmdline_file(entry.path() / "cmdline");
         if (cmdline_file.is_open()) {
             std::string cmdline;
-            std::getline(cmdline_file, cmdline, '\0'); // 读取到第一个NUL字符
+            std::getline(cmdline_file, cmdline, '\0');
             if (!cmdline.empty() && cmdline == package_name) {
                 try {
                     return std::stoi(pid_str);
@@ -68,7 +66,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::sha
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status) {
     if (app.current_status == new_status) return;
     
-    // 现在调用 status_to_string_local 是安全的
     LOGI("State transition for %s: %s -> %s", 
          app.package_name.c_str(), 
          status_to_string_local(app.current_status).c_str(), 
@@ -221,7 +218,9 @@ nlohmann::json StateManager::get_dashboard_payload() {
     
     json apps_state = json::array();
     for (const auto& [pkg, app] : managed_apps_) {
-        if (app.current_status != AppRuntimeState::Status::STOPPED || app.is_foreground_for_display) {
+        // 【核心修复】移除未定义的 'is_foreground_for_display'。
+        // 现在的逻辑是：只要应用的状态不是 STOPPED，就将其信息推送到UI。
+        if (app.current_status != AppRuntimeState::Status::STOPPED) {
             json app_json;
             app_json["package_name"] = app.package_name;
             app_json["app_name"] = app.app_name;
