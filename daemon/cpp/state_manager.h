@@ -9,7 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
-// #include <unordered_set> // <-- 【核心原则变更】不再需要
+#include <unordered_set> // 【安全网】重新引入，用于定义硬性安全网
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "process_monitor.h"
@@ -59,8 +59,8 @@ private:
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
 
-    // 【核心原则变更】移除 is_critical_system_app 函数
-    // bool is_critical_system_app(const std::string& package_name) const;
+    // 【安全网】重新引入关键应用检查函数
+    bool is_critical_system_app(const std::string& package_name) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
@@ -74,8 +74,8 @@ private:
     
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     
-    // 【核心原则变更】移除硬编码的白名单
-    // std::unordered_set<std::string> critical_system_apps_;
+    // 【安全网】重新引入硬性安全网列表
+    std::unordered_set<std::string> critical_system_apps_;
 };
 
-#endif //CERBERUS_STATE_MANAGER_H
+#endif //CERBERUS_STATE_MANAGER_H   
