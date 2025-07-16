@@ -34,15 +34,10 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
     LOGI("StateManager (Safe-by-Default) Initializing...");
     
-    // 【核心原则变更】移除所有硬编码白名单的初始化
-    
     refresh_app_list_from_db();
     initial_scan();
     LOGI("StateManager Initialized.");
 }
-
-// 【核心原则变更】移除此函数
-// bool StateManager::is_critical_system_app(const std::string& package_name) const { ... }
 
 void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -51,15 +46,12 @@ void StateManager::tick() {
     check_and_update_foreground_status();
 
     for (auto& [key, app] : managed_apps_) {
-        // 【核心原则变更】唯一的判断标准：策略是否为豁免。
-        // 未在数据库中配置的应用，其策略默认为EXEMPTED，因此也会在这里被跳过。
         if (app.pids.empty() || app.config.policy == AppPolicy::EXEMPTED) {
             continue;
         }
 
         if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-            // TODO: 后续应根据不同策略设置不同超时时间
             if (elapsed > 15) { 
                 transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE);
             }
@@ -84,29 +76,25 @@ void StateManager::update_app_config_from_ui(const AppConfig& new_config) {
         LOGE("Failed to save app config to DB for %s", new_config.package_name.c_str());
     }
 
-    // 更新所有匹配该包名的应用实例
     for (auto& [key, app] : managed_apps_) {
         if (key.first == new_config.package_name) {
             app.config = new_config;
             LOGI("Updated in-memory config for %s (user %d). New policy: %d", 
                  app.package_name.c_str(), app.user_id, static_cast<int>(app.config.policy));
             
-            // 如果新策略是豁免，立即解冻并设置状态
             if (app.config.policy == AppPolicy::EXEMPTED && app.current_status != AppRuntimeState::Status::EXEMPTED) {
                 if(app.current_status == AppRuntimeState::Status::FROZEN) {
                     action_executor_->unfreeze_app(app.package_name, app.user_id);
                 }
                 transition_state(app, AppRuntimeState::Status::EXEMPTED);
             } 
-            // 如果从豁免变为非豁免，需要重新评估状态
             else if (app.config.policy != AppPolicy::EXEMPTED && app.current_status == AppRuntimeState::Status::EXEMPTED) {
-                transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE); // 假定它在后台
+                transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
             }
         }
     }
 }
 
-// 【逻辑核心】当发现一个新应用时，检查数据库；如果不存在，则默认为豁免。
 AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) {
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
@@ -118,17 +106,13 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     new_state.user_id = user_id;
     new_state.app_name = package_name;
     
-    // 检查数据库中是否已存在配置
     auto config_opt = db_manager_->get_app_config(package_name);
     if(config_opt) {
-        // 如果存在，使用数据库中的配置
         new_state.config = *config_opt;
         LOGI("Found existing config for %s. Policy: %d", package_name.c_str(), static_cast<int>(new_state.config.policy));
     } else {
-        // 【核心原则变更】如果数据库中没有，则创建一个默认“豁免”的配置。
-        // 这个配置只存在于内存中，不会写入数据库。
         new_state.config.package_name = package_name;
-        new_state.config.policy = AppPolicy::EXEMPTED; // 默认安全！
+        new_state.config.policy = AppPolicy::EXEMPTED;
         LOGI("No config found for %s. Applying Safe-by-Default policy: EXEMPTED.", package_name.c_str());
     }
     
@@ -148,7 +132,6 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
         pid_to_app_map_[pid] = app;
 
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
-            // 【核心原则变更】初始状态由其配置决定
             if (app->config.policy == AppPolicy::EXEMPTED) {
                  transition_state(*app, AppRuntimeState::Status::EXEMPTED);
             } else {
@@ -157,6 +140,30 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
             LOGI("Discovered new process %d for %s (user %d), policy is %d. Initial state: %s", 
                 pid, package_name.c_str(), user_id, static_cast<int>(app->config.policy), status_to_string_local(app->current_status).c_str());
         }
+    }
+}
+
+void StateManager::remove_pid_from_app(int pid) {
+    auto it = pid_to_app_map_.find(pid);
+    if (it == pid_to_app_map_.end()) return;
+
+    AppRuntimeState* app = it->second;
+    pid_to_app_map_.erase(it);
+
+    auto& pids = app->pids;
+    pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
+
+    LOGI("Process %d exited for %s (user %d), remaining pids: %zu.", pid, app->package_name.c_str(), app->user_id, pids.size());
+
+    if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
+        if(app->current_status == AppRuntimeState::Status::FROZEN){
+            // 【核心修复】使用 -> 访问指针成员
+            action_executor_->unfreeze_app(app->package_name, app->user_id);
+        }
+        transition_state(*app, AppRuntimeState::Status::STOPPED);
+        app->mem_usage_kb = 0;
+        app->swap_usage_kb = 0;
+        app->cpu_usage_percent = 0.0f;
     }
 }
 
@@ -183,7 +190,6 @@ nlohmann::json StateManager::get_dashboard_payload() {
             app_json["mem_usage_kb"] = app.mem_usage_kb;
             app_json["swap_usage_kb"] = app.swap_usage_kb;
             app_json["cpu_usage_percent"] = app.cpu_usage_percent;
-            // 【核心原则变更】is_whitelisted现在只取决于策略
             app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
             app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
             app_json["hasPlayback"] = false;
@@ -196,9 +202,6 @@ nlohmann::json StateManager::get_dashboard_payload() {
     payload["apps_runtime_state"] = apps_state;
     return payload;
 }
-
-
-// ----- 以下函数保持不变 -----
 
 void StateManager::process_event_handler(ProcessEventType type, int pid, int ppid) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -266,29 +269,6 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
         return cmdline;
     }
     return "";
-}
-
-void StateManager::remove_pid_from_app(int pid) {
-    auto it = pid_to_app_map_.find(pid);
-    if (it == pid_to_app_map_.end()) return;
-
-    AppRuntimeState* app = it->second;
-    pid_to_app_map_.erase(it);
-
-    auto& pids = app->pids;
-    pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-
-    LOGI("Process %d exited for %s (user %d), remaining pids: %zu.", pid, app->package_name.c_str(), app->user_id, pids.size());
-
-    if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
-        if(app->current_status == AppRuntimeState::Status::FROZEN){
-            action_executor_->unfreeze_app(app.package_name, app->user_id);
-        }
-        transition_state(*app, AppRuntimeState::Status::STOPPED);
-        app->mem_usage_kb = 0;
-        app->swap_usage_kb = 0;
-        app->cpu_usage_percent = 0.0f;
-    }
 }
 
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status) {
