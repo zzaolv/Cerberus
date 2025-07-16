@@ -1,0 +1,41 @@
+#      Project Cerberus SELinux Policy
+# ==============================================
+# 定义我们的进程类型和可执行文件类型
+type cerberus_daemon_t, domain;
+type cerberus_daemon_exec_t, exec_type, file_type, vendor_file_type;
+
+# 允许init域(Magisk)启动我们的守护进程，并允许进程自我转换
+init_daemon_domain(cerberus_daemon_t)
+
+# 允许完全控制其数据目录 (/data/adb/cerberus)
+# 用于存放数据库、日志、Socket文件等
+type cerberus_data_file, file_type, data_file_type;
+allow cerberus_daemon_t cerberus_data_file:dir { create search write add_name remove_name rmdir getattr setattr };
+allow cerberus_daemon_t cerberus_data_file:file { create open read write append getattr setattr unlink };
+
+# === 核心修正部分 ===
+# 允许守护进程创建、监听和接受UDS连接
+allow cerberus_daemon_t self:unix_stream_socket { create listen accept bind read write shutdown getattr setattr };
+
+# 允许 untrusted_app (UI App) 和 system_server (Probe) 连接到我们的守护进程创建的socket
+# 语法: allow <source> <target>:<class> <permission>
+allow { untrusted_app system_server } cerberus_daemon_t:unix_stream_socket connectto;
+
+# 允许守护进程从 untrusted_app 和 system_server 接收数据
+allow cerberus_daemon_t { untrusted_app system_server }:unix_stream_socket { read write getattr setattr };
+
+# 允许操作cgroup v1/v2 freezer，这是核心冻结机制
+allow cerberus_daemon_t cgroupfs:dir { search write add_name remove_name };
+allow cerberus_daemon_t cgroupfs:file { open write };
+allow cerberus_daemon_t cgroup_v2:dir { search write add_name remove_name };
+allow cerberus_daemon_t cgroup_v2:file { open write };
+
+# 允许向其他应用进程发送信号，用于SIGSTOP/SIGKILL
+# 这是高权限操作，Daemon内部逻辑必须严格控制目标
+allow cerberus_daemon_t { zygote untrusted_app platform_app system_app }:process { signal sigkill sigstop };
+
+# 允许写入Magisk模块自身的属性文件，用于动态更新状态描述
+allow cerberus_daemon_t magisk_file:file { write open };
+allow cerberus_daemon_t proc:file { read open getattr };
+allow cerberus_daemon_t proc_stat:file { read open getattr };
+allow cerberus_daemon_t proc_meminfo:file { read open getattr };
