@@ -32,8 +32,6 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-
-// 【新增】帮助函数，从cgroup的tasks文件中读取PID列表
 void read_pids_from_cgroup(const std::string& path, std::vector<int>& pids) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -45,8 +43,6 @@ void read_pids_from_cgroup(const std::string& path, std::vector<int>& pids) {
     }
 }
 
-
-// 【核心重构】使用cgroup重写进程发现机制
 void StateManager::build_process_cache_from_cgroups() {
     process_info_cache_.clear();
 
@@ -61,9 +57,9 @@ void StateManager::build_process_cache_from_cgroups() {
         std::string proc_path = "/proc/" + std::to_string(pid);
 
         if (stat(proc_path.c_str(), &st) == 0) {
-            // 只关心UID >= 10000的普通应用进程
             if (st.st_uid >= 10000) {
-                process_info_cache_[pid] = {pid, st.st_uid, state};
+                // 【核心修复】对 st.st_uid 进行显式类型转换
+                process_info_cache_[pid] = {pid, static_cast<int>(st.st_uid), state};
             }
         }
     };
@@ -76,17 +72,12 @@ void StateManager::build_process_cache_from_cgroups() {
     }
 }
 
-
-// 【核心重构】tick函数现在使用新的cgroup缓存
 void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
 
-    // 1. 高效地从cgroup构建缓存
     build_process_cache_from_cgroups();
 
-    // 2. 为了快速查找，将PID缓存转换为UID -> CgroupState的映射。
-    //    一个UID可能有多个进程，以前台进程为准。
     std::map<int, CgroupState> uid_cgroup_state_map;
     for (const auto& [pid, info] : process_info_cache_) {
         auto it = uid_cgroup_state_map.find(info.uid);
@@ -95,7 +86,6 @@ void StateManager::tick() {
         }
     }
 
-    // 3. 遍历所有受管理的应用，更新其状态
     for (auto& [key, app] : managed_apps_) {
         if (app.uid == -1) continue;
 
@@ -107,7 +97,6 @@ void StateManager::tick() {
         auto it = uid_cgroup_state_map.find(app.uid);
 
         if (it == uid_cgroup_state_map.end()) {
-            // 在cgroup中未找到，说明进程已停止
             if (app.current_status != AppRuntimeState::Status::STOPPED) {
                  if (app.current_status == AppRuntimeState::Status::FROZEN) {
                     action_executor_->unfreeze_uid(app.uid);
@@ -118,22 +107,15 @@ void StateManager::tick() {
                 app.swap_usage_kb = 0;
             }
         } else {
-            // 在cgroup中找到了，说明进程在运行
             CgroupState current_cgroup_state = it->second;
 
-            // 只有当应用不处于前台时，我们的自动状态机才介入
-            // Probe发送的事件会强制将状态设为FOREGROUND，优先级最高
             if (app.current_status != AppRuntimeState::Status::FOREGROUND) {
                 if (current_cgroup_state == CgroupState::BACKGROUND) {
-                    // 如果cgroup在后台，且应用当前是初次启动或已停止，则将其设为后台闲置
                     if(app.current_status == AppRuntimeState::Status::STOPPED) {
                          transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE);
                     }
                 }
-                // 如果cgroup在前台，但我们的状态机没收到Probe事件，也暂时不同步为FOREGROUND
-                // 等待Probe的事件，或者等待它被移到background cgroup
 
-                // 核心状态转移逻辑
                 switch (app.current_status) {
                     case AppRuntimeState::Status::BACKGROUND_IDLE: {
                         auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
@@ -161,15 +143,12 @@ void StateManager::tick() {
     }
 }
 
-
-// 【修改】update_resource_stats现在使用新的PID缓存
 void StateManager::update_resource_stats(bool update_user, bool update_system) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     sys_monitor_->update_all_stats();
     global_stats_ = sys_monitor_->get_stats();
 
-    // 遍历所有受管理的应用，而不是缓存，因为我们需要更新应用对象
     for (auto& [key, app] : managed_apps_) {
         if (app.current_status == AppRuntimeState::Status::STOPPED || app.current_status == AppRuntimeState::Status::EXEMPTED) {
             continue;
@@ -180,12 +159,10 @@ void StateManager::update_resource_stats(bool update_user, bool update_system) {
             continue;
         }
 
-        // 查找该UID对应的PID
         int representative_pid = -1;
         for(const auto& [pid, info] : process_info_cache_) {
             if (info.uid == app.uid) {
                 representative_pid = pid;
-                // 优先选择前台进程的PID作为代表
                 if (info.cgroup_state == CgroupState::FOREGROUND) {
                     break;
                 }
@@ -200,9 +177,6 @@ void StateManager::update_resource_stats(bool update_user, bool update_system) {
         }
     }
 }
-
-
-// ============== 以下函数基本不变，仅做微小调整 ==============
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor)
     : db_manager_(std::move(db_manager)),
