@@ -18,12 +18,11 @@ public:
     void run();
     void stop();
     void broadcast_message(const std::string& message);
-    void set_message_handler(std::function<void(const std::string&)> handler);
+    
+    void set_message_handler(std::function<void(int client_fd, const std::string&)> handler);
 
-    /**
-     * @brief 检查当前是否有任何客户端连接。
-     * @return 如果至少有一个客户端连接，则返回 true，否则返回 false。
-     */
+    void send_message_to_client(int client_fd, const std::string& message);
+
     bool has_clients();
 
 private:
@@ -38,7 +37,7 @@ private:
     std::vector<int> client_fds_;
     std::mutex client_mutex_;
 
-    std::function<void(const std::string&)> on_message_received_;
+    std::function<void(int, const std::string&)> on_message_received_;
     std::map<int, std::string> client_buffers_;
 };
 

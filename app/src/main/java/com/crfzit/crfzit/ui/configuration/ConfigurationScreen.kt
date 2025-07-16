@@ -13,6 +13,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -27,7 +28,6 @@ import com.crfzit.crfzit.navigation.Screen
 import com.crfzit.crfzit.ui.icons.AppIcons
 import kotlinx.coroutines.launch
 
-// 【新增】ViewModel 工厂
 class ConfigurationViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(ConfigurationViewModel::class.java)) {
@@ -42,10 +42,7 @@ class ConfigurationViewModelFactory(private val application: Application) : View
 @Composable
 fun ConfigurationScreen(
     navController: NavController,
-    // 【核心修改】使用工厂来创建ViewModel
-    viewModel: ConfigurationViewModel = viewModel(
-        factory = ConfigurationViewModelFactory(LocalContext.current.applicationContext as Application)
-    )
+    viewModel: ConfigurationViewModel = viewModel(factory = ConfigurationViewModelFactory(LocalContext.current.applicationContext as Application))
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -110,9 +107,12 @@ fun ConfigurationScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(filteredApps, key = { it.packageName }) { app ->
-                        AppPolicyItem(app = app) {
-                            selectedApp = app
-                            scope.launch { sheetState.show() }
+                        val isProtected = uiState.safetyNet.contains(app.packageName)
+                        AppPolicyItem(app = app, isProtected = isProtected) {
+                            if (!isProtected) {
+                                selectedApp = app
+                                scope.launch { sheetState.show() }
+                            }
                         }
                     }
                 }
@@ -128,9 +128,8 @@ fun ConfigurationScreen(
             AppPolicyBottomSheetContent(
                 app = selectedApp!!,
                 viewModel = viewModel,
-                onPolicyChange = { newPolicy ->
-                    viewModel.setPolicy(selectedApp!!.packageName, newPolicy)
-                    scope.launch { sheetState.hide() }.invokeOnCompletion {
+                onDismiss = {
+                     scope.launch { sheetState.hide() }.invokeOnCompletion {
                         if (!sheetState.isVisible) {
                             selectedApp = null
                         }
@@ -143,13 +142,15 @@ fun ConfigurationScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onClick: () -> Unit) {
+    Card(
+        onClick = onClick, 
+        modifier = Modifier.fillMaxWidth().alpha(if (isProtected) 0.6f else 1.0f)
+    ) {
         Row(
             modifier = Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 【UI改进】显示应用图标
             Image(
                 painter = rememberAsyncImagePainter(
                     model = ImageRequest.Builder(LocalContext.current)
@@ -162,23 +163,27 @@ fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
             )
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Text(app.appName, fontWeight = FontWeight.Bold)
-                Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+                Text(app.packageName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            }
+            val (label, icon) = if (isProtected) {
+                "系统核心" to "🔒"
+            } else {
+                getPolicyLabel(app.policy)
             }
             Text(
-                text = getPolicyLabel(app.policy).first,
-                color = MaterialTheme.colorScheme.primary,
+                text = "$icon $label",
+                color = if (isProtected) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.Bold
             )
         }
     }
 }
 
-
 @Composable
 fun AppPolicyBottomSheetContent(
     app: AppInfo,
     viewModel: ConfigurationViewModel,
-    onPolicyChange: (Policy) -> Unit
+    onDismiss: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -189,12 +194,15 @@ fun AppPolicyBottomSheetContent(
         Text(app.appName, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.align(Alignment.CenterHorizontally))
         HorizontalDivider()
         Text("策略等级", style = MaterialTheme.typography.titleMedium)
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Policy.entries.forEach { policy ->
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             Policy.entries.forEach { policy ->
                 val (label, icon) = getPolicyLabel(policy)
                 Button(
-                    onClick = { onPolicyChange(policy) },
-                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { 
+                        viewModel.setPolicy(app.packageName, policy)
+                        onDismiss()
+                    },
+                    modifier = Modifier.weight(1f),
                     enabled = app.policy != policy
                 ) {
                     Text("$icon $label")
@@ -223,7 +231,7 @@ fun AppPolicyBottomSheetContent(
 
 fun getPolicyLabel(policy: Policy): Pair<String, String> {
     return when (policy) {
-        Policy.EXEMPTED -> "自由后台" to "🛡️"
+        Policy.EXEMPTED -> "自由" to "🛡️"
         Policy.IMPORTANT -> "重要" to "✅"
         Policy.STANDARD -> "智能" to "⚙️"
         Policy.STRICT -> "严格" to "🧊"

@@ -1,8 +1,10 @@
+// app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
 package com.crfzit.crfzit.ui.logs
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,7 +20,7 @@ import java.util.*
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
-    val logs by viewModel.logs.collectAsState()
+    val uiState by viewModel.uiState.collectAsState()
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("事件时间线", "资源统计")
 
@@ -36,7 +38,10 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
                 }
             }
             when (selectedTab) {
-                0 -> EventTimeline(logs)
+                0 -> EventTimeline(
+                    state = uiState,
+                    onLoadMore = { viewModel.loadMoreLogs() }
+                )
                 1 -> ResourceStatistics()
             }
         }
@@ -44,14 +49,40 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
 }
 
 @Composable
-fun EventTimeline(logs: List<LogEntry>) {
-    LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        reverseLayout = true
-    ) {
-        items(logs, key = { it.timestamp }) { log ->
-            LogItem(log)
+fun EventTimeline(state: LogsUiState, onLoadMore: () -> Unit) {
+    val listState = rememberLazyListState()
+    
+    // 到达列表底部时自动加载更多
+    val reachedBottom: Boolean by remember {
+        derivedStateOf {
+            val lastVisibleItem = listState.layoutInfo.visibleItemsInfo.lastOrNull()
+            lastVisibleItem?.index == listState.layoutInfo.totalItemsCount - 1
+        }
+    }
+
+    LaunchedEffect(reachedBottom) {
+        if (reachedBottom && state.canLoadMore && !state.isLoading) {
+            onLoadMore()
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            reverseLayout = false // 从上到下显示
+        ) {
+            items(state.logs, key = { it.timestamp }) { log ->
+                LogItem(log)
+            }
+            if (state.isLoading) {
+                item {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.Center) {
+                        CircularProgressIndicator()
+                    }
+                }
+            }
         }
     }
 }
@@ -79,15 +110,13 @@ fun ResourceStatistics() {
     }
 }
 
-// <-- 关键修正：将此函数标记为 @Composable
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {
     return when (level) {
         LogLevel.INFO -> "ℹ️" to MaterialTheme.colorScheme.outline
-        LogLevel.SUCCESS -> "✅" to Color(0xFF34A853) // Green
-        LogLevel.WARNING -> "⚠️" to Color(0xFFFBBC05) // Yellow
+        LogLevel.SUCCESS -> "✅" to Color(0xFF34A853)
+        LogLevel.WARNING -> "⚠️" to Color(0xFFFBBC05)
         LogLevel.ERROR -> "❌" to MaterialTheme.colorScheme.error
-        // 现在可以安全地访问 MaterialTheme.colorScheme 了
         LogLevel.EVENT -> "⚡" to MaterialTheme.colorScheme.primary
     }
 }

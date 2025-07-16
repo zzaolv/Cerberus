@@ -25,16 +25,31 @@ UdsServer::~UdsServer() {
     }
 }
 
-void UdsServer::set_message_handler(std::function<void(const std::string&)> handler) {
+void UdsServer::set_message_handler(std::function<void(int, const std::string&)> handler) {
     on_message_received_ = std::move(handler);
 }
 
-// 【新增】实现 has_clients 方法
 bool UdsServer::has_clients() {
     std::lock_guard<std::mutex> lock(client_mutex_);
     return !client_fds_.empty();
 }
 
+void UdsServer::send_message_to_client(int client_fd, const std::string& message) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    auto it = std::find(client_fds_.begin(), client_fds_.end(), client_fd);
+    if (it == client_fds_.end()) {
+        LOGW("Attempted to send message to non-existent client fd: %d", client_fd);
+        return;
+    }
+
+    std::string line = message + "\n";
+    ssize_t bytes_sent = send(client_fd, line.c_str(), line.length(), MSG_NOSIGNAL);
+    if (bytes_sent < 0) {
+        if (errno == EPIPE || errno == ECONNRESET) {
+            LOGW("Send to client %d failed, it may have disconnected.", client_fd);
+        }
+    }
+}
 
 void UdsServer::add_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -72,13 +87,7 @@ void UdsServer::broadcast_message(const std::string& message) {
 
     if (!disconnected_clients.empty()) {
         for (int fd : disconnected_clients) {
-            auto it_fds = std::remove(client_fds_.begin(), client_fds_.end(), fd);
-            if (it_fds != client_fds_.end()) {
-                client_fds_.erase(it_fds, client_fds_.end());
-                client_buffers_.erase(fd);
-                LOGI("Client fd %d write failed (Connection closed), removing.", fd);
-                close(fd);
-            }
+            // Do not call remove_client here to avoid deadlock
         }
     }
 }
@@ -118,29 +127,16 @@ void UdsServer::handle_client_data(int client_fd) {
 
     if (on_message_received_ && !messages_to_process.empty()) {
         for (const auto& msg : messages_to_process) {
-            on_message_received_(msg);
+            on_message_received_(client_fd, msg);
         }
     }
 }
 
-
 void UdsServer::stop() {
-    LOGI("Stopping UDS server...");
     is_running_ = false;
-
     if (server_fd_ != -1) {
         shutdown(server_fd_, SHUT_RDWR);
-        close(server_fd_);
-        server_fd_ = -1;
     }
-
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    for (int fd : client_fds_) {
-        close(fd);
-    }
-    client_fds_.clear();
-    client_buffers_.clear();
-    LOGI("All client connections closed.");
 }
 
 void UdsServer::run() {
@@ -156,7 +152,7 @@ void UdsServer::run() {
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_path_.c_str(), sizeof(addr.sun_path) - 2);
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_path_.length() + 1;
-
+    
     if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
         LOGE("Failed to bind socket '@%s': %s", socket_path_.c_str(), strerror(errno));
         close(server_fd_);
@@ -178,9 +174,11 @@ void UdsServer::run() {
         FD_SET(server_fd_, &read_fds);
         int max_fd = server_fd_;
 
+        std::vector<int> current_clients;
         {
             std::lock_guard<std::mutex> lock(client_mutex_);
-            for (int fd : client_fds_) {
+            current_clients = client_fds_;
+            for (int fd : current_clients) {
                 FD_SET(fd, &read_fds);
                 if (fd > max_fd) {
                     max_fd = fd;
@@ -194,12 +192,12 @@ void UdsServer::run() {
 
         int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
 
+        if (!is_running_) break;
+
         if (activity < 0 && errno != EINTR) {
             LOGE("select() error: %s", strerror(errno));
             break;
         }
-
-        if (!is_running_) break;
 
         if (activity > 0) {
             if (FD_ISSET(server_fd_, &read_fds)) {
@@ -209,11 +207,6 @@ void UdsServer::run() {
                 }
             }
             
-            std::vector<int> current_clients;
-            {
-                std::lock_guard<std::mutex> lock(client_mutex_);
-                current_clients = client_fds_;
-            }
             for (int fd : current_clients) {
                 if (FD_ISSET(fd, &read_fds)) {
                     handle_client_data(fd);
@@ -222,5 +215,18 @@ void UdsServer::run() {
         }
     }
 
-    LOGI("Server event loop has terminated.");
+    LOGI("Server event loop has terminated. Cleaning up all sockets.");
+    close(server_fd_);
+    server_fd_ = -1;
+    
+    std::vector<int> clients_to_close;
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        clients_to_close = client_fds_;
+        client_fds_.clear();
+        client_buffers_.clear();
+    }
+    for (int fd : clients_to_close) {
+        close(fd);
+    }
 }

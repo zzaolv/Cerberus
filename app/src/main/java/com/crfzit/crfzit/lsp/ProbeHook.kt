@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
+import android.app.Notification
 import android.content.ComponentName
 import android.content.pm.ApplicationInfo
 import android.os.Process
@@ -16,9 +17,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.lang.reflect.Method
 
-/**
- * 这是我们的 LSPosed 模块的入口点。
- */
 class ProbeHook : IXposedHookLoadPackage {
 
     private val probeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -27,32 +25,83 @@ class ProbeHook : IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "CerberusProbe"
-        // Android User ID 分隔符
         private const val PER_USER_RANGE = 100000
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 只注入 system_server 进程
         if (lpparam.packageName != "android" || lpparam.processName != "android") {
             return
         }
         
-        // 启动UDS客户端
         udsClient.start()
         XposedBridge.log("$TAG: Attached to system_server (PID: ${Process.myPid()})")
+        
         hookActivityManagerService(lpparam.classLoader)
+        hookPowerManagerService(lpparam.classLoader)
+        hookNotificationManagerService(lpparam.classLoader)
     }
+
+    // 【新增】Hook 电源管理器，用于监听亮/熄屏
+    private fun hookPowerManagerService(classLoader: ClassLoader) {
+        try {
+            val pmsClass = XposedHelpers.findClass("com.android.server.power.PowerManagerService", classLoader)
+
+            XposedHelpers.findAndHookMethod(pmsClass, "goToSleep", Long::class.java, Int::class.java, Int::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        XposedBridge.log("$TAG: Screen is turning OFF.")
+                        sendEventToDaemon("event.screen_off", emptyMap())
+                    }
+                })
+
+            XposedHelpers.findAndHookMethod(pmsClass, "wakeUp", Long::class.java, Int::class.java, String::class.java, String::class.java, Int::class.java, String::class.java, Int::class.java,
+                object : XC_MethodHook() {
+                     override fun afterHookedMethod(param: MethodHookParam) {
+                        XposedBridge.log("$TAG: Screen is turning ON.")
+                        sendEventToDaemon("event.screen_on", emptyMap())
+                    }
+                })
+             XposedBridge.log("$TAG: Successfully hooked PowerManagerService.")
+        } catch(t: Throwable) {
+            XposedBridge.log("$TAG: Failed to hook PowerManagerService: ${t.message}")
+        }
+    }
+    
+    // 【新增】Hook 通知管理器，用于监听通知
+    private fun hookNotificationManagerService(classLoader: ClassLoader) {
+        try {
+            val nmsClass = XposedHelpers.findClass("com.android.server.notification.NotificationManagerService", classLoader)
+
+            XposedHelpers.findAndHookMethod(nmsClass, "enqueueNotificationWithTag",
+                String::class.java, // pkg
+                String::class.java, // opPkg
+                String::class.java, // tag
+                Int::class.java, // id
+                Notification::class.java, // notification
+                Int::class.java, // userId
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val pkg = param.args[0] as String
+                        val userId = param.args[5] as Int
+                        XposedBridge.log("$TAG: Notification posted for $pkg (user: $userId)")
+                        sendEventToDaemon("event.notification_post", mapOf(
+                            "package_name" to pkg,
+                            "user_id" to userId
+                        ))
+                    }
+                })
+            XposedBridge.log("$TAG: Successfully hooked NotificationManagerService.")
+        } catch(t: Throwable) {
+            XposedBridge.log("$TAG: Failed to hook NotificationManagerService: ${t.message}")
+        }
+    }
+
 
     private fun hookActivityManagerService(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
 
-            // Hook cleanUpRemovedTask - 任务被移除，视为应用被杀死
-            XposedHelpers.findAndHookMethod(
-                amsClass,
-                "cleanUpRemovedTask",
-                "com.android.server.wm.Task",
-                Boolean::class.java,
+            XposedHelpers.findAndHookMethod(amsClass, "cleanUpRemovedTask", "com.android.server.wm.Task", Boolean::class.java, Boolean::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
@@ -60,11 +109,9 @@ class ProbeHook : IXposedHookLoadPackage {
                             val baseIntent = XposedHelpers.getObjectField(task, "mBaseIntent")
                             val componentName = XposedHelpers.callMethod(baseIntent, "getComponent") as ComponentName?
                             val packageName = componentName?.packageName
-                            // 【核心重构】从Task中获取发起者的UserID，这是最可靠的方式
                             val userId = XposedHelpers.callMethod(task, "getUserId") as Int
                             
                             if (packageName != null) {
-                                XposedBridge.log("$TAG: App task removed: $packageName, user: $userId")
                                 sendEventToDaemon("event.app_killed", mapOf("package_name" to packageName, "user_id" to userId))
                             }
                         } catch (t: Throwable) {
@@ -74,8 +121,6 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             )
             
-            // Hook 'startProcess' - 进程启动
-            // 找到最通用的 startProcess 方法，它有多个重载
             val startProcessMethods = amsClass.declaredMethods.filter { it.name == "startProcess" }
             startProcessMethods.forEach { method ->
                  XposedBridge.hookMethod(method, object : XC_MethodHook() {
@@ -83,14 +128,13 @@ class ProbeHook : IXposedHookLoadPackage {
                         val appInfo = param.args.firstOrNull { it is ApplicationInfo } as? ApplicationInfo
                         if (appInfo != null) {
                             val packageName = appInfo.packageName
-                            // 【核心重构】从 ApplicationInfo 中获取完整的 UID，并计算出 UserID
                             val uid = appInfo.uid
                             val userId = uid / PER_USER_RANGE
                             
-                            XposedBridge.log("$TAG: App process starting: $packageName, user: $userId (uid: $uid)")
                             sendEventToDaemon("event.app_start", mapOf(
                                 "package_name" to packageName,
-                                "user_id" to userId
+                                "user_id" to userId,
+                                "uid" to uid
                             ))
                         }
                     }

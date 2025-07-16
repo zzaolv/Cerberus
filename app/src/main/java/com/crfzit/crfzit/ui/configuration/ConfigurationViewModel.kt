@@ -9,26 +9,22 @@ import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 data class ConfigurationUiState(
     val isLoading: Boolean = true,
     val allApps: List<AppInfo> = emptyList(),
     val searchQuery: String = "",
-    val showSystemApps: Boolean = false
+    val showSystemApps: Boolean = false,
+    val safetyNet: Set<String> = emptySet() // 【新增】安全网列表
 )
 
-// 【核心修改】继承 AndroidViewModel 以获取 Context
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
-    // 【核心修改】获取 AppInfoRepository 单例
     private val appInfoRepository = AppInfoRepository.getInstance(application)
-    
-    // 【核心修改】引入 UDS Client 和 Gson
     private val udsClient = UdsClient(viewModelScope)
     private val gson = Gson()
 
@@ -36,27 +32,66 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     val uiState: StateFlow<ConfigurationUiState> = _uiState.asStateFlow()
 
     init {
-        // 【核心修改】启动 UDS 客户端
         udsClient.start()
-        loadApps()
+        observeDaemonResponses()
+        loadInitialData()
     }
 
-    private fun loadApps() {
+    private fun loadInitialData() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            // 强制刷新加载所有应用
+            // 1. 先加载本地安装的应用列表
             appInfoRepository.loadAllInstalledApps(forceRefresh = true)
-            _uiState.update {
-                it.copy(
-                    isLoading = false,
-                    // 从缓存中获取应用列表
-                    allApps = appInfoRepository.getCachedApps().values.sortedBy { app -> app.appName }
-                )
+            
+            // 2. 同时向daemon请求安全网和所有应用的策略配置
+            querySafetyNet()
+            queryAllPolicies()
+        }
+    }
+    
+    // 【新增】监听来自daemon的响应
+    private fun observeDaemonResponses() {
+        viewModelScope.launch {
+            udsClient.incomingMessages.filter { it.contains("\"type\":\"resp.") }.collect { jsonLine ->
+                try {
+                    val msg = gson.fromJson(jsonLine, Map::class.java)
+                    val payloadJson = gson.toJson(msg["payload"])
+                    
+                    when (msg["type"]) {
+                        "resp.safety_net" -> {
+                            val listType = object : TypeToken<Set<String>>() {}.type
+                            val safetyNetApps: Set<String> = gson.fromJson(payloadJson, listType)
+                            _uiState.update { it.copy(safetyNet = safetyNetApps) }
+                        }
+                        "resp.all_policies" -> {
+                            val listType = object : TypeToken<List<AppInfo>>() {}.type
+                            val policies: List<AppInfo> = gson.fromJson(payloadJson, listType)
+                            
+                            val localApps = appInfoRepository.getCachedApps()
+                            val mergedApps = localApps.values.map { localApp ->
+                                policies.find { it.packageName == localApp.packageName }
+                                    ?: localApp.copy(policy = Policy.EXEMPTED) // 默认豁免
+                            }.sortedBy { it.appName }
+
+                            _uiState.update { it.copy(allApps = mergedApps, isLoading = false) }
+                        }
+                    }
+                } catch (e: Exception) { /* ignore */ }
             }
         }
     }
+    
+    // 【新增】查询方法
+    private fun querySafetyNet() {
+        val request = mapOf("v" to 1, "type" to "query.get_safety_net", "req_id" to UUID.randomUUID().toString())
+        udsClient.sendMessage(gson.toJson(request))
+    }
 
-    // 【核心修改】发送指令到守护进程
+    private fun queryAllPolicies() {
+        val request = mapOf("v" to 1, "type" to "query.get_all_policies", "req_id" to UUID.randomUUID().toString())
+        udsClient.sendMessage(gson.toJson(request))
+    }
+
     private fun sendPolicyUpdate(appInfo: AppInfo) {
         val payload = mapOf(
             "package_name" to appInfo.packageName,
@@ -64,61 +99,31 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             "force_playback_exempt" to appInfo.forcePlaybackExemption,
             "force_network_exempt" to appInfo.forceNetworkExemption
         )
-        val message = mapOf(
-            "v" to 1,
-            "type" to "cmd.set_policy",
-            "payload" to payload
-        )
+        val message = mapOf("v" to 1, "type" to "cmd.set_policy", "payload" to payload)
         udsClient.sendMessage(gson.toJson(message))
     }
     
-    fun onSearchQueryChanged(query: String) {
-        _uiState.update { it.copy(searchQuery = query) }
-    }
-
-    fun onShowSystemAppsChanged(show: Boolean) {
-        _uiState.update { it.copy(showSystemApps = show) }
-    }
+    fun onSearchQueryChanged(query: String) { _uiState.update { it.copy(searchQuery = query) } }
+    fun onShowSystemAppsChanged(show: Boolean) { _uiState.update { it.copy(showSystemApps = show) } }
     
-    // 【核心修改】setPolicy 现在会发送消息
     fun setPolicy(packageName: String, policy: Policy) {
-        var updatedApp: AppInfo? = null
-        _uiState.update { currentState ->
-            val updatedApps = currentState.allApps.map { app ->
-                if (app.packageName == packageName) {
-                    app.copy(policy = policy).also { updatedApp = it }
-                } else {
-                    app
-                }
-            }
-            currentState.copy(allApps = updatedApps)
-        }
-        updatedApp?.let { sendPolicyUpdate(it) }
+        updateAppInfo(packageName) { it.copy(policy = policy) }
     }
 
-    // 【核心修改】setPlaybackExemption 现在会发送消息
     fun setPlaybackExemption(packageName: String, isExempt: Boolean) {
-        var updatedApp: AppInfo? = null
-        _uiState.update { currentState ->
-            val updatedApps = currentState.allApps.map { app ->
-                if (app.packageName == packageName) {
-                    app.copy(forcePlaybackExemption = isExempt).also { updatedApp = it }
-                } else {
-                    app
-                }
-            }
-            currentState.copy(allApps = updatedApps)
-        }
-        updatedApp?.let { sendPolicyUpdate(it) }
+        updateAppInfo(packageName) { it.copy(forcePlaybackExemption = isExempt) }
     }
 
-    // 【核心修改】setNetworkExemption 现在会发送消息
     fun setNetworkExemption(packageName: String, isExempt: Boolean) {
+        updateAppInfo(packageName) { it.copy(forceNetworkExemption = isExempt) }
+    }
+
+    private fun updateAppInfo(packageName: String, transform: (AppInfo) -> AppInfo) {
         var updatedApp: AppInfo? = null
         _uiState.update { currentState ->
             val updatedApps = currentState.allApps.map { app ->
                 if (app.packageName == packageName) {
-                    app.copy(forceNetworkExemption = isExempt).also { updatedApp = it }
+                    transform(app).also { updatedApp = it }
                 } else {
                     app
                 }

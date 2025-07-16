@@ -29,46 +29,86 @@ const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
 std::unique_ptr<ProcessMonitor> g_proc_monitor;
+std::shared_ptr<DatabaseManager> g_db_manager;
 std::atomic<bool> g_is_running = true;
 
-// 【核心修改】实现指令处理
-void handle_ui_message(const std::string& message_str) {
-    LOGI("Received UI message: %s", message_str.c_str());
+void handle_incoming_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        if (type == "cmd.set_policy") {
-            const auto& payload = msg["payload"];
-            std::string package_name = payload.value("package_name", "");
-            int policy_int = payload.value("policy", 2); // 默认为 STANDARD
+        if (type.rfind("event.", 0) == 0) {
+            if (g_state_manager) g_state_manager->handle_probe_event(msg);
 
-            if (!package_name.empty()) {
+        } else if (type.rfind("cmd.", 0) == 0) {
+            const auto& payload = msg["payload"];
+            if (type == "cmd.set_policy") {
                 AppConfig new_config;
-                new_config.package_name = package_name;
-                new_config.policy = static_cast<AppPolicy>(policy_int);
-                // TODO: 从 payload 中读取豁免开关
+                new_config.package_name = payload.value("package_name", "");
+                new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
                 new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
                 new_config.force_network_exempt = payload.value("force_network_exempt", false);
-
-                if (g_state_manager) {
-                    LOGI("Processing set_policy for %s to policy %d", package_name.c_str(), policy_int);
-                    g_state_manager->update_app_config_from_ui(new_config);
-                }
+                if (g_state_manager) g_state_manager->update_app_config_from_ui(new_config);
             }
+
         } else if (type.rfind("query.", 0) == 0) {
-            LOGI("Handling query: %s (not implemented yet)", type.c_str());
+            json response_payload;
+            std::string response_type;
+
+            if (type == "query.get_all_policies") {
+                response_type = "resp.all_policies";
+                auto configs = g_db_manager->get_all_app_configs();
+                json configs_json = json::array();
+                for (const auto& cfg : configs) {
+                    configs_json.push_back({
+                        {"package_name", cfg.package_name},
+                        {"policy", static_cast<int>(cfg.policy)},
+                        {"force_playback_exempt", cfg.force_playback_exempt},
+                        {"force_network_exempt", cfg.force_network_exempt},
+                    });
+                }
+                response_payload["policies"] = configs_json;
+            } else if (type == "query.get_safety_net") {
+                response_type = "resp.safety_net";
+                response_payload["packages"] = g_state_manager->get_safety_net_list();
+            } else if (type == "query.get_logs") {
+                response_type = "resp.logs";
+                int limit = msg["payload"].value("limit", 50);
+                int offset = msg["payload"].value("offset", 0);
+                auto logs = g_db_manager->get_logs(limit, offset);
+                json logs_json = json::array();
+                for (const auto& log : logs) {
+                    logs_json.push_back({
+                        {"timestamp", log.timestamp},
+                        {"level", static_cast<int>(log.level)},
+                        {"message", log.message},
+                        {"app_name", log.app_name},
+                    });
+                }
+                response_payload["logs"] = logs_json;
+            }
+            
+            if (!response_type.empty()) {
+                json response_msg = {
+                    {"v", 1},
+                    {"type", response_type},
+                    {"req_id", msg.value("req_id", "")},
+                    {"payload", response_payload}
+                };
+                g_server->send_message_to_client(client_fd, response_msg.dump());
+            }
         }
 
     } catch (const json::parse_error& e) {
-        LOGW("JSON parse error from UI: %s", e.what());
+        LOGW("JSON parse error: %s for message: %s", e.what(), message_str.c_str());
     } catch (const std::exception& e) {
-        LOGE("Error handling UI message: %s", e.what());
+        LOGE("Error handling message: %s", e.what());
     }
 }
 
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
+    if(g_db_manager) g_db_manager->log_event(LogLevel::EVENT, "Cerberus daemon shutting down.");
     g_is_running = false;
     if (g_proc_monitor) g_proc_monitor->stop();
     if (g_server) g_server->stop();
@@ -80,18 +120,19 @@ void worker_thread() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!g_is_running) break;
 
-        if(g_state_manager) g_state_manager->tick();
+        if (g_state_manager) g_state_manager->tick();
 
         if (g_server && g_server->has_clients()) {
-            if(g_state_manager) g_state_manager->update_all_resource_stats();
-            
-            json payload = g_state_manager->get_dashboard_payload();
-            json message = {
-                {"v", 1},
-                {"type", "stream.dashboard_update"},
-                {"payload", payload}
-            };
-            g_server->broadcast_message(message.dump());
+            if (g_state_manager) {
+                g_state_manager->update_all_resource_stats();
+                json payload = g_state_manager->get_dashboard_payload();
+                json message = {
+                    {"v", 1},
+                    {"type", "stream.dashboard_update"},
+                    {"payload", payload}
+                };
+                g_server->broadcast_message(message.dump());
+            }
         }
     }
     LOGI("Worker thread finished.");
@@ -101,7 +142,7 @@ int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v2.0 (Event-Driven) starting...");
+    LOGI("Cerberus Daemon v1.1.1 starting...");
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -113,10 +154,10 @@ int main() {
         return 1;
     }
 
-    auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
+    g_db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto sys_monitor = std::make_shared<SystemMonitor>();
     auto action_executor = std::make_shared<ActionExecutor>();
-    g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor);
+    g_state_manager = std::make_shared<StateManager>(g_db_manager, sys_monitor, action_executor);
     
     g_proc_monitor = std::make_unique<ProcessMonitor>();
     g_proc_monitor->start([&](ProcessEventType type, int pid, int ppid) {
@@ -128,7 +169,7 @@ int main() {
     std::thread worker(worker_thread);
 
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
-    g_server->set_message_handler(handle_ui_message);
+    g_server->set_message_handler(handle_incoming_message);
     g_server->run(); 
 
     LOGI("UDS server event loop has finished. Cleaning up...");
