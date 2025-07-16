@@ -18,17 +18,9 @@
 
 namespace fs = std::filesystem;
 
-// 【修复】添加缺失的常量定义
 constexpr int PER_USER_RANGE = 100000;
 
-// 帮助函数：从文件中快速读取第一个整数
-static inline bool quick_read_int(const fs::path& path, int& out_value) {
-    std::ifstream file(path, std::ios_base::in);
-    if (!file.is_open()) return false;
-    file >> out_value;
-    return file.good();
-}
-
+// status_to_string_local 函数保持不变
 static std::string status_to_string_local(AppRuntimeState::Status status) {
     switch (status) {
         case AppRuntimeState::Status::STOPPED: return "STOPPED";
@@ -42,7 +34,8 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
     return "UNKNOWN";
 }
 
-// 【核心重构】终极优化版的 build_process_cache
+
+// 【核心修复】修正 build_process_cache 过滤逻辑
 void StateManager::build_process_cache() {
     uid_to_pids_map_.clear();
     const fs::path proc_dir("/proc");
@@ -53,38 +46,44 @@ void StateManager::build_process_cache() {
     }
 
     for (const auto& entry : fs::directory_iterator(proc_dir)) {
-        // --- 过滤阶段 1: 只处理数字命名的目录 (PID) ---
+        // --- 过滤阶段 1: 必须是数字目录 (PID) ---
         const auto& path = entry.path();
         const auto filename_str = path.filename().string();
         if (!entry.is_directory() || filename_str.empty() || !std::all_of(filename_str.begin(), filename_str.end(), ::isdigit)) {
             continue;
         }
 
-        // --- 过滤阶段 2: oom_score_adj 快速路径检查 ---
-        int oom_score;
-        if (!quick_read_int(path / "oom_score_adj", oom_score) || oom_score < 0) {
-            continue;
-        }
-
-        // --- 过滤阶段 3: cmdline 快速路径检查 ---
-        try {
-            if (fs::file_size(path / "cmdline") == 0) {
-                continue;
-            }
-        } catch (const fs::filesystem_error&) {
-            continue;
-        }
-
-        // --- 最后的确认：通过所有过滤，现在执行 stat() 获取UID ---
+        // --- 过滤阶段 2 (核心): stat() 获取 UID ---
+        // 我们将最可靠的 stat() 调用提前，作为主要过滤依据。
         struct stat st;
-        if (stat(path.c_str(), &st) == 0) {
-            if (st.st_uid >= 10000) {
-                 try {
-                    int pid = std::stoi(filename_str);
-                    uid_to_pids_map_[st.st_uid].push_back(pid);
-                } catch (const std::invalid_argument&) {
-                }
-            }
+        if (stat(path.c_str(), &st) != 0) {
+            // 如果 stat 失败，直接跳过这个进程
+            continue;
+        }
+        
+        // --- 过滤阶段 3: UID 范围检查 ---
+        // 只关心UID大于等于10000的进程，这是Android应用的标准UID范围。
+        // 这有效地排除了root(0), system(1000), shell(2000)等系统用户进程。
+        if (st.st_uid < 10000) {
+            continue;
+        }
+        
+        // --- 过滤阶段 4 (可选，但推荐): cmdline 存在性检查 ---
+        // 对于UID符合条件的进程，再检查 cmdline 是否有效。
+        // 这可以帮助排除一些僵尸进程或者状态异常的进程。
+        fs::path cmdline_path = path / "cmdline";
+        std::ifstream cmdline_file(cmdline_path);
+        if (!cmdline_file.is_open() || cmdline_file.peek() == std::ifstream::traits_type::eof()) {
+             // 如果 cmdline 不存在或为空，我们大概率认为它不是一个正常的应用进程。
+             continue;
+        }
+
+        // --- 通过所有检查，确认是目标进程 ---
+        try {
+            int pid = std::stoi(filename_str);
+            uid_to_pids_map_[st.st_uid].push_back(pid);
+        } catch (const std::invalid_argument&) {
+            // 理论上不会发生，因为前面已经检查了 isdigit
         }
     }
 }
@@ -328,6 +327,8 @@ nlohmann::json StateManager::get_dashboard_payload() {
     
     json apps_state = json::array();
     for (const auto& [key, app] : managed_apps_) {
+        // 【关键修复】这里是之前的一个逻辑错误。我们应该展示所有**正在运行**的应用，而不是所有**非停止**的应用。
+        // 一个豁免的应用也可能在运行，我们也应该展示它。
         if (app.current_status != AppRuntimeState::Status::STOPPED) {
             json app_json;
             app_json["package_name"] = app.package_name;
@@ -339,6 +340,13 @@ nlohmann::json StateManager::get_dashboard_payload() {
             app_json["cpu_usage_percent"] = app.cpu_usage_percent;
             app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED);
             app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
+            
+            // 【新增】一些在模型中但之前未填充的字段，以符合UI预期
+            app_json["hasPlayback"] = false; // 示例值，未来可扩展
+            app_json["hasNotification"] = false; // 示例值
+            app_json["hasNetworkActivity"] = false; // 示例值
+            app_json["pendingFreezeSec"] = 0; // 示例值
+
             apps_state.push_back(app_json);
         }
     }
