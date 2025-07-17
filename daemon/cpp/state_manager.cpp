@@ -948,23 +948,6 @@ void StateManager::remove_pid_from_app(int pid) {
     }
 }
 
-void StateManager::process_event_handler(ProcessEventType type, int pid, int ppid) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    if (type == ProcessEventType::EXIT) {
-        remove_pid_from_app(pid);
-    } else if (type == ProcessEventType::FORK) {
-        AppRuntimeState* parent_app = find_app_by_pid(ppid);
-        if (parent_app) {
-             int uid = -1, user_id = -1;
-             std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
-             if(!pkg_name.empty() && pkg_name == parent_app->package_name){
-                add_pid_to_app(pid, parent_app->package_name, parent_app->user_id, parent_app->uid);
-             }
-        }
-    }
-}
-
 void StateManager::initial_scan() {
     LOGI("Performing initial process scan...");
     for (const auto& entry : fs::directory_iterator("/proc")) {
