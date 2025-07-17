@@ -5,6 +5,8 @@
 
 #define LOG_TAG "cerberusd_db"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+// 【编译修复】补充 LOGW 的宏定义
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 DatabaseManager::DatabaseManager(const std::string& db_path)
@@ -18,7 +20,7 @@ void DatabaseManager::initialize_database() {
     try {
         db_.exec("PRAGMA journal_mode=WAL;");
 
-        // 【修复】创建 app_policies 表，如果已存在则会静默失败，这没关系
+        // 使用 CREATE TABLE IF NOT EXISTS 来创建表
         db_.exec(R"(
             CREATE TABLE IF NOT EXISTS app_policies (
                 package_name TEXT PRIMARY KEY,
@@ -29,7 +31,7 @@ void DatabaseManager::initialize_database() {
             )
         )");
 
-        // 【修复】为旧版本数据库添加新列。如果失败（例如列已存在），则捕获异常并忽略
+        // 为旧版本数据库添加新列。如果失败（例如列已存在），则捕获异常并忽略
         try {
             db_.exec("ALTER TABLE app_policies ADD COLUMN cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0;");
             LOGI("Successfully added 'cumulative_runtime_seconds' to 'app_policies' table for upgrade.");
@@ -149,7 +151,6 @@ bool DatabaseManager::update_app_runtime(const std::string& package_name, long l
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
         SQLite::Statement query(db_, "UPDATE app_policies SET cumulative_runtime_seconds = cumulative_runtime_seconds + ? WHERE package_name = ?");
-        // 【编译修复】显式将 long long 转换为 int64_t 来消除歧义
         query.bind(1, static_cast<int64_t>(session_seconds));
         query.bind(2, package_name);
         query.exec();
