@@ -3,84 +3,40 @@
 #include <android/log.h>
 #include <sys/stat.h>
 #include <fstream>
-#include <filesystem>
 #include <unistd.h>
 #include <csignal>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem> // [修复] 添加 <filesystem> 头文件
 
 #define LOG_TAG "cerberusd_action"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-bool ActionExecutor::freeze_pids(const std::vector<int>& pids, FreezerType type) {
-    if (pids.empty()) return true;
+// [修复] 声明命名空间 fs
+namespace fs = std::filesystem;
 
-    FreezerType final_type = type;
-    if (type == FreezerType::AUTO) {
-        final_type = get_auto_detected_freezer_type();
+// ======================================================================
+// 唯一的、正确的函数实现区域
+// ======================================================================
+
+ActionExecutor::ActionExecutor() {
+    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
+        cgroup_version_ = CgroupVersion::V2;
+        LOGI("Detected cgroup v2.");
+        frozen_cgroup_path_ = "/sys/fs/cgroup/cerberus_frozen";
+    } else if (fs::exists("/sys/fs/cgroup/freezer")) {
+        cgroup_version_ = CgroupVersion::V1;
+        LOGI("Detected cgroup v1.");
+        frozen_cgroup_path_ = "/sys/fs/cgroup/freezer/cerberus_frozen";
+    } else {
+        cgroup_version_ = CgroupVersion::UNKNOWN;
+        LOGE("Could not determine cgroup version.");
+        return;
     }
-    
-    LOGI("Freezing %zu PIDs using method: %d", pids.size(), static_cast<int>(final_type));
-
-    if (final_type == FreezerType::CGROUP_V1 || final_type == FreezerType::CGROUP_V2) {
-        if (cgroup_version_ == CgroupVersion::UNKNOWN) {
-            LOGE("Cgroup freezer requested, but no cgroup support detected.");
-            return false;
-        }
-        if (!add_pids_to_frozen_cgroup(pids)) {
-            LOGE("Failed to move PIDs to frozen cgroup, aborting freeze.");
-            return false;
-        }
-        const std::string freeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "1" : "FROZEN";
-        return write_to_file(frozen_cgroup_state_path_, freeze_cmd);
-    // [修复] 更新枚举成员的引用
-    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
-        for (int pid : pids) {
-            if (kill(pid, SIGSTOP) != 0) {
-                LOGW("Failed to send SIGSTOP to PID %d: %s", pid, strerror(errno));
-            }
-        }
-        return true;
-    }
-
-    LOGE("Unknown freezer type requested: %d", static_cast<int>(type));
-    return false;
-}
-
-bool ActionExecutor::unfreeze_pids(const std::vector<int>& pids, FreezerType type) {
-    if (pids.empty()) return true;
-
-    FreezerType final_type = type;
-    if (type == FreezerType::AUTO) {
-        final_type = get_auto_detected_freezer_type();
-    }
-    
-    LOGI("Unfreezing PIDs using method: %d", static_cast<int>(final_type));
-
-    if (final_type == FreezerType::CGROUP_V1 || final_type == FreezerType::CGROUP_V2) {
-        if (cgroup_version_ == CgroupVersion::UNKNOWN) return false;
-        const std::string unfreeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "0" : "THAWED";
-        return write_to_file(frozen_cgroup_state_path_, unfreeze_cmd);
-    // [修复] 更新枚举成员的引用
-    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
-        for (int pid : pids) {
-            if (kill(pid, SIGCONT) != 0) {
-                 LOGW("Failed to send SIGCONT to PID %d: %s", pid, strerror(errno));
-            }
-        }
-        return true;
-    }
-
-    return false;
-}
-
-FreezerType ActionExecutor::get_auto_detected_freezer_type() const {
-    if (cgroup_version_ == CgroupVersion::V2) return FreezerType::CGROUP_V2;
-    if (cgroup_version_ == CgroupVersion::V1) return FreezerType::CGROUP_V1;
-    // [修复] 更新枚举成员的引用
-    return FreezerType::FREEZER_SIGSTOP;
+    create_frozen_cgroup_if_needed();
+    initialize_network_chains();
 }
 
 bool ActionExecutor::execute_shell_command(const std::string& command) {
@@ -98,7 +54,6 @@ void ActionExecutor::initialize_network_chains() {
     system("iptables -D OUTPUT -j cerberus_output > /dev/null 2>&1");
     system("iptables -F cerberus_output > /dev/null 2>&1");
     system("iptables -X cerberus_output > /dev/null 2>&1");
-
     execute_shell_command("iptables -N cerberus_output");
     execute_shell_command("iptables -I OUTPUT -j cerberus_output");
     execute_shell_command("iptables -A cerberus_output -j RETURN");
@@ -116,28 +71,9 @@ bool ActionExecutor::block_network(int uid) {
 
 bool ActionExecutor::unblock_network(int uid) {
     if (uid < 10000) return true;
-    std::string cmd = "iptables -D cerberus_output -m owner --uid-owner " + std::to_string(uid) + " -j DROP > /dev/null 2>&1";
+    std::string cmd = "iptables -D cerberus_output -m owner --uid-owner " + std::to_string(uid) + " -j DROP";
     system(cmd.c_str());
     return true;
-}
-
-ActionExecutor::ActionExecutor() {
-    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
-        cgroup_version_ = CgroupVersion::V2;
-        LOGI("Detected cgroup v2.");
-        frozen_cgroup_path_ = "/sys/fs/cgroup/cerberus_frozen";
-    } else if (fs::exists("/sys/fs/cgroup/freezer")) {
-        cgroup_version_ = CgroupVersion::V1;
-        LOGI("Detected cgroup v1.");
-        frozen_cgroup_path_ = "/sys/fs/cgroup/freezer/cerberus_frozen";
-    } else {
-        cgroup_version_ = CgroupVersion::UNKNOWN;
-        LOGE("Could not determine cgroup version.");
-    }
-    if(cgroup_version_ != CgroupVersion::UNKNOWN) {
-        create_frozen_cgroup_if_needed();
-    }
-    initialize_network_chains();
 }
 
 void ActionExecutor::create_frozen_cgroup_if_needed() {
@@ -220,7 +156,7 @@ bool ActionExecutor::freeze_pids(const std::vector<int>& pids, FreezerType type)
         }
         const std::string freeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "1" : "FROZEN";
         return write_to_file(frozen_cgroup_state_path_, freeze_cmd);
-    } else if (final_type == FreezerType::SIGSTOP) {
+    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
         for (int pid : pids) {
             if (kill(pid, SIGSTOP) != 0) {
                 LOGW("Failed to send SIGSTOP to PID %d: %s", pid, strerror(errno));
@@ -247,7 +183,7 @@ bool ActionExecutor::unfreeze_pids(const std::vector<int>& pids, FreezerType typ
         if (cgroup_version_ == CgroupVersion::UNKNOWN) return false;
         const std::string unfreeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "0" : "THAWED";
         return write_to_file(frozen_cgroup_state_path_, unfreeze_cmd);
-    } else if (final_type == FreezerType::SIGSTOP) {
+    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
         for (int pid : pids) {
             if (kill(pid, SIGCONT) != 0) {
                  LOGW("Failed to send SIGCONT to PID %d: %s", pid, strerror(errno));
@@ -262,5 +198,5 @@ bool ActionExecutor::unfreeze_pids(const std::vector<int>& pids, FreezerType typ
 FreezerType ActionExecutor::get_auto_detected_freezer_type() const {
     if (cgroup_version_ == CgroupVersion::V2) return FreezerType::CGROUP_V2;
     if (cgroup_version_ == CgroupVersion::V1) return FreezerType::CGROUP_V1;
-    return FreezerType::SIGSTOP; // Fallback
+    return FreezerType::FREEZER_SIGSTOP;
 }
