@@ -5,16 +5,18 @@
 #include <string>
 #include <vector>
 
-// Freezer 类型枚举
 enum class FreezerType {
-    AUTO, CGROUP_V2, CGROUP_V1, SIGSTOP
+    AUTO,
+    CGROUP_V2,
+    CGROUP_V1,
+    // [修复] 将 SIGSTOP 重命名为 FREEZER_SIGSTOP 以避免与系统宏冲突
+    FREEZER_SIGSTOP 
 };
 
 class ActionExecutor {
 public:
     ActionExecutor();
 
-    // 冻结/解冻方法现在接受 FreezerType
     bool freeze_pids(const std::vector<int>& pids, FreezerType type);
     bool unfreeze_pids(const std::vector<int>& pids, FreezerType type);
 
@@ -22,7 +24,6 @@ public:
     bool unblock_network(int uid);
     void initialize_network_chains();
 
-    // 获取自动检测到的 Cgroup 版本
     FreezerType get_auto_detected_freezer_type() const;
 
 private:

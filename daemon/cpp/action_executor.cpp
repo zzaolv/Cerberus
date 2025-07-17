@@ -14,7 +14,74 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-namespace fs = std::filesystem;
+bool ActionExecutor::freeze_pids(const std::vector<int>& pids, FreezerType type) {
+    if (pids.empty()) return true;
+
+    FreezerType final_type = type;
+    if (type == FreezerType::AUTO) {
+        final_type = get_auto_detected_freezer_type();
+    }
+    
+    LOGI("Freezing %zu PIDs using method: %d", pids.size(), static_cast<int>(final_type));
+
+    if (final_type == FreezerType::CGROUP_V1 || final_type == FreezerType::CGROUP_V2) {
+        if (cgroup_version_ == CgroupVersion::UNKNOWN) {
+            LOGE("Cgroup freezer requested, but no cgroup support detected.");
+            return false;
+        }
+        if (!add_pids_to_frozen_cgroup(pids)) {
+            LOGE("Failed to move PIDs to frozen cgroup, aborting freeze.");
+            return false;
+        }
+        const std::string freeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "1" : "FROZEN";
+        return write_to_file(frozen_cgroup_state_path_, freeze_cmd);
+    // [修复] 更新枚举成员的引用
+    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
+        for (int pid : pids) {
+            if (kill(pid, SIGSTOP) != 0) {
+                LOGW("Failed to send SIGSTOP to PID %d: %s", pid, strerror(errno));
+            }
+        }
+        return true;
+    }
+
+    LOGE("Unknown freezer type requested: %d", static_cast<int>(type));
+    return false;
+}
+
+bool ActionExecutor::unfreeze_pids(const std::vector<int>& pids, FreezerType type) {
+    if (pids.empty()) return true;
+
+    FreezerType final_type = type;
+    if (type == FreezerType::AUTO) {
+        final_type = get_auto_detected_freezer_type();
+    }
+    
+    LOGI("Unfreezing PIDs using method: %d", static_cast<int>(final_type));
+
+    if (final_type == FreezerType::CGROUP_V1 || final_type == FreezerType::CGROUP_V2) {
+        if (cgroup_version_ == CgroupVersion::UNKNOWN) return false;
+        const std::string unfreeze_cmd = (cgroup_version_ == CgroupVersion::V2) ? "0" : "THAWED";
+        return write_to_file(frozen_cgroup_state_path_, unfreeze_cmd);
+    // [修复] 更新枚举成员的引用
+    } else if (final_type == FreezerType::FREEZER_SIGSTOP) {
+        for (int pid : pids) {
+            if (kill(pid, SIGCONT) != 0) {
+                 LOGW("Failed to send SIGCONT to PID %d: %s", pid, strerror(errno));
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+FreezerType ActionExecutor::get_auto_detected_freezer_type() const {
+    if (cgroup_version_ == CgroupVersion::V2) return FreezerType::CGROUP_V2;
+    if (cgroup_version_ == CgroupVersion::V1) return FreezerType::CGROUP_V1;
+    // [修复] 更新枚举成员的引用
+    return FreezerType::FREEZER_SIGSTOP;
+}
 
 bool ActionExecutor::execute_shell_command(const std::string& command) {
     int ret = system(command.c_str());
