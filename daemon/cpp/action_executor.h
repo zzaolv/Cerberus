@@ -5,17 +5,25 @@
 #include <string>
 #include <vector>
 
+// Freezer 类型枚举
+enum class FreezerType {
+    AUTO, CGROUP_V2, CGROUP_V1, SIGSTOP
+};
+
 class ActionExecutor {
 public:
     ActionExecutor();
 
-    bool freeze_pids(const std::vector<int>& pids);
-    bool unfreeze_pids(const std::vector<int>& pids);
+    // 冻结/解冻方法现在接受 FreezerType
+    bool freeze_pids(const std::vector<int>& pids, FreezerType type);
+    bool unfreeze_pids(const std::vector<int>& pids, FreezerType type);
 
-    // [新增] 网络控制接口
     bool block_network(int uid);
     bool unblock_network(int uid);
     void initialize_network_chains();
+
+    // 获取自动检测到的 Cgroup 版本
+    FreezerType get_auto_detected_freezer_type() const;
 
 private:
     enum class CgroupVersion { V1, V2, UNKNOWN };
@@ -25,8 +33,6 @@ private:
 
     bool write_to_file(const std::string& path, const std::string& value);
     bool write_pids_to_file(const std::string& path, const std::vector<int>& pids);
-    
-    // [新增] 执行shell命令的辅助函数
     bool execute_shell_command(const std::string& command);
 
     CgroupVersion cgroup_version_ = CgroupVersion::UNKNOWN;

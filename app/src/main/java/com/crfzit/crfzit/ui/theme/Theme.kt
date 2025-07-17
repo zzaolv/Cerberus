@@ -1,4 +1,4 @@
-// app/src/main/java/com/crfzit/crfzit/ui/theme
+// app/src/main/java/com/crfzit/crfzit/ui/theme/Theme.kt
 package com.crfzit.crfzit.ui.theme
 
 import android.app.Activity
@@ -47,14 +47,19 @@ fun CRFzitTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            // 【全面屏适配】将状态栏设置为透明，让Scaffold来控制颜色
+
+            // [修复] 使用最现代、标准的 Edge-to-Edge API
+            // 1. 让App内容可以绘制到系统栏后面
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+
+            // 2. 将系统栏背景设为透明
             window.statusBarColor = Color.Transparent.toArgb()
-            // 【全面屏适配】设置导航栏颜色为透明，并确保内容和导航栏图标颜色对比度
             window.navigationBarColor = Color.Transparent.toArgb()
-            // 设置状态栏图标颜色
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
-            // 设置导航栏图标颜色
-            WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = !darkTheme
+
+            // 3. 控制系统栏前景（图标、文字）颜色
+            val insetsController = WindowCompat.getInsetsController(window, view)
+            insetsController.isAppearanceLightStatusBars = !darkTheme
+            insetsController.isAppearanceLightNavigationBars = !darkTheme
         }
     }
 

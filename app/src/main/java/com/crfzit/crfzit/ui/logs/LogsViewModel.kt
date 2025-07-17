@@ -52,14 +52,21 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                         val logListType = object : TypeToken<List<Map<String, Any>>>() {}.type
                         val rawLogs: List<Map<String, Any>> = gson.fromJson(payloadJson, logListType)
 
-                        val newLogs = rawLogs.mapNotNull {
+                        val newLogs = rawLogs.mapNotNull { rawLogEntry ->
                             try {
-                                val timestampNum = it["timestamp"] as? Number
-                                val eventTypeNum = it["event_type"] as? Number
-                                val payloadMap = it["payload"] as? Map<String, Any>
+                                val timestampNum = rawLogEntry["timestamp"] as? Number
+                                val eventTypeNum = rawLogEntry["event_type"] as? Number
+
+                                // [修复] 使用安全的类型检查来避免 Unchecked cast 警告
+                                val payloadMap = if (rawLogEntry["payload"] is Map<*, *>) {
+                                    @Suppress("UNCHECKED_CAST")
+                                    rawLogEntry["payload"] as? Map<String, Any>
+                                } else {
+                                    null
+                                }
 
                                 if (timestampNum == null || eventTypeNum == null || payloadMap == null) {
-                                    Log.w("LogsViewModel", "Skipping log entry with null values: $it")
+                                    Log.w("LogsViewModel", "Skipping log entry with invalid types: $rawLogEntry")
                                     return@mapNotNull null
                                 }
 
@@ -69,7 +76,7 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                                     payload = payloadMap
                                 )
                             } catch (e: Exception) {
-                                Log.w("LogsViewModel", "Skipping malformed log entry: $it", e)
+                                Log.w("LogsViewModel", "Skipping malformed log entry: $rawLogEntry", e)
                                 null
                             }
                         }
@@ -81,14 +88,14 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                                 canLoadMore = newLogs.size >= logsPerPage
                             )
                         }
-                        
+
                         if (newLogs.isNotEmpty()) {
                             currentPage++
                         }
 
                     } catch (e: JsonSyntaxException) {
                         Log.e("LogsViewModel", "JSON parse error for logs response", e)
-                         _uiState.update { it.copy(isLoading = false) }
+                        _uiState.update { it.copy(isLoading = false) }
                     } catch (e: Exception) {
                         Log.e("LogsViewModel", "Error processing logs response", e)
                         _uiState.update { it.copy(isLoading = false) }
@@ -104,7 +111,7 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(isLoading = true) }
         requestLogsPage(currentPage)
     }
-    
+
     private fun requestLogsPage(page: Int) {
         val requestId = "logs-${UUID.randomUUID()}"
         val requestPayload = mapOf(
