@@ -37,7 +37,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        LOGI("Handling message of type: %s", type.c_str()); // 增加日志用于调试
+        LOGI("Handling message of type: %s", type.c_str());
 
         if (type.rfind("event.", 0) == 0) {
             if (g_state_manager) g_state_manager->handle_probe_event(msg);
@@ -47,10 +47,8 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             if (type == "cmd.set_policy") {
                 AppConfig new_config;
                 new_config.package_name = payload.value("package_name", "");
-                // 【健壮性修复】从int转换为enum
                 int policy_int = payload.value("policy", 2);
                 new_config.policy = (policy_int >= 0 && policy_int <= 3) ? static_cast<AppPolicy>(policy_int) : AppPolicy::STANDARD;
-                
                 new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
                 new_config.force_network_exempt = payload.value("force_network_exempt", false);
                 if (g_state_manager) g_state_manager->update_app_config_from_ui(new_config);
@@ -66,18 +64,16 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 json configs_json = json::array();
                 for (const auto& cfg : configs) {
                     configs_json.push_back({
-                        {"packageName", cfg.package_name}, // 修复驼峰命名以匹配 AppInfo
-                        {"appName", ""}, // appName 由客户端填充
+                        {"packageName", cfg.package_name},
+                        {"appName", ""},
                         {"policy", cfg.policy},
                         {"forcePlaybackExemption", cfg.force_playback_exempt},
                         {"forceNetworkExemption", cfg.force_network_exempt}
                     });
                 }
-                // 【核心修复】直接将数组赋值给 payload
-                response_payload = configs_json; 
+                response_payload = configs_json;
             } else if (type == "query.get_safety_net") {
                 response_type = "resp.safety_net";
-                // 【核心修复】直接将数组赋值给 payload
                 response_payload = g_state_manager->get_safety_net_list();
             } else if (type == "query.get_logs") {
                 response_type = "resp.logs";
@@ -88,12 +84,10 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 for (const auto& log : logs) {
                     logs_json.push_back({
                         {"timestamp", log.timestamp},
-                        {"level", static_cast<int>(log.level)},
-                        {"message", log.message},
-                        {"appName", log.app_name}, // 修复驼峰命名以匹配 LogEntry
+                        {"event_type", static_cast<int>(log.event_type)},
+                        {"payload", log.payload} // 直接传递JSON payload
                     });
                 }
-                // 【核心修复】直接将数组赋值给 payload
                 response_payload = logs_json;
             }
             
@@ -104,7 +98,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     {"req_id", msg.value("req_id", "")},
                     {"payload", response_payload}
                 };
-                LOGI("Sending response of type: %s", response_type.c_str()); // 增加日志用于调试
+                LOGI("Sending response of type: %s", response_type.c_str());
                 g_server->send_message_to_client(client_fd, response_msg.dump());
             }
         }
@@ -118,7 +112,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
 
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
-    if(g_db_manager) g_db_manager->log_event(LogLevel::EVENT, "Cerberus daemon shutting down.");
+    if(g_db_manager) g_db_manager->log_event(LogEventType::DAEMON_SHUTDOWN, {{"message", "Cerberus daemon shutting down."}});
     g_is_running = false;
     if (g_proc_monitor) g_proc_monitor->stop();
     if (g_server) g_server->stop();

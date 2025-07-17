@@ -2,13 +2,15 @@
 package com.crfzit.crfzit.ui.logs
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.CerberusApplication
 import com.crfzit.crfzit.data.model.LogEntry
-import com.crfzit.crfzit.data.model.LogLevel
+import com.crfzit.crfzit.data.model.LogEventType
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
+import com.google.gson.JsonSyntaxException
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -34,55 +36,80 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         observeLogResponses()
-        loadMoreLogs()
+        requestLogsPage(0)
     }
 
     private fun observeLogResponses() {
         viewModelScope.launch {
-            udsClient.incomingMessages.filter { it.contains("resp.logs") }.collect { jsonLine ->
-                try {
-                    val msgType = object : TypeToken<Map<String, Any>>() {}.type
-                    val msg: Map<String, Any> = gson.fromJson(jsonLine, msgType)
+            udsClient.incomingMessages
+                .filter { it.contains("\"type\":\"resp.logs\"") }
+                .collect { jsonLine ->
+                    try {
+                        val msgType = object : TypeToken<Map<String, Any>>() {}.type
+                        val msg: Map<String, Any> = gson.fromJson(jsonLine, msgType)
 
-                    val payloadJson = gson.toJson(msg["payload"])
-                    val logListType = object : TypeToken<List<Map<String, Any>>>() {}.type
-                    val rawLogs: List<Map<String, Any>> = gson.fromJson(payloadJson, logListType)
+                        val payloadJson = gson.toJson(msg["payload"])
+                        val logListType = object : TypeToken<List<Map<String, Any>>>() {}.type
+                        val rawLogs: List<Map<String, Any>> = gson.fromJson(payloadJson, logListType)
 
-                    val newLogs = rawLogs.mapNotNull {
-                        try {
-                            LogEntry(
-                                timestamp = (it["timestamp"] as Double).toLong(),
-                                level = LogLevel.entries.getOrElse((it["level"] as Double).toInt()) { LogLevel.INFO },
-                                message = it["message"] as String,
-                                appName = it["app_name"] as? String
-                            )
-                        } catch (e: Exception) {
-                            null // Skip malformed log entries
+                        val newLogs = rawLogs.mapNotNull {
+                            try {
+                                val timestampNum = it["timestamp"] as? Number
+                                val eventTypeNum = it["event_type"] as? Number
+                                val payloadMap = it["payload"] as? Map<String, Any>
+
+                                if (timestampNum == null || eventTypeNum == null || payloadMap == null) {
+                                    Log.w("LogsViewModel", "Skipping log entry with null values: $it")
+                                    return@mapNotNull null
+                                }
+
+                                LogEntry(
+                                    timestamp = timestampNum.toLong(),
+                                    eventType = LogEventType.entries.getOrElse(eventTypeNum.toInt()) { LogEventType.UNKNOWN },
+                                    payload = payloadMap
+                                )
+                            } catch (e: Exception) {
+                                Log.w("LogsViewModel", "Skipping malformed log entry: $it", e)
+                                null
+                            }
                         }
-                    }
 
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            logs = it.logs + newLogs,
-                            canLoadMore = newLogs.size >= logsPerPage
-                        )
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                logs = (it.logs + newLogs).distinctBy { log -> log.timestamp.toString() + log.payload.toString() },
+                                canLoadMore = newLogs.size >= logsPerPage
+                            )
+                        }
+                        
+                        if (newLogs.isNotEmpty()) {
+                            currentPage++
+                        }
+
+                    } catch (e: JsonSyntaxException) {
+                        Log.e("LogsViewModel", "JSON parse error for logs response", e)
+                         _uiState.update { it.copy(isLoading = false) }
+                    } catch (e: Exception) {
+                        Log.e("LogsViewModel", "Error processing logs response", e)
+                        _uiState.update { it.copy(isLoading = false) }
                     }
-                } catch (e: Exception) {
-                    // ignore parse errors
                 }
-            }
         }
     }
 
     fun loadMoreLogs() {
-        if (uiState.value.isLoading || !uiState.value.canLoadMore) return
-
+        if (uiState.value.isLoading || !uiState.value.canLoadMore) {
+            return
+        }
         _uiState.update { it.copy(isLoading = true) }
+        requestLogsPage(currentPage)
+    }
+    
+    private fun requestLogsPage(page: Int) {
         val requestId = "logs-${UUID.randomUUID()}"
         val requestPayload = mapOf(
             "limit" to logsPerPage,
-            "offset" to currentPage * logsPerPage
+            "offset" to page * logsPerPage
         )
         val request = mapOf(
             "v" to 1,
@@ -91,12 +118,6 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
             "payload" to requestPayload
         )
         udsClient.sendMessage(gson.toJson(request))
-        currentPage++
+        Log.i("LogsViewModel", "Requested logs page $page")
     }
-
-    // 【核心修复】移除 onCleared 方法
-    // override fun onCleared() {
-    //     super.onCleared()
-    //     udsClient.stop() // <-- This was the error
-    // }
 }

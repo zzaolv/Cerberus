@@ -6,6 +6,7 @@
 #include <vector>
 #include <optional>
 #include <mutex>
+#include <nlohmann/json.hpp> // 新增JSON库依赖
 #include <SQLiteCpp/Database.h>
 #include <SQLiteCpp/Statement.h>
 #include <SQLiteCpp/Transaction.h>
@@ -19,15 +20,35 @@ struct AppConfig {
     AppPolicy policy = AppPolicy::STANDARD;
     bool force_playback_exempt = false;
     bool force_network_exempt = false;
+    long long cumulative_runtime_seconds = 0; // 【新增】累计运行时长（秒）
 };
 
-enum class LogLevel { INFO, SUCCESS, WARNING, ERROR, EVENT };
+// 【重构】定义结构化日志事件类型
+enum class LogEventType {
+    // 通用事件
+    GENERIC_INFO,
+    GENERIC_SUCCESS,
+    GENERIC_WARNING,
+    GENERIC_ERROR,
+    // 系统事件
+    DAEMON_START,
+    DAEMON_SHUTDOWN,
+    SCREEN_ON,
+    SCREEN_OFF,
+    // 应用生命周期事件
+    APP_START,
+    APP_STOP,
+    APP_FOREGROUND,
+    APP_BACKGROUND,
+    APP_FROZEN,
+    APP_UNFROZEN
+};
 
+// 【重构】LogEntry现在包含一个事件类型和一个JSON payload
 struct LogEntry {
     long long timestamp;
-    LogLevel level;
-    std::string message;
-    std::string app_name;
+    LogEventType event_type;
+    nlohmann::json payload;
 };
 
 class DatabaseManager {
@@ -36,9 +57,11 @@ public:
 
     std::optional<AppConfig> get_app_config(const std::string& package_name);
     bool set_app_config(const AppConfig& config);
+    bool update_app_runtime(const std::string& package_name, long long session_seconds); // 【新增】更新累计时长
     std::vector<AppConfig> get_all_app_configs();
 
-    bool log_event(LogLevel level, const std::string& message, const std::string& app_name = "");
+    // 【重构】日志记录函数现在接受结构化数据
+    bool log_event(LogEventType type, const nlohmann::json& payload);
     std::vector<LogEntry> get_logs(int limit, int offset);
 
 private:

@@ -26,19 +26,30 @@ data class AppInfo(
 
 //--- 日志页模型 ---
 
-// 日志级别
-enum class LogLevel {
-    INFO, // 信息
-    SUCCESS, // 成功
-    WARNING, // 警告
-    ERROR, // 错误
-    EVENT // 事件
+// 【重构】日志事件类型，与C++后端保持一致
+enum class LogEventType {
+    GENERIC_INFO,
+    GENERIC_SUCCESS,
+    GENERIC_WARNING,
+    GENERIC_ERROR,
+    DAEMON_START,
+    DAEMON_SHUTDOWN,
+    SCREEN_ON,
+    SCREEN_OFF,
+    APP_START,
+    APP_STOP,
+    APP_FOREGROUND,
+    APP_BACKGROUND,
+    APP_FROZEN,
+    APP_UNFROZEN,
+    // 对于无法识别的类型
+    UNKNOWN
 }
 
-// 单条日志条目
+
+// 【重构】新的日志条目数据类
 data class LogEntry(
     val timestamp: Long,
-    val level: LogLevel,
-    val message: String,
-    val appName: String? = null
+    val eventType: LogEventType,
+    val payload: Map<String, Any> // 使用Map来接收灵活的JSON payload
 )

@@ -30,6 +30,9 @@ struct AppRuntimeState {
     } current_status = Status::STOPPED;
 
     std::chrono::steady_clock::time_point last_state_change_time;
+    // 【新增】会话开始时间点
+    std::chrono::steady_clock::time_point active_session_start_time;
+    
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;

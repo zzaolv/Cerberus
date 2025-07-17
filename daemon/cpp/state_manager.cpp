@@ -15,6 +15,8 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
+
 constexpr int PER_USER_RANGE = 100000;
 constexpr long long NETWORK_ACTIVITY_THRESHOLD_BPS = 2 * 1024; // 2 KB/s
 
@@ -379,7 +381,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     
     refresh_app_list_from_db();
     initial_scan();
-    db_manager_->log_event(LogLevel::EVENT, "Cerberus daemon started");
+    db_manager_->log_event(LogEventType::DAEMON_START, {{"message", "Cerberus daemon started"}});
     LOGI("StateManager Initialized.");
 }
 
@@ -411,11 +413,7 @@ void StateManager::tick() {
             } else if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
                  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
                 if (elapsed > 5) { 
-                    if (action_executor_->freeze_pids(app.pids)) {
-                        transition_state(app, AppRuntimeState::Status::FROZEN, "Awaiting period ended");
-                    } else {
-                        transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "Freeze failed");
-                    }
+                    transition_state(app, AppRuntimeState::Status::FROZEN, "Awaiting period ended");
                 }
             }
         }
@@ -430,17 +428,18 @@ void StateManager::handle_probe_event(const nlohmann::json& event) {
         
         if (type == "event.screen_on") {
             is_screen_on_ = true;
-            db_manager_->log_event(LogLevel::EVENT, "Screen ON");
+            db_manager_->log_event(LogEventType::SCREEN_ON, {});
             for(auto& [key, a] : managed_apps_) {
                 if(a.current_status == AppRuntimeState::Status::FROZEN) {
-                    action_executor_->unfreeze_pids(a.pids);
-                    transition_state(a, AppRuntimeState::Status::BACKGROUND_IDLE, "Screen ON unfreeze");
+                    if (action_executor_->unfreeze_pids(a.pids)) {
+                        transition_state(a, AppRuntimeState::Status::BACKGROUND_IDLE, "Screen ON unfreeze");
+                    }
                 }
             }
             return;
         } else if (type == "event.screen_off") {
             is_screen_on_ = false;
-            db_manager_->log_event(LogLevel::EVENT, "Screen OFF");
+            db_manager_->log_event(LogEventType::SCREEN_OFF, {});
             return;
         }
 
@@ -454,8 +453,9 @@ void StateManager::handle_probe_event(const nlohmann::json& event) {
         if (type == "event.notification_post") {
             app->has_notification = true;
             if (app->current_status == AppRuntimeState::Status::FROZEN) {
-                action_executor_->unfreeze_pids(app->pids);
-                transition_state(*app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "Notification received");
+                 if (action_executor_->unfreeze_pids(app->pids)) {
+                    transition_state(*app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "Notification received");
+                }
             }
         }
 
@@ -480,8 +480,9 @@ void StateManager::check_system_events() {
             if (delta_bytes > NETWORK_ACTIVITY_THRESHOLD_BPS) {
                 app.has_network_activity = true;
                 if(app.current_status == AppRuntimeState::Status::FROZEN) {
-                    action_executor_->unfreeze_pids(app.pids);
-                    transition_state(app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "High network activity");
+                    if (action_executor_->unfreeze_pids(app.pids)) {
+                        transition_state(app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "High network activity");
+                    }
                 } else if(app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE || app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
                     transition_state(app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "High network activity");
                 }
@@ -497,16 +498,83 @@ void StateManager::check_system_events() {
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) {
     if (app.current_status == new_status) return;
     
-    std::string old_status_str = status_to_string_local(app.current_status);
+    auto old_status = app.current_status;
+    std::string old_status_str = status_to_string_local(old_status);
     std::string new_status_str = status_to_string_local(new_status);
+    auto now = std::chrono::steady_clock::now();
 
-    std::string log_msg = "State: " + old_status_str + " -> " + new_status_str + " (Reason: " + reason + ")";
-    db_manager_->log_event(LogLevel::INFO, log_msg, app.app_name);
-
-    LOGI("State transition for %s (user %d): %s", app.package_name.c_str(), app.user_id, log_msg.c_str());
+    json log_payload = {
+        {"package_name", app.package_name},
+        {"app_name", app.app_name},
+        {"user_id", app.user_id},
+        {"reason", reason}
+    };
     
+    LogEventType event_type = LogEventType::GENERIC_INFO;
+
+    bool is_session_active = (old_status == AppRuntimeState::Status::FOREGROUND || old_status == AppRuntimeState::Status::BACKGROUND_ACTIVE || old_status == AppRuntimeState::Status::BACKGROUND_IDLE);
+
+    if (new_status == AppRuntimeState::Status::FROZEN || new_status == AppRuntimeState::Status::STOPPED) {
+        if (is_session_active) {
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - app.active_session_start_time).count();
+            if (duration > 0) {
+                db_manager_->update_app_runtime(app.package_name, duration);
+                auto updated_config = db_manager_->get_app_config(app.package_name);
+                if(updated_config) app.config = *updated_config;
+                log_payload["session_duration_s"] = duration;
+                log_payload["cumulative_duration_s"] = app.config.cumulative_runtime_seconds;
+            }
+        }
+    }
+    
+    if (new_status == AppRuntimeState::Status::FOREGROUND || new_status == AppRuntimeState::Status::BACKGROUND_ACTIVE) {
+        if (!is_session_active) {
+            app.active_session_start_time = now;
+        }
+    }
+
+    switch(new_status) {
+        case AppRuntimeState::Status::FOREGROUND: event_type = LogEventType::APP_FOREGROUND; break;
+        case AppRuntimeState::Status::BACKGROUND_IDLE: event_type = LogEventType::APP_BACKGROUND; break;
+        case AppRuntimeState::Status::FROZEN:
+            event_type = LogEventType::APP_FROZEN;
+            log_payload["pid_count"] = app.pids.size();
+            break;
+        case AppRuntimeState::Status::STOPPED: event_type = LogEventType::APP_STOP; break;
+        case AppRuntimeState::Status::EXEMPTED:
+             if (old_status == AppRuntimeState::Status::FROZEN) {
+                action_executor_->unfreeze_pids(app.pids);
+                db_manager_->log_event(LogEventType::APP_UNFROZEN, {{"package_name", app.package_name}, {"app_name", app.app_name}, {"reason", "Policy change"}});
+            }
+            break;
+        default: break;
+    }
+
+    if (new_status == AppRuntimeState::Status::FROZEN) {
+        if (action_executor_->freeze_pids(app.pids)) {
+            db_manager_->log_event(event_type, log_payload);
+        } else {
+            LOGE("Freeze failed for %s, state transition aborted.", app.package_name.c_str());
+            db_manager_->log_event(LogEventType::GENERIC_ERROR, {{"message", "Freeze failed for " + app.package_name}});
+            return;
+        }
+    } else {
+        db_manager_->log_event(event_type, log_payload);
+    }
+    
+    if (old_status == AppRuntimeState::Status::FROZEN && new_status != AppRuntimeState::Status::FROZEN) {
+         if (action_executor_->unfreeze_pids(app.pids)) {
+             db_manager_->log_event(LogEventType::APP_UNFROZEN, {
+                {"package_name", app.package_name},
+                {"app_name", app.app_name},
+                {"reason", reason}
+            });
+         }
+    }
+
+    LOGI("State transition for %s (user %d): %s -> %s", app.package_name.c_str(), app.user_id, old_status_str.c_str(), new_status_str.c_str());
     app.current_status = new_status;
-    app.last_state_change_time = std::chrono::steady_clock::now();
+    app.last_state_change_time = now;
 }
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
@@ -529,20 +597,19 @@ void StateManager::update_app_config_from_ui(const AppConfig& new_config) {
 
     if (!db_manager_->set_app_config(new_config)) {
         LOGE("Failed to save app config to DB for %s", new_config.package_name.c_str());
-        db_manager_->log_event(LogLevel::ERROR, "Failed to set policy for " + new_config.package_name, new_config.package_name);
+        db_manager_->log_event(LogEventType::GENERIC_ERROR, {{"message", "Failed to set policy for " + new_config.package_name}});
     } else {
-        db_manager_->log_event(LogLevel::SUCCESS, "Policy set to " + std::to_string(static_cast<int>(new_config.policy)), new_config.package_name);
+        db_manager_->log_event(LogEventType::GENERIC_SUCCESS, {{"message", "Policy set for " + new_config.package_name}});
     }
 
     for (auto& [key, app] : managed_apps_) {
         if (key.first == new_config.package_name) {
-            app.config = new_config;
+            app.config.policy = new_config.policy;
+            app.config.force_network_exempt = new_config.force_network_exempt;
+            app.config.force_playback_exempt = new_config.force_playback_exempt;
             LOGI("Updated in-memory config for %s (user %d).", app.package_name.c_str(), app.user_id);
             
             if (app.config.policy == AppPolicy::EXEMPTED && app.current_status != AppRuntimeState::Status::EXEMPTED) {
-                if(app.current_status == AppRuntimeState::Status::FROZEN) {
-                    action_executor_->unfreeze_pids(app.pids);
-                }
                 transition_state(app, AppRuntimeState::Status::EXEMPTED, "Policy changed by user");
             } 
             else if (app.config.policy != AppPolicy::EXEMPTED && app.current_status == AppRuntimeState::Status::EXEMPTED) {
@@ -579,7 +646,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
 
 nlohmann::json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    using json = nlohmann::json;
     json payload;
     payload["global_stats"] = {
         {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent},
@@ -641,12 +707,13 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
         pid_to_app_map_[pid] = app;
 
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
-            std::string reason = "New process discovered";
-            if (app->config.policy == AppPolicy::EXEMPTED || is_critical_system_app(package_name)) {
+             db_manager_->log_event(LogEventType::APP_START, {{"package_name", app->package_name}, {"app_name", app->app_name}, {"pid", pid}});
+             std::string reason = "New process discovered";
+             if (app->config.policy == AppPolicy::EXEMPTED || is_critical_system_app(package_name)) {
                  transition_state(*app, AppRuntimeState::Status::EXEMPTED, reason);
-            } else {
+             } else {
                  transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, reason);
-            }
+             }
         }
     }
 }
@@ -663,9 +730,6 @@ void StateManager::remove_pid_from_app(int pid) {
     pids.erase(pid_it, pids.end());
 
     if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
-        if(app->current_status == AppRuntimeState::Status::FROZEN){
-            action_executor_->unfreeze_pids({}); 
-        }
         transition_state(*app, AppRuntimeState::Status::STOPPED, "All processes exited");
         app->mem_usage_kb = 0;
         app->swap_usage_kb = 0;
@@ -760,9 +824,6 @@ void StateManager::check_and_update_foreground_status() {
         bool is_foreground = (!fg_pkg.empty() && app.package_name == key.first && app.uid == fg_uid);
 
         if(is_foreground && app.current_status != AppRuntimeState::Status::FOREGROUND){
-             if(app.current_status == AppRuntimeState::Status::FROZEN){
-                action_executor_->unfreeze_pids(app.pids);
-             }
              transition_state(app, AppRuntimeState::Status::FOREGROUND, "App became foreground");
         } else if (!is_foreground && app.current_status == AppRuntimeState::Status::FOREGROUND) {
             transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "App moved to background");
