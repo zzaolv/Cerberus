@@ -4,7 +4,6 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
-#include "process_monitor.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
@@ -13,6 +12,7 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
+#include <unistd.h> // [修复] 添加此头文件以声明 getpid()
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -34,6 +34,7 @@ std::atomic<bool> g_is_running = true;
 
 std::atomic<bool> g_probe_connected = false;
 std::atomic<long long> g_last_probe_timestamp = 0;
+
 
 void handle_incoming_message(int client_fd, const std::string& message_str) {
     try {
@@ -60,21 +61,19 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             } else if (type == "cmd.set_settings") {
                 int freezer_int = payload.value("freezer_type", 0);
                 int unfreeze_interval = payload.value("unfreeze_interval", 0);
-                
                 if (g_state_manager) {
                     g_state_manager->set_freezer_type(static_cast<FreezerType>(freezer_int));
                     g_state_manager->set_periodic_unfreeze_interval(unfreeze_interval);
                 }
-
                 LOGI("Settings updated: FreezerType=%d, UnfreezeInterval=%dmin", freezer_int, unfreeze_interval);
-             } else if (type == "cmd.restart_daemon") {
+            } else if (type == "cmd.restart_daemon") {
                 LOGI("Restart command received. Shutting down...");
                 g_is_running = false;
                 if (g_server) g_server->stop();
-             } else if (type == "cmd.clear_stats") {
+            } else if (type == "cmd.clear_stats") {
                 if(g_db_manager) g_db_manager->clear_all_stats();
                 LOGI("All resource statistics have been cleared.");
-             }
+            }
 
         } else if (type.rfind("query.", 0) == 0) {
             json response_payload;
@@ -97,7 +96,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             } else if (type == "query.health_check") {
                 response_type = "resp.health_check";
                 long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                bool is_probe_alive = (now - g_last_probe_timestamp) < 30000;
+                bool is_probe_alive = g_probe_connected.load() && (now - g_last_probe_timestamp) < 30000;
                 response_payload = {
                     {"daemon_pid", getpid()},
                     {"is_probe_connected", is_probe_alive}
@@ -116,9 +115,6 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     });
                 }
                 response_payload = configs_json;
-            } else if (type == "query.get_safety_net") {
-                response_type = "resp.safety_net";
-                response_payload = g_state_manager->get_safety_net_list();
             } else if (type == "query.get_logs") {
                 response_type = "resp.logs";
                 int limit = msg["payload"].value("limit", 50);
@@ -168,7 +164,9 @@ void worker_thread() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!g_is_running) break;
 
-        if (g_state_manager) g_state_manager->tick();
+        if (g_state_manager) {
+            g_state_manager->tick();
+        }
 
         if (g_server && g_server->has_clients()) {
             if (g_state_manager) {
@@ -190,7 +188,7 @@ int main() {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Cerberus Daemon v1.2 starting...");
+    LOGI("Cerberus Daemon starting...");
 
     try {
         if (!fs::exists(DATA_DIR)) {
