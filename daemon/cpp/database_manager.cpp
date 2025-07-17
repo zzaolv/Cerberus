@@ -29,18 +29,15 @@ void DatabaseManager::initialize_database() {
             )
         )");
         
-        // 为旧数据库升级，添加统计列
         const char* columns_to_add[] = {
-            "cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0",
             "background_wakeups INTEGER NOT NULL DEFAULT 0",
             "background_cpu_seconds INTEGER NOT NULL DEFAULT 0",
             "background_traffic_bytes INTEGER NOT NULL DEFAULT 0"
         };
-
         for(const auto& col_def : columns_to_add) {
             try {
                 db_.exec("ALTER TABLE app_policies ADD COLUMN " + std::string(col_def));
-                LOGI("Successfully added column '%s' to 'app_policies' table.", col_def);
+                LOGI("Successfully added column for stats to 'app_policies' table.");
             } catch (const SQLite::Exception& e) {
                 if (std::string(e.what()).find("duplicate column name") == std::string::npos) {
                     LOGW("Could not add column (might already exist): %s", e.what());
@@ -60,6 +57,127 @@ void DatabaseManager::initialize_database() {
 
     } catch (const std::exception& e) {
         LOGE("Database initialization failed: %s", e.what());
+    }
+}
+
+std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    try {
+        SQLite::Statement query(db_, R"(
+            SELECT policy, force_playback_exempt, force_network_exempt, cumulative_runtime_seconds, 
+                   background_wakeups, background_cpu_seconds, background_traffic_bytes
+            FROM app_policies WHERE package_name = ?
+        )");
+        query.bind(1, package_name);
+
+        if (query.executeStep()) {
+            AppConfig config;
+            config.package_name = package_name;
+            config.policy = static_cast<AppPolicy>(query.getColumn(0).getInt());
+            // [修复] 将 int 显式转换为 bool，使用 != 0 是最清晰的方式
+            config.force_playback_exempt = (query.getColumn(1).getInt() != 0);
+            config.force_network_exempt = (query.getColumn(2).getInt() != 0);
+            config.cumulative_runtime_seconds = query.getColumn(3).getInt64();
+            config.background_wakeups = query.getColumn(4).getInt64();
+            config.background_cpu_seconds = query.getColumn(5).getInt64();
+            config.background_traffic_bytes = query.getColumn(6).getInt64();
+            return config;
+        }
+    } catch (const std::exception& e) {
+        LOGE("Failed to get app config for %s: %s", package_name.c_str(), e.what());
+    }
+    return std::nullopt;
+}
+
+std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    std::vector<AppConfig> configs;
+    try {
+        SQLite::Statement query(db_, R"(
+            SELECT package_name, policy, force_playback_exempt, force_network_exempt, cumulative_runtime_seconds,
+                   background_wakeups, background_cpu_seconds, background_traffic_bytes
+            FROM app_policies
+        )");
+        while (query.executeStep()) {
+            configs.emplace_back(AppConfig{
+                .package_name = query.getColumn(0).getString(),
+                .policy = static_cast<AppPolicy>(query.getColumn(1).getInt()),
+                // [修复] 将 int 显式转换为 bool
+                .force_playback_exempt = (query.getColumn(2).getInt() != 0),
+                .force_network_exempt = (query.getColumn(3).getInt() != 0),
+                .cumulative_runtime_seconds = query.getColumn(4).getInt64(),
+                .background_wakeups = query.getColumn(5).getInt64(),
+                .background_cpu_seconds = query.getColumn(6).getInt64(),
+                .background_traffic_bytes = query.getColumn(7).getInt64(),
+            });
+        }
+    } catch (const std::exception& e) {
+        LOGE("Failed to get all app configs: %s", e.what());
+    }
+    return configs;
+}
+
+bool DatabaseManager::update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes) {
+    if (wakeups <= 0 && cpu_seconds <= 0 && traffic_bytes <= 0) return true;
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    try {
+        SQLite::Statement query(db_, R"(
+            UPDATE app_policies SET
+            background_wakeups = background_wakeups + ?,
+            background_cpu_seconds = background_cpu_seconds + ?,
+            background_traffic_bytes = background_traffic_bytes + ?
+            WHERE package_name = ?
+        )");
+        // [修复] 使用 static_cast<int64_t> 解决 bind 的歧义性
+        query.bind(1, static_cast<int64_t>(wakeups));
+        query.bind(2, static_cast<int64_t>(cpu_seconds));
+        query.bind(3, static_cast<int64_t>(traffic_bytes));
+        query.bind(4, package_name);
+        query.exec();
+        return query.getChanges() > 0;
+    } catch (const std::exception& e) {
+        LOGE("Failed to update app stats for %s: %s", package_name.c_str(), e.what());
+        return false;
+    }
+}
+
+bool DatabaseManager::clear_all_stats() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    try {
+        SQLite::Statement query(db_, R"(
+            UPDATE app_policies SET
+            background_wakeups = 0,
+            background_cpu_seconds = 0,
+            background_traffic_bytes = 0
+        )");
+        query.exec();
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("Failed to clear all stats: %s", e.what());
+        return false;
+    }
+}
+
+bool DatabaseManager::set_app_config(const AppConfig& config) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    try {
+        SQLite::Statement query(db_, R"(
+            INSERT INTO app_policies (package_name, policy, force_playback_exempt, force_network_exempt)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(package_name) DO UPDATE SET
+            policy = excluded.policy,
+            force_playback_exempt = excluded.force_playback_exempt,
+            force_network_exempt = excluded.force_network_exempt
+        )");
+        query.bind(1, config.package_name);
+        query.bind(2, static_cast<int>(config.policy));
+        query.bind(3, static_cast<int>(config.force_playback_exempt));
+        query.bind(4, static_cast<int>(config.force_network_exempt));
+        query.exec();
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("Failed to update app config for %s: %s", config.package_name.c_str(), e.what());
+        return false;
     }
 }
 
@@ -103,122 +221,4 @@ std::vector<LogEntry> DatabaseManager::get_logs(int limit, int offset) {
         LOGE("Failed to get logs: %s", e.what());
     }
     return entries;
-}
-
-std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
-    std::lock_guard<std::mutex> lock(db_mutex_);
-    try {
-        SQLite::Statement query(db_, R"(
-            SELECT policy, force_playback_exempt, force_network_exempt, cumulative_runtime_seconds, 
-                   background_wakeups, background_cpu_seconds, background_traffic_bytes
-            FROM app_policies WHERE package_name = ?
-        )");
-        query.bind(1, package_name);
-
-        if (query.executeStep()) {
-            AppConfig config;
-            config.package_name = package_name;
-            config.policy = static_cast<AppPolicy>(query.getColumn(0).getInt());
-            config.force_playback_exempt = query.getColumn(1).getInt();
-            config.force_network_exempt = query.getColumn(2).getInt();
-            config.cumulative_runtime_seconds = query.getColumn(3).getInt64();
-            config.background_wakeups = query.getColumn(4).getInt64();
-            config.background_cpu_seconds = query.getColumn(5).getInt64();
-            config.background_traffic_bytes = query.getColumn(6).getInt64();
-            return config;
-        }
-    } catch (const std::exception& e) {
-        LOGE("Failed to get app config for %s: %s", package_name.c_str(), e.what());
-    }
-    return std::nullopt;
-}
-
-bool DatabaseManager::set_app_config(const AppConfig& config) {
-    std::lock_guard<std::mutex> lock(db_mutex_);
-    try {
-        SQLite::Statement query(db_, R"(
-            INSERT INTO app_policies (package_name, policy, force_playback_exempt, force_network_exempt)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(package_name) DO UPDATE SET
-            policy = excluded.policy,
-            force_playback_exempt = excluded.force_playback_exempt,
-            force_network_exempt = excluded.force_network_exempt
-        )");
-        query.bind(1, config.package_name);
-        query.bind(2, static_cast<int>(config.policy));
-        query.bind(3, static_cast<int>(config.force_playback_exempt));
-        query.bind(4, static_cast<int>(config.force_network_exempt));
-        query.exec();
-        return true;
-    } catch (const std::exception& e) {
-        LOGE("Failed to update app config for %s: %s", config.package_name.c_str(), e.what());
-        return false;
-    }
-}
-
-std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
-    std::lock_guard<std::mutex> lock(db_mutex_);
-    std::vector<AppConfig> configs;
-    try {
-        SQLite::Statement query(db_, R"(
-            SELECT package_name, policy, force_playback_exempt, force_network_exempt, cumulative_runtime_seconds,
-                   background_wakeups, background_cpu_seconds, background_traffic_bytes
-            FROM app_policies
-        )");
-        while (query.executeStep()) {
-            configs.emplace_back(AppConfig{
-                .package_name = query.getColumn(0).getString(),
-                .policy = static_cast<AppPolicy>(query.getColumn(1).getInt()),
-                .force_playback_exempt = query.getColumn(2).getInt(),
-                .force_network_exempt = query.getColumn(3).getInt(),
-                .cumulative_runtime_seconds = query.getColumn(4).getInt64(),
-                .background_wakeups = query.getColumn(5).getInt64(),
-                .background_cpu_seconds = query.getColumn(6).getInt64(),
-                .background_traffic_bytes = query.getColumn(7).getInt64(),
-            });
-        }
-    } catch (const std::exception& e) {
-        LOGE("Failed to get all app configs: %s", e.what());
-    }
-    return configs;
-}
-
-bool DatabaseManager::update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes) {
-    if (wakeups <= 0 && cpu_seconds <= 0 && traffic_bytes <= 0) return true;
-    std::lock_guard<std::mutex> lock(db_mutex_);
-    try {
-        SQLite::Statement query(db_, R"(
-            UPDATE app_policies SET
-            background_wakeups = background_wakeups + ?,
-            background_cpu_seconds = background_cpu_seconds + ?,
-            background_traffic_bytes = background_traffic_bytes + ?
-            WHERE package_name = ?
-        )");
-        query.bind(1, wakeups);
-        query.bind(2, cpu_seconds);
-        query.bind(3, traffic_bytes);
-        query.bind(4, package_name);
-        query.exec();
-        return query.getChanges() > 0;
-    } catch (const std::exception& e) {
-        LOGE("Failed to update app stats for %s: %s", package_name.c_str(), e.what());
-        return false;
-    }
-}
-
-bool DatabaseManager::clear_all_stats() {
-    std::lock_guard<std::mutex> lock(db_mutex_);
-    try {
-        SQLite::Statement query(db_, R"(
-            UPDATE app_policies SET
-            background_wakeups = 0,
-            background_cpu_seconds = 0,
-            background_traffic_bytes = 0
-        )");
-        query.exec();
-        return true;
-    } catch (const std::exception& e) {
-        LOGE("Failed to clear all stats: %s", e.what());
-        return false;
-    }
 }
