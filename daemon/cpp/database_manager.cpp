@@ -17,46 +17,47 @@ void DatabaseManager::initialize_database() {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
         db_.exec("PRAGMA journal_mode=WAL;");
-        // 【重构】更新 app_policies 表，增加累计运行时长列
-        if (!db_.tableExists("app_policies")) {
-            LOGI("Table 'app_policies' does not exist. Creating it.");
-            db_.exec(R"(
-                CREATE TABLE app_policies (
-                    package_name TEXT PRIMARY KEY,
-                    policy INTEGER NOT NULL DEFAULT 2,
-                    force_playback_exempt INTEGER NOT NULL DEFAULT 0,
-                    force_network_exempt INTEGER NOT NULL DEFAULT 0,
-                    cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0
-                )
-            )");
-        } else {
-            // 如果表已存在，检查是否需要添加新列（用于升级）
-            if (!db_.columnExists("app_policies", "cumulative_runtime_seconds")) {
-                 LOGI("Adding 'cumulative_runtime_seconds' to 'app_policies' table.");
-                 db_.exec("ALTER TABLE app_policies ADD COLUMN cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0;");
+
+        // 【修复】创建 app_policies 表，如果已存在则会静默失败，这没关系
+        db_.exec(R"(
+            CREATE TABLE IF NOT EXISTS app_policies (
+                package_name TEXT PRIMARY KEY,
+                policy INTEGER NOT NULL DEFAULT 2,
+                force_playback_exempt INTEGER NOT NULL DEFAULT 0,
+                force_network_exempt INTEGER NOT NULL DEFAULT 0,
+                cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0
+            )
+        )");
+
+        // 【修复】为旧版本数据库添加新列。如果失败（例如列已存在），则捕获异常并忽略
+        try {
+            db_.exec("ALTER TABLE app_policies ADD COLUMN cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0;");
+            LOGI("Successfully added 'cumulative_runtime_seconds' to 'app_policies' table for upgrade.");
+        } catch (const SQLite::Exception& e) {
+            // 忽略 "duplicate column name" 错误，这是预期的行为
+            if (std::string(e.what()).find("duplicate column name") == std::string::npos) {
+                // 如果是其他错误，则打印出来
+                LOGW("Could not add column (might already exist): %s", e.what());
             }
         }
 
-        // 【重构】更新 logs 表，存储事件类型和JSON payload
-        if (!db_.tableExists("logs")) {
-            LOGI("Table 'logs' does not exist. Creating it.");
-            db_.exec(R"(
-                CREATE TABLE logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL,
-                    event_type INTEGER NOT NULL,
-                    payload TEXT NOT NULL
-                )
-            )");
-             db_.exec("CREATE INDEX idx_logs_timestamp ON logs(timestamp DESC);");
-        }
+        // 创建 logs 表
+        db_.exec(R"(
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                event_type INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )
+        )");
+        // 创建索引
+        db_.exec("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp DESC);");
 
     } catch (const std::exception& e) {
         LOGE("Database initialization failed: %s", e.what());
     }
 }
 
-// 【重构】实现新的日志记录函数
 bool DatabaseManager::log_event(LogEventType type, const nlohmann::json& payload) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
@@ -75,7 +76,6 @@ bool DatabaseManager::log_event(LogEventType type, const nlohmann::json& payload
     }
 }
 
-// 【重构】实现新的日志查询函数
 std::vector<LogEntry> DatabaseManager::get_logs(int limit, int offset) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     std::vector<LogEntry> entries;
@@ -100,7 +100,6 @@ std::vector<LogEntry> DatabaseManager::get_logs(int limit, int offset) {
     return entries;
 }
 
-// 【重构】更新 get_app_config 以包含新字段
 std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
@@ -122,11 +121,9 @@ std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& pack
     return std::nullopt;
 }
 
-// 【重构】更新 set_app_config 以包含新字段，但只在INSERT时设置默认值
 bool DatabaseManager::set_app_config(const AppConfig& config) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
-        // cumulative_runtime_seconds 不应被UI直接重置，所以它不在UPDATE部分
         SQLite::Statement query(db_, R"(
             INSERT INTO app_policies (package_name, policy, force_playback_exempt, force_network_exempt)
             VALUES (?, ?, ?, ?)
@@ -147,13 +144,13 @@ bool DatabaseManager::set_app_config(const AppConfig& config) {
     }
 }
 
-// 【新增】实现更新累计运行时长的函数
 bool DatabaseManager::update_app_runtime(const std::string& package_name, long long session_seconds) {
     if (session_seconds <= 0) return true;
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
         SQLite::Statement query(db_, "UPDATE app_policies SET cumulative_runtime_seconds = cumulative_runtime_seconds + ? WHERE package_name = ?");
-        query.bind(1, session_seconds);
+        // 【编译修复】显式将 long long 转换为 int64_t 来消除歧义
+        query.bind(1, static_cast<int64_t>(session_seconds));
         query.bind(2, package_name);
         query.exec();
         return query.getChanges() > 0;
@@ -163,7 +160,6 @@ bool DatabaseManager::update_app_runtime(const std::string& package_name, long l
     }
 }
 
-// 【重构】更新 get_all_app_configs 以包含新字段
 std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
     std::lock_guard<std::mutex> lock(db_mutex_);
     std::vector<AppConfig> configs;
