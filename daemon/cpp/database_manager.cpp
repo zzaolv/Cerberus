@@ -74,7 +74,6 @@ std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& pack
             AppConfig config;
             config.package_name = package_name;
             config.policy = static_cast<AppPolicy>(query.getColumn(0).getInt());
-            // [修复] 将 int 显式转换为 bool，使用 != 0 是最清晰的方式
             config.force_playback_exempt = (query.getColumn(1).getInt() != 0);
             config.force_network_exempt = (query.getColumn(2).getInt() != 0);
             config.cumulative_runtime_seconds = query.getColumn(3).getInt64();
@@ -102,7 +101,6 @@ std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
             configs.emplace_back(AppConfig{
                 .package_name = query.getColumn(0).getString(),
                 .policy = static_cast<AppPolicy>(query.getColumn(1).getInt()),
-                // [修复] 将 int 显式转换为 bool
                 .force_playback_exempt = (query.getColumn(2).getInt() != 0),
                 .force_network_exempt = (query.getColumn(3).getInt() != 0),
                 .cumulative_runtime_seconds = query.getColumn(4).getInt64(),
@@ -117,6 +115,21 @@ std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
     return configs;
 }
 
+bool DatabaseManager::update_app_runtime(const std::string& package_name, long long session_seconds) {
+    if (session_seconds <= 0) return true;
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    try {
+        SQLite::Statement query(db_, "UPDATE app_policies SET cumulative_runtime_seconds = cumulative_runtime_seconds + ? WHERE package_name = ?");
+        query.bind(1, static_cast<int64_t>(session_seconds));
+        query.bind(2, package_name);
+        query.exec();
+        return true; 
+    } catch (const std::exception& e) {
+        LOGE("Failed to update cumulative runtime for %s: %s", package_name.c_str(), e.what());
+        return false;
+    }
+}
+
 bool DatabaseManager::update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes) {
     if (wakeups <= 0 && cpu_seconds <= 0 && traffic_bytes <= 0) return true;
     std::lock_guard<std::mutex> lock(db_mutex_);
@@ -128,7 +141,6 @@ bool DatabaseManager::update_app_stats(const std::string& package_name, long lon
             background_traffic_bytes = background_traffic_bytes + ?
             WHERE package_name = ?
         )");
-        // [修复] 使用 static_cast<int64_t> 解决 bind 的歧义性
         query.bind(1, static_cast<int64_t>(wakeups));
         query.bind(2, static_cast<int64_t>(cpu_seconds));
         query.bind(3, static_cast<int64_t>(traffic_bytes));

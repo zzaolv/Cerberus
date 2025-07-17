@@ -14,6 +14,7 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "process_monitor.h"
+#include "action_executor.h"
 
 class ActionExecutor;
 
@@ -39,27 +40,28 @@ struct AppRuntimeState {
 
     bool has_notification = false;
     bool has_network_activity = false;
-    bool is_network_blocked = false; // [新增]
+    bool is_network_blocked = false;
     long long last_rx_bytes = 0;
     long long last_tx_bytes = 0;
 };
 
-// [新增] Doze状态机
 enum class DozeState {
-    ACTIVE,         // 设备活动
-    IDLE_PENDING,   // 等待进入IDLE
-    IDLE,           // 轻度Doze
-    DEEP_IDLE,      // 深度Doze
+    ACTIVE,
+    IDLE,
+    DEEP_IDLE,
 };
 
 class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
 
+    void set_freezer_type(FreezerType type);
+    void set_periodic_unfreeze_interval(int minutes);
+
     void process_event_handler(ProcessEventType type, int pid, int ppid);
     void handle_probe_event(const nlohmann::json& event);
 
-    void tick(); // 主循环，现在分为多个子任务
+    void tick();
     void update_all_resource_stats();
     nlohmann::json get_dashboard_payload();
 
@@ -67,12 +69,10 @@ public:
     const std::unordered_set<std::string>& get_safety_net_list() const;
 
 private:
-    // Tick 分解
     void tick_app_states();
     void tick_doze_state();
     void tick_power_state();
 
-    // Doze 相关
     void handle_doze_event(const nlohmann::json& payload);
     void transition_doze_state(DozeState new_state, const std::string& reason);
     void enter_deep_doze_actions();
@@ -80,7 +80,6 @@ private:
     void start_doze_resource_snapshot();
     void generate_doze_exit_report();
 
-    // 状态管理
     void initial_scan();
     void refresh_app_list_from_db();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -99,15 +98,16 @@ private:
 
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
-    std::optional<BatteryStats> battery_stats_; // [新增]
+    std::optional<BatteryStats> battery_stats_;
     bool is_screen_on_ = true;
 
-    // [新增] Doze状态机相关
+    std::atomic<FreezerType> current_freezer_type_ = FreezerType::AUTO;
+    std::atomic<int> periodic_unfreeze_interval_min_ = 0;
+
     DozeState doze_state_ = DozeState::ACTIVE;
     std::chrono::steady_clock::time_point last_doze_state_change_time_;
-    std::unordered_map<int, long long> doze_cpu_snapshot_; // PID -> Jiffies
+    std::unordered_map<int, long long> doze_cpu_snapshot_;
 
-    // [新增] 电源监控相关
     std::chrono::steady_clock::time_point last_power_check_time_;
     int last_capacity_ = -1;
 

@@ -19,9 +19,9 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 constexpr int PER_USER_RANGE = 100000;
-constexpr long long NETWORK_ACTIVITY_THRESHOLD_BPS = 2 * 1024; // 2 KB/s
+constexpr long long NETWORK_ACTIVITY_THRESHOLD_BPS = 2 * 1024;
 constexpr int POWER_CHECK_INTERVAL_SECONDS = 60;
-constexpr int IDLE_TIMEOUT_SECONDS = 30 * 60; // 30分钟进入深度Doze
+constexpr int IDLE_TIMEOUT_SECONDS = 30 * 60;
 constexpr int AWAIT_FREEZE_SECONDS = 5;
 
 static std::string status_to_string_local(AppRuntimeState::Status status) {
@@ -40,7 +40,6 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
     LOGI("StateManager (Defense-in-Depth) Initializing...");
-    
     
     critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -393,8 +392,14 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
-const std::unordered_set<std::string>& StateManager::get_safety_net_list() const {
-    return critical_system_apps_;
+void StateManager::set_freezer_type(FreezerType type) {
+    current_freezer_type_ = type;
+    LOGI("StateManager freezer type set to: %d", static_cast<int>(type));
+}
+
+void StateManager::set_periodic_unfreeze_interval(int minutes) {
+    periodic_unfreeze_interval_min_ = minutes;
+    LOGI("StateManager periodic unfreeze interval set to: %d minutes", minutes);
 }
 
 void StateManager::tick() {
@@ -408,20 +413,13 @@ void StateManager::tick() {
 void StateManager::tick_app_states() {
     auto now = std::chrono::steady_clock::now();
     for (auto& [key, app] : managed_apps_) {
-        if (app.pids.empty()) {
-            if (app.current_status != AppRuntimeState::Status::STOPPED) {
-                transition_state(app, AppRuntimeState::Status::STOPPED, "All processes exited");
-            }
-            continue;
-        }
-
-        if (app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
+        if (app.pids.empty() || app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
             if (app.is_network_blocked) {
                 action_executor_->unblock_network(app.uid);
                 app.is_network_blocked = false;
             }
             if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                action_executor_->unfreeze_pids(app.pids);
+                action_executor_->unfreeze_pids(app.pids, current_freezer_type_);
             }
             if (app.current_status != AppRuntimeState::Status::EXEMPTED) {
                  transition_state(app, AppRuntimeState::Status::EXEMPTED, "Safety Net or Exempted Policy");
@@ -429,11 +427,10 @@ void StateManager::tick_app_states() {
             continue;
         }
 
-        // 仅当设备不处于深度休眠时，才执行常规的后台超时冻结逻辑
         if (doze_state_ != DozeState::DEEP_IDLE && !is_screen_on_) {
             if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                if (elapsed > 30) { // TODO: 使用策略配置的超时
+                if (elapsed > 30) {
                     transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE, "Background timeout");
                 }
             } else if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
@@ -450,7 +447,7 @@ void StateManager::tick_doze_state() {
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_doze_state_change_time_).count();
 
-    bool is_charging = battery_stats_ && (battery_stats_->status.find("Charging") != std::string::npos || battery_stats_->status.find("Full") != std::string::npos);
+    bool is_charging = battery_stats_ && (battery_stats_->status.find("Charging") != std::string::npos);
 
     if (is_screen_on_ || is_charging) {
         if (doze_state_ != DozeState::ACTIVE) {
@@ -459,7 +456,6 @@ void StateManager::tick_doze_state() {
         return;
     }
 
-    // 熄屏且未充电
     if (doze_state_ == DozeState::ACTIVE) {
         transition_doze_state(DozeState::IDLE, "Screen off and not charging");
     } else if (doze_state_ == DozeState::IDLE) {
@@ -476,7 +472,8 @@ void StateManager::tick_power_state() {
     if (elapsed < POWER_CHECK_INTERVAL_SECONDS) {
         return;
     }
-    
+    last_power_check_time_ = now;
+
     battery_stats_ = sys_monitor_->get_battery_stats();
     if (!battery_stats_) {
         LOGW("Failed to get battery stats in tick.");
@@ -489,17 +486,12 @@ void StateManager::tick_power_state() {
         {"power_watt", battery_stats_->power_watt}
     };
 
-    int current_capacity = battery_stats_->capacity;
-
-    if (last_capacity_ != -1 && last_capacity_ > current_capacity) {
-        int capacity_drop = last_capacity_ - current_capacity;
-        int duration_min = static_cast<int>(elapsed / 60);
-        if (duration_min == 0) duration_min = 1; // 避免除零
-
+    if (last_capacity_ != -1 && last_capacity_ > battery_stats_->capacity) {
+        int capacity_drop = last_capacity_ - battery_stats_->capacity;
         payload["consumption_percent"] = capacity_drop;
-        payload["consumption_duration_min"] = duration_min;
+        payload["consumption_duration_min"] = static_cast<int>(elapsed / 60);
         
-        if (elapsed <= 65 && capacity_drop >= 1) { // 1分钟左右掉电1%或以上
+        if (elapsed <= 65 && capacity_drop >= 1) {
              db_manager_->log_event(LogEventType::POWER_WARNING, payload);
         } else {
              db_manager_->log_event(LogEventType::POWER_UPDATE, payload);
@@ -508,8 +500,7 @@ void StateManager::tick_power_state() {
         db_manager_->log_event(LogEventType::POWER_UPDATE, payload);
     }
 
-    last_capacity_ = current_capacity;
-    last_power_check_time_ = now;
+    last_capacity_ = battery_stats_->capacity;
 }
 
 void StateManager::handle_probe_event(const nlohmann::json& event) {
@@ -543,7 +534,7 @@ void StateManager::handle_probe_event(const nlohmann::json& event) {
         if (type == "event.notification_post") {
             app->has_notification = true;
             if (app->current_status == AppRuntimeState::Status::FROZEN) {
-                 if (action_executor_->unfreeze_pids(app->pids)) {
+                 if (action_executor_->unfreeze_pids(app->pids, current_freezer_type_)) {
                     transition_state(*app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "Notification received");
                 }
             }
@@ -584,7 +575,7 @@ void StateManager::transition_doze_state(DozeState new_state, const std::string&
         enter_deep_doze_actions();
     }
 
-    LOGI("Doze state transition: %d -> %d. Reason: %s", static_cast<int>(old_state), static_cast<int>(new_state), reason.c_str());
+    LOGI("Doze state transition: %d -> %d. Reason: %s", (int)old_state, (int)new_state, reason.c_str());
 }
 
 void StateManager::enter_deep_doze_actions() {
@@ -635,7 +626,7 @@ void StateManager::exit_deep_doze_actions() {
         }
 
         if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            // Unfreezing is handled in transition_state
+            action_executor_->unfreeze_pids(app.pids, current_freezer_type_);
             transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "Exiting Deep Doze");
         }
     }
@@ -644,7 +635,7 @@ void StateManager::exit_deep_doze_actions() {
 void StateManager::start_doze_resource_snapshot() {
     doze_cpu_snapshot_.clear();
     for (const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if(app_ptr == nullptr || app_ptr->pids.empty()) continue;
+        if(app_ptr->pids.empty()) continue;
         doze_cpu_snapshot_[pid] = sys_monitor_->get_app_stats(pid, "", 0).cpu_time_jiffies;
     }
     LOGI("Took resource snapshot for %zu processes at Doze entry.", doze_cpu_snapshot_.size());
@@ -657,7 +648,7 @@ void StateManager::generate_doze_exit_report() {
     long jiffy_hz = sysconf(_SC_CLK_TCK);
 
     for (const auto& [pid, app_ptr] : pid_to_app_map_) {
-         if (app_ptr == nullptr || app_ptr->pids.empty()) continue;
+         if (app_ptr->pids.empty()) continue;
          
          auto it = doze_cpu_snapshot_.find(pid);
          if (it != doze_cpu_snapshot_.end()) {
@@ -688,12 +679,8 @@ void StateManager::generate_doze_exit_report() {
             });
         }
     }
-    
-    if (!entries.empty()) {
-        report_payload["entries"] = entries;
-        db_manager_->log_event(LogEventType::DOZE_RESOURCE_REPORT, report_payload);
-    }
-    
+    report_payload["entries"] = entries;
+    db_manager_->log_event(LogEventType::DOZE_RESOURCE_REPORT, report_payload);
     doze_cpu_snapshot_.clear();
 }
 
@@ -744,7 +731,7 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
         case AppRuntimeState::Status::STOPPED: event_type = LogEventType::APP_STOP; break;
         case AppRuntimeState::Status::EXEMPTED:
              if (old_status == AppRuntimeState::Status::FROZEN) {
-                action_executor_->unfreeze_pids(app.pids);
+                action_executor_->unfreeze_pids(app.pids, current_freezer_type_);
                 db_manager_->log_event(LogEventType::APP_UNFROZEN, {{"package_name", app.package_name}, {"app_name", app.app_name}, {"reason", "Policy change"}});
             }
             break;
@@ -752,7 +739,7 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
     }
 
     if (new_status == AppRuntimeState::Status::FROZEN) {
-        if (action_executor_->freeze_pids(app.pids)) {
+        if (action_executor_->freeze_pids(app.pids, current_freezer_type_)) {
             db_manager_->log_event(event_type, log_payload);
         } else {
             db_manager_->log_event(LogEventType::GENERIC_ERROR, {{"message", "Freeze failed for " + app.package_name}});
@@ -763,18 +750,23 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
     }
     
     if (old_status == AppRuntimeState::Status::FROZEN && new_status != AppRuntimeState::Status::FROZEN) {
-         if (action_executor_->unfreeze_pids(app.pids)) {
+         if (action_executor_->unfreeze_pids(app.pids, current_freezer_type_)) {
              db_manager_->log_event(LogEventType::APP_UNFROZEN, {
                 {"package_name", app.package_name},
                 {"app_name", app.app_name},
+                {"pid_count", app.pids.size()},
                 {"reason", reason}
             });
          }
     }
 
-    LOGI("State transition for %s (user %d): %s -> %s. Reason: %s", app.package_name.c_str(), app.user_id, old_status_str.c_str(), new_status_str.c_str(), reason.c_str());
+    LOGI("State transition for %s (user %d): %s -> %s", app.package_name.c_str(), app.user_id, old_status_str.c_str(), new_status_str.c_str());
     app.current_status = new_status;
     app.last_state_change_time = now;
+}
+
+const std::unordered_set<std::string>& StateManager::get_safety_net_list() const {
+    return critical_system_apps_;
 }
 
 nlohmann::json StateManager::get_dashboard_payload() {
@@ -831,6 +823,23 @@ nlohmann::json StateManager::get_dashboard_payload() {
     }
     payload["apps_runtime_state"] = apps_state;
     return payload;
+}
+
+void StateManager::process_event_handler(ProcessEventType type, int pid, int ppid) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    if (type == ProcessEventType::EXIT) {
+        remove_pid_from_app(pid);
+    } else if (type == ProcessEventType::FORK) {
+        AppRuntimeState* parent_app = find_app_by_pid(ppid);
+        if (parent_app) {
+             int uid = -1, user_id = -1;
+             std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+             if(!pkg_name.empty() && pkg_name == parent_app->package_name){
+                add_pid_to_app(pid, parent_app->package_name, parent_app->user_id, parent_app->uid);
+             }
+        }
+    }
 }
 
 void StateManager::update_app_config_from_ui(const AppConfig& new_config) {

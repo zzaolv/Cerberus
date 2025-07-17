@@ -21,13 +21,11 @@ struct AppConfig {
     bool force_playback_exempt = false;
     bool force_network_exempt = false;
     long long cumulative_runtime_seconds = 0;
-    // [新增] 资源统计字段
     long long background_wakeups = 0;
     long long background_cpu_seconds = 0;
     long long background_traffic_bytes = 0;
 };
 
-// 与V1.2版本日志类型同步
 enum class LogEventType {
     GENERIC_INFO,
     GENERIC_SUCCESS,
@@ -51,7 +49,6 @@ enum class LogEventType {
     NETWORK_BLOCKED,
     NETWORK_UNBLOCKED,
     SCHEDULED_TASK_EXEC,
-    // [新增] 为健康检查新增一个事件类型
     HEALTH_CHECK_STATUS,
     UNKNOWN
 };
@@ -69,10 +66,12 @@ public:
     std::optional<AppConfig> get_app_config(const std::string& package_name);
     bool set_app_config(const AppConfig& config);
     std::vector<AppConfig> get_all_app_configs();
+    
+    // 恢复 update_app_runtime 的声明
+    bool update_app_runtime(const std::string& package_name, long long session_seconds);
 
-    // [新增] 更新统计数据的接口
     bool update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes);
-    bool clear_all_stats(); // 用于UI上的清空数据功能
+    bool clear_all_stats();
 
     bool log_event(LogEventType type, const nlohmann::json& payload);
     std::vector<LogEntry> get_logs(int limit, int offset);
