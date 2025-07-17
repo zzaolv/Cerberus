@@ -2,6 +2,7 @@
 package com.crfzit.crfzit.ui.configuration
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.CerberusApplication
@@ -26,10 +27,8 @@ data class ConfigurationUiState(
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appInfoRepository = AppInfoRepository.getInstance(application)
-
     private val appScope = (application as CerberusApplication).applicationScope
     private val udsClient = UdsClient.getInstance(appScope)
-
     private val gson = Gson()
 
     private val _uiState = MutableStateFlow(ConfigurationUiState())
@@ -43,7 +42,9 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     private fun loadInitialData() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            appInfoRepository.loadAllInstalledApps(forceRefresh = true)
+            // 确保本地应用列表已加载
+            appInfoRepository.loadAllInstalledApps()
+            // 向守护进程请求最新数据
             querySafetyNet()
             queryAllPolicies()
         }
@@ -63,24 +64,34 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                             _uiState.update { it.copy(safetyNet = safetyNetApps) }
                         }
                         "resp.all_policies" -> {
-                            val listType = object : TypeToken<List<AppInfo>>() {}.type
-                            val daemonPolicies: List<AppInfo> = gson.fromJson(payloadJson, listType)
+                            // 【核心修复】这是确保配置正确的关键逻辑
+                            val listType = object : TypeToken<List<Map<String, Any>>>() {}.type
+                            val daemonPolicies: List<Map<String, Any>> = gson.fromJson(payloadJson, listType)
 
-                            val localApps = appInfoRepository.getCachedApps()
+                            val localApps = appInfoRepository.getCachedApps().toMutableMap()
+
                             // 将 daemon 的配置合并到本地应用列表
-                            val mergedApps = localApps.values.map { localApp ->
-                                val daemonConfig = daemonPolicies.find { it.packageName == localApp.packageName }
-                                localApp.copy(
-                                    policy = daemonConfig?.policy ?: Policy.EXEMPTED,
-                                    forcePlaybackExemption = daemonConfig?.forcePlaybackExemption ?: false,
-                                    forceNetworkExemption = daemonConfig?.forceNetworkExemption ?: false
-                                )
-                            }.sortedBy { it.appName }
+                            daemonPolicies.forEach { daemonConfig ->
+                                val pkgName = daemonConfig["packageName"] as? String ?: return@forEach
+                                localApps[pkgName]?.let { localApp ->
+                                    // 直接修改缓存中的AppInfo对象
+                                    localApp.policy = Policy.entries.getOrElse((daemonConfig["policy"] as? Double)?.toInt() ?: 0) { Policy.EXEMPTED }
+                                    localApp.forcePlaybackExemption = daemonConfig["forcePlaybackExemption"] as? Boolean ?: false
+                                    localApp.forceNetworkExemption = daemonConfig["forceNetworkExemption"] as? Boolean ?: false
+                                }
+                            }
 
-                            _uiState.update { it.copy(allApps = mergedApps, isLoading = false) }
+                            _uiState.update {
+                                it.copy(
+                                    allApps = localApps.values.sortedBy { app -> app.appName },
+                                    isLoading = false
+                                )
+                            }
                         }
                     }
-                } catch (e: Exception) { /* ignore */ }
+                } catch (e: Exception) {
+                    Log.e("ConfigViewModel", "Error parsing daemon response: ${e.message}", e)
+                }
             }
         }
     }
@@ -123,6 +134,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
     private fun updateAppInfo(packageName: String, transform: (AppInfo) -> AppInfo) {
         var updatedApp: AppInfo? = null
+        // 乐观更新UI
         _uiState.update { currentState ->
             val updatedApps = currentState.allApps.map { app ->
                 if (app.packageName == packageName) {
@@ -133,12 +145,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
             currentState.copy(allApps = updatedApps)
         }
+        // 发送指令到守护进程
         updatedApp?.let { sendPolicyUpdate(it) }
     }
-
-    // 【核心修复】移除 onCleared 方法，因为它不应再管理 UDS Client 的生命周期
-    // override fun onCleared() {
-    //     super.onCleared()
-    //     udsClient.stop() // <-- This was the error
-    // }
 }

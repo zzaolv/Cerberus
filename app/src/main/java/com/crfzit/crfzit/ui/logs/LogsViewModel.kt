@@ -26,7 +26,6 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appScope = (application as CerberusApplication).applicationScope
     private val udsClient = UdsClient.getInstance(appScope)
-
     private val gson = Gson()
     private var currentPage = 0
     private val logsPerPage = 50
@@ -36,7 +35,7 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         observeLogResponses()
-        requestLogsPage(0)
+        requestLogsPage(0) // 初始加载第一页
     }
 
     private fun observeLogResponses() {
@@ -56,20 +55,13 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                             try {
                                 val timestampNum = rawLogEntry["timestamp"] as? Number
                                 val eventTypeNum = rawLogEntry["event_type"] as? Number
-
-                                // [修复] 使用安全的类型检查来避免 Unchecked cast 警告
-                                val payloadMap = if (rawLogEntry["payload"] is Map<*, *>) {
-                                    @Suppress("UNCHECKED_CAST")
-                                    rawLogEntry["payload"] as? Map<String, Any>
-                                } else {
-                                    null
-                                }
+                                @Suppress("UNCHECKED_CAST")
+                                val payloadMap = rawLogEntry["payload"] as? Map<String, Any>
 
                                 if (timestampNum == null || eventTypeNum == null || payloadMap == null) {
                                     Log.w("LogsViewModel", "Skipping log entry with invalid types: $rawLogEntry")
                                     return@mapNotNull null
                                 }
-
                                 LogEntry(
                                     timestamp = timestampNum.toLong(),
                                     eventType = LogEventType.entries.getOrElse(eventTypeNum.toInt()) { LogEventType.UNKNOWN },
@@ -84,7 +76,9 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                         _uiState.update {
                             it.copy(
                                 isLoading = false,
-                                logs = (it.logs + newLogs).distinctBy { log -> log.timestamp.toString() + log.payload.toString() },
+                                // 合并并去重，防止重复加载
+                                logs = (it.logs + newLogs).distinctBy { log -> log.timestamp.toString() + log.payload.toString() }
+                                    .sortedByDescending { log -> log.timestamp },
                                 canLoadMore = newLogs.size >= logsPerPage
                             )
                         }
@@ -125,6 +119,5 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
             "payload" to requestPayload
         )
         udsClient.sendMessage(gson.toJson(request))
-        Log.i("LogsViewModel", "Requested logs page $page")
     }
 }

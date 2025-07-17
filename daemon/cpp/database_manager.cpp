@@ -22,13 +22,14 @@ void DatabaseManager::initialize_database() {
         db_.exec(R"(
             CREATE TABLE IF NOT EXISTS app_policies (
                 package_name TEXT PRIMARY KEY,
-                policy INTEGER NOT NULL DEFAULT 2,
+                policy INTEGER NOT NULL DEFAULT 0,
                 force_playback_exempt INTEGER NOT NULL DEFAULT 0,
                 force_network_exempt INTEGER NOT NULL DEFAULT 0,
                 cumulative_runtime_seconds INTEGER NOT NULL DEFAULT 0
             )
         )");
         
+        // 【核心修复】确保统计列存在
         const char* columns_to_add[] = {
             "background_wakeups INTEGER NOT NULL DEFAULT 0",
             "background_cpu_seconds INTEGER NOT NULL DEFAULT 0",
@@ -39,8 +40,9 @@ void DatabaseManager::initialize_database() {
                 db_.exec("ALTER TABLE app_policies ADD COLUMN " + std::string(col_def));
                 LOGI("Successfully added column for stats to 'app_policies' table.");
             } catch (const SQLite::Exception& e) {
+                // 忽略 "duplicate column" 错误，这意味着列已存在
                 if (std::string(e.what()).find("duplicate column name") == std::string::npos) {
-                    LOGW("Could not add column (might already exist): %s", e.what());
+                    LOGW("Could not add column: %s", e.what());
                 }
             }
         }
@@ -60,6 +62,7 @@ void DatabaseManager::initialize_database() {
     }
 }
 
+// ... get_app_config and get_all_app_configs ... (无重大变更，但现在会读取新列)
 std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
@@ -123,6 +126,7 @@ bool DatabaseManager::update_app_runtime(const std::string& package_name, long l
         query.bind(1, static_cast<int64_t>(session_seconds));
         query.bind(2, package_name);
         query.exec();
+        // 即使没有行被更新（新应用），也返回 true
         return true; 
     } catch (const std::exception& e) {
         LOGE("Failed to update cumulative runtime for %s: %s", package_name.c_str(), e.what());
@@ -130,6 +134,7 @@ bool DatabaseManager::update_app_runtime(const std::string& package_name, long l
     }
 }
 
+// 【核心修复】实现统计数据更新
 bool DatabaseManager::update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes) {
     if (wakeups <= 0 && cpu_seconds <= 0 && traffic_bytes <= 0) return true;
     std::lock_guard<std::mutex> lock(db_mutex_);
@@ -146,29 +151,30 @@ bool DatabaseManager::update_app_stats(const std::string& package_name, long lon
         query.bind(3, static_cast<int64_t>(traffic_bytes));
         query.bind(4, package_name);
         query.exec();
-        return query.getChanges() > 0;
+        return true;
     } catch (const std::exception& e) {
         LOGE("Failed to update app stats for %s: %s", package_name.c_str(), e.what());
         return false;
     }
 }
 
+// 【核心修复】实现统计数据清空
 bool DatabaseManager::clear_all_stats() {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {
-        SQLite::Statement query(db_, R"(
+        db_.exec(R"(
             UPDATE app_policies SET
             background_wakeups = 0,
             background_cpu_seconds = 0,
             background_traffic_bytes = 0
         )");
-        query.exec();
         return true;
     } catch (const std::exception& e) {
         LOGE("Failed to clear all stats: %s", e.what());
         return false;
     }
 }
+
 
 bool DatabaseManager::set_app_config(const AppConfig& config) {
     std::lock_guard<std::mutex> lock(db_mutex_);
@@ -193,6 +199,7 @@ bool DatabaseManager::set_app_config(const AppConfig& config) {
     }
 }
 
+// ... log_event 和 get_logs 保持不变 ...
 bool DatabaseManager::log_event(LogEventType type, const nlohmann::json& payload) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     try {

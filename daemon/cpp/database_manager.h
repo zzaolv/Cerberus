@@ -17,7 +17,7 @@ enum class AppPolicy {
 
 struct AppConfig {
     std::string package_name;
-    AppPolicy policy = AppPolicy::STANDARD;
+    AppPolicy policy = AppPolicy::EXEMPTED; // 默认改为豁免
     bool force_playback_exempt = false;
     bool force_network_exempt = false;
     long long cumulative_runtime_seconds = 0;
@@ -26,6 +26,7 @@ struct AppConfig {
     long long background_traffic_bytes = 0;
 };
 
+// [重构] 与UI层完全同步的LogEventType
 enum class LogEventType {
     GENERIC_INFO,
     GENERIC_SUCCESS,
@@ -67,9 +68,7 @@ public:
     bool set_app_config(const AppConfig& config);
     std::vector<AppConfig> get_all_app_configs();
     
-    // 恢复 update_app_runtime 的声明
     bool update_app_runtime(const std::string& package_name, long long session_seconds);
-
     bool update_app_stats(const std::string& package_name, long long wakeups, long long cpu_seconds, long long traffic_bytes);
     bool clear_all_stats();
 

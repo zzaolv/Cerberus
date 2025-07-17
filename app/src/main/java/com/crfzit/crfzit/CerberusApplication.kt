@@ -2,12 +2,13 @@
 package com.crfzit.crfzit
 
 import android.app.Application
+import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.uds.UdsClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
-// 【核心修复】创建自定义 Application 类
 class CerberusApplication : Application() {
 
     // 创建一个贯穿整个应用生命周期的协程作用域
@@ -15,7 +16,13 @@ class CerberusApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        // 在应用启动时，就初始化（预热）UDS客户端单例
+        // 1. 在应用启动时，就初始化（预热）UDS客户端单例
+        // 它会自动开始连接，并在后台保持
         UdsClient.getInstance(applicationScope)
+
+        // 2. 异步加载所有应用信息到缓存
+        applicationScope.launch {
+            AppInfoRepository.getInstance(this@CerberusApplication).loadAllInstalledApps()
+        }
     }
 }

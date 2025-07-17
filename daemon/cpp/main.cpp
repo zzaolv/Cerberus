@@ -12,7 +12,7 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
-#include <unistd.h> // [修复] 添加此头文件以声明 getpid()
+#include <unistd.h>
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -31,7 +31,6 @@ std::shared_ptr<StateManager> g_state_manager;
 std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::shared_ptr<DatabaseManager> g_db_manager;
 std::atomic<bool> g_is_running = true;
-
 std::atomic<bool> g_probe_connected = false;
 std::atomic<long long> g_last_probe_timestamp = 0;
 
@@ -47,18 +46,18 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             g_probe_connected = true;
             g_last_probe_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             if (g_state_manager) g_state_manager->handle_probe_event(msg);
-
         } else if (type.rfind("cmd.", 0) == 0) {
             const auto& payload = msg["payload"];
             if (type == "cmd.set_policy") {
                 AppConfig new_config;
                 new_config.package_name = payload.value("package_name", "");
-                int policy_int = payload.value("policy", 2);
-                new_config.policy = (policy_int >= 0 && policy_int <= 3) ? static_cast<AppPolicy>(policy_int) : AppPolicy::STANDARD;
+                int policy_int = payload.value("policy", 0);
+                new_config.policy = (policy_int >= 0 && policy_int <= 3) ? static_cast<AppPolicy>(policy_int) : AppPolicy::EXEMPTED;
                 new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
                 new_config.force_network_exempt = payload.value("force_network_exempt", false);
                 if (g_state_manager) g_state_manager->update_app_config_from_ui(new_config);
             } else if (type == "cmd.set_settings") {
+                // 【核心修复】处理设置指令
                 int freezer_int = payload.value("freezer_type", 0);
                 int unfreeze_interval = payload.value("unfreeze_interval", 0);
                 if (g_state_manager) {
@@ -71,15 +70,16 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 g_is_running = false;
                 if (g_server) g_server->stop();
             } else if (type == "cmd.clear_stats") {
+                // 【核心修复】处理清空统计指令
                 if(g_db_manager) g_db_manager->clear_all_stats();
                 LOGI("All resource statistics have been cleared.");
             }
-
         } else if (type.rfind("query.", 0) == 0) {
             json response_payload;
             std::string response_type;
 
             if (type == "query.get_resource_stats") {
+                // 【核心修复】查询资源统计
                 response_type = "resp.resource_stats";
                 auto configs = g_db_manager->get_all_app_configs();
                 response_payload = json::array();
@@ -96,7 +96,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
             } else if (type == "query.health_check") {
                 response_type = "resp.health_check";
                 long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                bool is_probe_alive = g_probe_connected.load() && (now - g_last_probe_timestamp) < 30000;
+                bool is_probe_alive = g_probe_connected.load() && (now - g_last_probe_timestamp.load()) < 30000;
                 response_payload = {
                     {"daemon_pid", getpid()},
                     {"is_probe_connected", is_probe_alive}
@@ -108,7 +108,6 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 for (const auto& cfg : configs) {
                     configs_json.push_back({
                         {"packageName", cfg.package_name},
-                        {"appName", ""},
                         {"policy", cfg.policy},
                         {"forcePlaybackExemption", cfg.force_playback_exempt},
                         {"forceNetworkExemption", cfg.force_network_exempt}
@@ -129,6 +128,14 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     });
                 }
                 response_payload = logs_json;
+            } else if (type == "query.get_settings") {
+                // 【核心修复】处理设置查询
+                 response_type = "resp.current_settings";
+                 response_payload = g_state_manager->get_current_settings_as_json();
+            } else if (type == "query.get_safety_net") {
+                // 【核心修复】处理安全网查询
+                response_type = "resp.safety_net";
+                response_payload = g_state_manager->get_safety_net_list();
             }
             
             if (!response_type.empty()) {
@@ -138,11 +145,9 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     {"req_id", msg.value("req_id", "")},
                     {"payload", response_payload}
                 };
-                LOGI("Sending response of type: %s", response_type.c_str());
                 g_server->send_message_to_client(client_fd, response_msg.dump());
             }
         }
-
     } catch (const json::parse_error& e) {
         LOGW("JSON parse error: %s for message: %s", e.what(), message_str.c_str());
     } catch (const std::exception& e) {
@@ -150,6 +155,7 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
     }
 }
 
+// ... signal_handler 和 worker_thread 保持不变 ...
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     if(g_db_manager) g_db_manager->log_event(LogEventType::DAEMON_SHUTDOWN, {{"message", "Cerberus daemon shutting down."}});
@@ -183,6 +189,7 @@ void worker_thread() {
     }
     LOGI("Worker thread finished.");
 }
+
 
 int main() {
     signal(SIGTERM, signal_handler);

@@ -16,8 +16,6 @@
 #include "process_monitor.h"
 #include "action_executor.h"
 
-class ActionExecutor;
-
 struct AppRuntimeState {
     std::string package_name;
     std::string app_name;
@@ -45,26 +43,27 @@ struct AppRuntimeState {
     long long last_tx_bytes = 0;
 };
 
-enum class DozeState {
-    ACTIVE,
-    IDLE,
-    DEEP_IDLE,
-};
+enum class DozeState { ACTIVE, IDLE, DEEP_IDLE };
 
 class StateManager {
 public:
-    StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
+    StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act);
 
+    // Settings
     void set_freezer_type(FreezerType type);
     void set_periodic_unfreeze_interval(int minutes);
+    nlohmann::json get_current_settings_as_json() const; // [新增]
 
+    // Event Handling
     void process_event_handler(ProcessEventType type, int pid, int ppid);
     void handle_probe_event(const nlohmann::json& event);
 
+    // Core Logic
     void tick();
     void update_all_resource_stats();
     nlohmann::json get_dashboard_payload();
 
+    // UI Interaction
     void update_app_config_from_ui(const AppConfig& new_config);
     const std::unordered_set<std::string>& get_safety_net_list() const;
 
@@ -72,14 +71,12 @@ private:
     void tick_app_states();
     void tick_doze_state();
     void tick_power_state();
-
     void handle_doze_event(const nlohmann::json& payload);
     void transition_doze_state(DozeState new_state, const std::string& reason);
     void enter_deep_doze_actions();
     void exit_deep_doze_actions();
     void start_doze_resource_snapshot();
     void generate_doze_exit_report();
-
     void initial_scan();
     void refresh_app_list_from_db();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -87,7 +84,6 @@ private:
     void remove_pid_from_app(int pid);
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     void check_and_update_foreground_status();
-    void check_system_events();
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
     bool is_critical_system_app(const std::string& package_name) const;
@@ -96,21 +92,25 @@ private:
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
 
-    std::mutex state_mutex_;
+    mutable std::mutex state_mutex_;
     GlobalStatsData global_stats_;
     std::optional<BatteryStats> battery_stats_;
     bool is_screen_on_ = true;
 
-    std::atomic<FreezerType> current_freezer_type_ = FreezerType::AUTO;
-    std::atomic<int> periodic_unfreeze_interval_min_ = 0;
+    // Settings State
+    std::atomic<FreezerType> current_freezer_type_{FreezerType::AUTO};
+    std::atomic<int> periodic_unfreeze_interval_min_{0};
 
+    // Doze State
     DozeState doze_state_ = DozeState::ACTIVE;
     std::chrono::steady_clock::time_point last_doze_state_change_time_;
     std::unordered_map<int, long long> doze_cpu_snapshot_;
 
+    // Power State
     std::chrono::steady_clock::time_point last_power_check_time_;
     int last_capacity_ = -1;
 
+    // App Management
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;

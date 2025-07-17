@@ -24,8 +24,6 @@ class UdsDashboardRepository(
         Log.i("UdsDashboardRepo", "UDS message flow is now active. Listening to shared UDS client...")
 
         // 【核心修复】不再需要调用 udsClient.start()，它在Application创建时已自动启动
-        // udsClient.start()
-
         udsClient.incomingMessages.collect { jsonLine ->
             try {
                 // 使用更健壮的解析方式

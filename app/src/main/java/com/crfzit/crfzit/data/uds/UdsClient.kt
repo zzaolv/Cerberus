@@ -25,11 +25,11 @@ class UdsClient private constructor(private val scope: CoroutineScope) {
         private const val SOCKET_NAME = "cerberus_socket"
         private const val RECONNECT_DELAY_MS = 5000L
 
-        // 【核心修复】使用 @Volatile 确保多线程可见性
+        // 使用 @Volatile 确保多线程可见性
         @Volatile
         private var INSTANCE: UdsClient? = null
 
-        // 【核心修复】提供获取单例的公共方法
+        // 提供获取单例的公共方法
         fun getInstance(scope: CoroutineScope): UdsClient {
             // 双重检查锁定，确保线程安全且高效
             return INSTANCE ?: synchronized(this) {
@@ -68,7 +68,7 @@ class UdsClient private constructor(private val scope: CoroutineScope) {
             }
         }
     }
-    
+
     fun sendMessage(message: String) {
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
@@ -77,6 +77,7 @@ class UdsClient private constructor(private val scope: CoroutineScope) {
                 return@launch
             }
             try {
+                // 确保消息以换行符结尾
                 stream.write((message + "\n").toByteArray(StandardCharsets.UTF_8))
                 stream.flush()
             } catch (e: IOException) {
@@ -86,13 +87,12 @@ class UdsClient private constructor(private val scope: CoroutineScope) {
         }
     }
 
-
     private suspend fun listenForMessages() {
         val currentSocket = socket ?: return
         try {
             currentSocket.inputStream.bufferedReader(StandardCharsets.UTF_8).use { reader ->
                 while (currentSocket.isConnected && scope.isActive) {
-                    val line = reader.readLine() ?: break
+                    val line = reader.readLine() ?: break // Connection closed
                     if (line.isNotBlank()) {
                         _incomingMessages.emit(line)
                     }
@@ -106,13 +106,6 @@ class UdsClient private constructor(private val scope: CoroutineScope) {
             Log.i(TAG, "Socket read loop finished or connection lost.")
             cleanupSocket()
         }
-    }
-
-    private fun stop() {
-        connectionJob?.cancel()
-        connectionJob = null
-        cleanupSocket()
-        Log.i(TAG, "UDS client stopped.")
     }
 
     private fun cleanupSocket() {
