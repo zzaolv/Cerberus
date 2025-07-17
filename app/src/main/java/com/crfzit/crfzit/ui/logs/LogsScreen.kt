@@ -24,6 +24,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -46,8 +47,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
 
-
-// 【新增】ResourceStatsViewModel 用于资源统计页面
+// ... ResourceStatsViewModel class remains the same ...
 class ResourceStatsViewModel(application: Application) : AndroidViewModel(application) {
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val appScope = (application as CerberusApplication).applicationScope
@@ -69,7 +69,7 @@ class ResourceStatsViewModel(application: Application) : AndroidViewModel(applic
 
     init {
         viewModelScope.launch {
-            appInfoRepository.loadAllInstalledApps(forceRefresh = true)
+            appInfoRepository.loadAllInstalledApps(forceRefresh = true) // Always get fresh app list
             observeStatsResponse()
             requestStats()
         }
@@ -113,9 +113,10 @@ class ResourceStatsViewModel(application: Application) : AndroidViewModel(applic
 }
 
 
-// 【新增】统一的 ViewModelFactory
+// 【核心修复】为工厂类的 create 函数添加 @Suppress("UNCHECKED_CAST") 注解
 class LogsViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
-    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return when {
             modelClass.isAssignableFrom(LogsViewModel::class.java) -> LogsViewModel(application) as T
             modelClass.isAssignableFrom(ResourceStatsViewModel::class.java) -> ResourceStatsViewModel(application) as T
@@ -158,6 +159,7 @@ fun LogsScreen(
     }
 }
 
+// ... the rest of LogsScreen.kt remains unchanged ...
 @Composable
 fun EventTimeline(state: LogsUiState, onLoadMore: () -> Unit) {
     val listState = rememberLazyListState()
@@ -186,11 +188,13 @@ fun EventTimeline(state: LogsUiState, onLoadMore: () -> Unit) {
             LazyColumn(
                 state = listState,
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                reverseLayout = false
             ) {
                 items(state.logs, key = { it.timestamp.toString() + it.payload.toString() }) { log ->
                     LogItem(log)
                 }
+
                 if (state.isLoading && state.logs.isNotEmpty()) {
                     item {
                         Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.Center) {
@@ -203,7 +207,6 @@ fun EventTimeline(state: LogsUiState, onLoadMore: () -> Unit) {
     }
 }
 
-// 【核心重构】LogItem现在处理多行和缩进
 @Composable
 fun LogItem(log: LogEntry) {
     val content = buildLogContent(log = log)
@@ -215,20 +218,18 @@ fun LogItem(log: LogEntry) {
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
-        // 渲染缩进的子项
         content.second?.forEach { subItem ->
             Text(
                 text = subItem,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
-                modifier = Modifier.padding(start = 8.dp) // 缩进
+                modifier = Modifier.padding(start = 8.dp)
             )
         }
     }
 }
 
-// 【核心重构】日志内容构建函数，完全根据您的格式要求实现
 @Composable
 private fun buildLogContent(log: LogEntry): Pair<AnnotatedString, List<AnnotatedString>?> {
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
@@ -236,8 +237,6 @@ private fun buildLogContent(log: LogEntry): Pair<AnnotatedString, List<Annotated
     var subItems: MutableList<AnnotatedString>? = null
 
     val payload = log.payload
-
-    // 安全地从 payload 获取值
     val appName = payload["app_name"] as? String
     val pidCount = (payload["pid_count"] as? Double)?.toInt()
     val sessionDuration = (payload["session_duration_s"] as? Double)?.toLong()
@@ -366,7 +365,6 @@ fun formatDuration(totalSeconds: Long): String {
     }
 }
 
-// 【资源统计页面】
 @Composable
 fun ResourceStatistics(
     viewModel: ResourceStatsViewModel = viewModel(factory = LogsViewModelFactory(LocalContext.current.applicationContext as Application))
