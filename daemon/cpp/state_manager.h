@@ -10,6 +10,7 @@
 #include <mutex>
 #include <chrono>
 #include <unordered_set>
+#include <unordered_map>
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "process_monitor.h"
@@ -30,7 +31,6 @@ struct AppRuntimeState {
     } current_status = Status::STOPPED;
 
     std::chrono::steady_clock::time_point last_state_change_time;
-    // 【新增】会话开始时间点
     std::chrono::steady_clock::time_point active_session_start_time;
     
     float cpu_usage_percent = 0.0f;
@@ -39,8 +39,17 @@ struct AppRuntimeState {
 
     bool has_notification = false;
     bool has_network_activity = false;
+    bool is_network_blocked = false; // [新增]
     long long last_rx_bytes = 0;
     long long last_tx_bytes = 0;
+};
+
+// [新增] Doze状态机
+enum class DozeState {
+    ACTIVE,         // 设备活动
+    IDLE_PENDING,   // 等待进入IDLE
+    IDLE,           // 轻度Doze
+    DEEP_IDLE,      // 深度Doze
 };
 
 class StateManager {
@@ -48,18 +57,30 @@ public:
     StateManager(std::shared_ptr<DatabaseManager> db_manager, std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<ActionExecutor> action_executor);
 
     void process_event_handler(ProcessEventType type, int pid, int ppid);
-    
     void handle_probe_event(const nlohmann::json& event);
 
-    void tick(); 
+    void tick(); // 主循环，现在分为多个子任务
     void update_all_resource_stats();
     nlohmann::json get_dashboard_payload();
 
     void update_app_config_from_ui(const AppConfig& new_config);
-
     const std::unordered_set<std::string>& get_safety_net_list() const;
 
 private:
+    // Tick 分解
+    void tick_app_states();
+    void tick_doze_state();
+    void tick_power_state();
+
+    // Doze 相关
+    void handle_doze_event(const nlohmann::json& payload);
+    void transition_doze_state(DozeState new_state, const std::string& reason);
+    void enter_deep_doze_actions();
+    void exit_deep_doze_actions();
+    void start_doze_resource_snapshot();
+    void generate_doze_exit_report();
+
+    // 状态管理
     void initial_scan();
     void refresh_app_list_from_db();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -68,10 +89,8 @@ private:
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     void check_and_update_foreground_status();
     void check_system_events();
-
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
-    
     bool is_critical_system_app(const std::string& package_name) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -80,13 +99,21 @@ private:
 
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
+    std::optional<BatteryStats> battery_stats_; // [新增]
     bool is_screen_on_ = true;
+
+    // [新增] Doze状态机相关
+    DozeState doze_state_ = DozeState::ACTIVE;
+    std::chrono::steady_clock::time_point last_doze_state_change_time_;
+    std::unordered_map<int, long long> doze_cpu_snapshot_; // PID -> Jiffies
+
+    // [新增] 电源监控相关
+    std::chrono::steady_clock::time_point last_power_check_time_;
+    int last_capacity_ = -1;
 
     using AppInstanceKey = std::pair<std::string, int>;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
-    
     std::map<int, AppRuntimeState*> pid_to_app_map_;
-    
     std::unordered_set<std::string> critical_system_apps_;
 };
 

@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
+#include <vector>
 
 #define LOG_TAG "cerberusd_state"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -19,6 +20,9 @@ using json = nlohmann::json;
 
 constexpr int PER_USER_RANGE = 100000;
 constexpr long long NETWORK_ACTIVITY_THRESHOLD_BPS = 2 * 1024; // 2 KB/s
+constexpr int POWER_CHECK_INTERVAL_SECONDS = 60;
+constexpr int IDLE_TIMEOUT_SECONDS = 30 * 60; // 30分钟进入深度Doze
+constexpr int AWAIT_FREEZE_SECONDS = 5;
 
 static std::string status_to_string_local(AppRuntimeState::Status status) {
     switch (status) {
@@ -36,6 +40,7 @@ static std::string status_to_string_local(AppRuntimeState::Status status) {
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
     LOGI("StateManager (Defense-in-Depth) Initializing...");
+    
     
     critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -381,7 +386,10 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     
     refresh_app_list_from_db();
     initial_scan();
-    db_manager_->log_event(LogEventType::DAEMON_START, {{"message", "Cerberus daemon started"}});
+    last_power_check_time_ = std::chrono::steady_clock::now();
+    last_doze_state_change_time_ = std::chrono::steady_clock::now();
+
+    db_manager_->log_event(LogEventType::DAEMON_START, {{"message", "Cerberus daemon started with Doze/Power management"}});
     LOGI("StateManager Initialized.");
 }
 
@@ -391,20 +399,38 @@ const std::unordered_set<std::string>& StateManager::get_safety_net_list() const
 
 void StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    auto now = std::chrono::steady_clock::now();
-
     check_and_update_foreground_status();
-    check_system_events();
+    tick_app_states();
+    tick_doze_state();
+    tick_power_state();
+}
 
+void StateManager::tick_app_states() {
+    auto now = std::chrono::steady_clock::now();
     for (auto& [key, app] : managed_apps_) {
-        if (app.pids.empty() || app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
-            if (is_critical_system_app(app.package_name) && app.current_status != AppRuntimeState::Status::EXEMPTED) {
-                 transition_state(app, AppRuntimeState::Status::EXEMPTED, "Hard Safety Net");
+        if (app.pids.empty()) {
+            if (app.current_status != AppRuntimeState::Status::STOPPED) {
+                transition_state(app, AppRuntimeState::Status::STOPPED, "All processes exited");
             }
             continue;
         }
 
-        if (!is_screen_on_) { // 只有熄屏才执行冻结逻辑
+        if (app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
+            if (app.is_network_blocked) {
+                action_executor_->unblock_network(app.uid);
+                app.is_network_blocked = false;
+            }
+            if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                action_executor_->unfreeze_pids(app.pids);
+            }
+            if (app.current_status != AppRuntimeState::Status::EXEMPTED) {
+                 transition_state(app, AppRuntimeState::Status::EXEMPTED, "Safety Net or Exempted Policy");
+            }
+            continue;
+        }
+
+        // 仅当设备不处于深度休眠时，才执行常规的后台超时冻结逻辑
+        if (doze_state_ != DozeState::DEEP_IDLE && !is_screen_on_) {
             if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
                 if (elapsed > 30) { // TODO: 使用策略配置的超时
@@ -412,12 +438,78 @@ void StateManager::tick() {
                 }
             } else if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
                  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                if (elapsed > 5) { 
+                if (elapsed > AWAIT_FREEZE_SECONDS) { 
                     transition_state(app, AppRuntimeState::Status::FROZEN, "Awaiting period ended");
                 }
             }
         }
     }
+}
+
+void StateManager::tick_doze_state() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_doze_state_change_time_).count();
+
+    bool is_charging = battery_stats_ && (battery_stats_->status.find("Charging") != std::string::npos || battery_stats_->status.find("Full") != std::string::npos);
+
+    if (is_screen_on_ || is_charging) {
+        if (doze_state_ != DozeState::ACTIVE) {
+            transition_doze_state(DozeState::ACTIVE, is_screen_on_ ? "Screen on" : "Charging");
+        }
+        return;
+    }
+
+    // 熄屏且未充电
+    if (doze_state_ == DozeState::ACTIVE) {
+        transition_doze_state(DozeState::IDLE, "Screen off and not charging");
+    } else if (doze_state_ == DozeState::IDLE) {
+        if (elapsed > IDLE_TIMEOUT_SECONDS) {
+            transition_doze_state(DozeState::DEEP_IDLE, "Idle timeout reached");
+        }
+    }
+}
+
+void StateManager::tick_power_state() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_power_check_time_).count();
+
+    if (elapsed < POWER_CHECK_INTERVAL_SECONDS) {
+        return;
+    }
+    
+    battery_stats_ = sys_monitor_->get_battery_stats();
+    if (!battery_stats_) {
+        LOGW("Failed to get battery stats in tick.");
+        return;
+    }
+
+    json payload = {
+        {"capacity", battery_stats_->capacity},
+        {"temperature", static_cast<float>(battery_stats_->temp_deci_celsius) / 10.0f},
+        {"power_watt", battery_stats_->power_watt}
+    };
+
+    int current_capacity = battery_stats_->capacity;
+
+    if (last_capacity_ != -1 && last_capacity_ > current_capacity) {
+        int capacity_drop = last_capacity_ - current_capacity;
+        int duration_min = static_cast<int>(elapsed / 60);
+        if (duration_min == 0) duration_min = 1; // 避免除零
+
+        payload["consumption_percent"] = capacity_drop;
+        payload["consumption_duration_min"] = duration_min;
+        
+        if (elapsed <= 65 && capacity_drop >= 1) { // 1分钟左右掉电1%或以上
+             db_manager_->log_event(LogEventType::POWER_WARNING, payload);
+        } else {
+             db_manager_->log_event(LogEventType::POWER_UPDATE, payload);
+        }
+    } else {
+        db_manager_->log_event(LogEventType::POWER_UPDATE, payload);
+    }
+
+    last_capacity_ = current_capacity;
+    last_power_check_time_ = now;
 }
 
 void StateManager::handle_probe_event(const nlohmann::json& event) {
@@ -426,16 +518,14 @@ void StateManager::handle_probe_event(const nlohmann::json& event) {
         std::string type = event.value("type", "");
         const auto& payload = event["payload"];
         
+        if (type == "event.doze_state_changed") {
+            handle_doze_event(payload);
+            return;
+        }
+
         if (type == "event.screen_on") {
             is_screen_on_ = true;
             db_manager_->log_event(LogEventType::SCREEN_ON, {});
-            for(auto& [key, a] : managed_apps_) {
-                if(a.current_status == AppRuntimeState::Status::FROZEN) {
-                    if (action_executor_->unfreeze_pids(a.pids)) {
-                        transition_state(a, AppRuntimeState::Status::BACKGROUND_IDLE, "Screen ON unfreeze");
-                    }
-                }
-            }
             return;
         } else if (type == "event.screen_off") {
             is_screen_on_ = false;
@@ -464,35 +554,147 @@ void StateManager::handle_probe_event(const nlohmann::json& event) {
     }
 }
 
-void StateManager::check_system_events() {
+void StateManager::handle_doze_event(const nlohmann::json& payload) {
+    std::string state_name = payload.value("state", "");
+    std::string reason = "Probe event: " + state_name;
+    
+    db_manager_->log_event(LogEventType::DOZE_STATE_CHANGE, {
+        {"status", state_name},
+        {"debug_info", payload.value("debug", "")}
+    });
+
+    if (state_name == "IDLE" && doze_state_ != DozeState::DEEP_IDLE) {
+        transition_doze_state(DozeState::IDLE, reason);
+    } else if (state_name == "FINISH" || state_name == "ACTIVE") {
+        transition_doze_state(DozeState::ACTIVE, reason);
+    }
+}
+
+void StateManager::transition_doze_state(DozeState new_state, const std::string& reason) {
+    if (doze_state_ == new_state) return;
+
+    DozeState old_state = doze_state_;
+    doze_state_ = new_state;
+    last_doze_state_change_time_ = std::chrono::steady_clock::now();
+    
+    if (old_state == DozeState::DEEP_IDLE && new_state != DozeState::DEEP_IDLE) {
+        exit_deep_doze_actions();
+    }
+    if (new_state == DozeState::DEEP_IDLE) {
+        enter_deep_doze_actions();
+    }
+
+    LOGI("Doze state transition: %d -> %d. Reason: %s", static_cast<int>(old_state), static_cast<int>(new_state), reason.c_str());
+}
+
+void StateManager::enter_deep_doze_actions() {
+    LOGI("Entering DEEP_IDLE state. Applying aggressive optimizations.");
+    db_manager_->log_event(LogEventType::DOZE_STATE_CHANGE, {{"status", "深度模式"}, {"debug_info", "系统已进入深度Doze"}});
+    
+    start_doze_resource_snapshot();
+
+    json batch_payload;
+    batch_payload["title"] = "以下为进入深度Doze后的集中处理:";
+    json actions = json::array();
+
     for (auto& [key, app] : managed_apps_) {
-        if (app.uid == -1 || app.pids.empty() || app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
-            app.has_network_activity = false;
+        if (app.pids.empty() || app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name)) {
             continue;
         }
 
-        AppNetworkStats net_stats = sys_monitor_->get_app_network_stats(app.uid);
-        long long total_bytes = net_stats.rx_bytes + net_stats.tx_bytes;
-        long long last_total_bytes = app.last_rx_bytes + app.last_tx_bytes;
-
-        if (last_total_bytes > 0 && total_bytes > last_total_bytes) {
-            long long delta_bytes = total_bytes - last_total_bytes;
-            if (delta_bytes > NETWORK_ACTIVITY_THRESHOLD_BPS) {
-                app.has_network_activity = true;
-                if(app.current_status == AppRuntimeState::Status::FROZEN) {
-                    if (action_executor_->unfreeze_pids(app.pids)) {
-                        transition_state(app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "High network activity");
-                    }
-                } else if(app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE || app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
-                    transition_state(app, AppRuntimeState::Status::BACKGROUND_ACTIVE, "High network activity");
-                }
-            } else {
-                app.has_network_activity = false;
-            }
+        if (action_executor_->block_network(app.uid)) {
+            app.is_network_blocked = true;
+            actions.push_back({
+                {"type", "network_block"},
+                {"app_name", app.app_name}
+            });
         }
-        app.last_rx_bytes = net_stats.rx_bytes;
-        app.last_tx_bytes = net_stats.tx_bytes;
+        
+        if (app.current_status != AppRuntimeState::Status::FROZEN) {
+            transition_state(app, AppRuntimeState::Status::FROZEN, "Deep Doze");
+            actions.push_back({
+                {"type", "freeze"},
+                {"app_name", app.app_name},
+                {"pid_count", app.pids.size()}
+            });
+        }
     }
+    batch_payload["actions"] = actions;
+    db_manager_->log_event(LogEventType::BATCH_OPERATION_START, batch_payload);
+}
+
+void StateManager::exit_deep_doze_actions() {
+    LOGI("Exiting DEEP_IDLE state. Reverting optimizations.");
+    
+    generate_doze_exit_report();
+
+    for (auto& [key, app] : managed_apps_) {
+        if (app.is_network_blocked) {
+            action_executor_->unblock_network(app.uid);
+            app.is_network_blocked = false;
+        }
+
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            // Unfreezing is handled in transition_state
+            transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "Exiting Deep Doze");
+        }
+    }
+}
+
+void StateManager::start_doze_resource_snapshot() {
+    doze_cpu_snapshot_.clear();
+    for (const auto& [pid, app_ptr] : pid_to_app_map_) {
+        if(app_ptr == nullptr || app_ptr->pids.empty()) continue;
+        doze_cpu_snapshot_[pid] = sys_monitor_->get_app_stats(pid, "", 0).cpu_time_jiffies;
+    }
+    LOGI("Took resource snapshot for %zu processes at Doze entry.", doze_cpu_snapshot_.size());
+}
+
+void StateManager::generate_doze_exit_report() {
+    if (doze_cpu_snapshot_.empty()) return;
+
+    std::map<std::string, long long> app_cpu_delta;
+    long jiffy_hz = sysconf(_SC_CLK_TCK);
+
+    for (const auto& [pid, app_ptr] : pid_to_app_map_) {
+         if (app_ptr == nullptr || app_ptr->pids.empty()) continue;
+         
+         auto it = doze_cpu_snapshot_.find(pid);
+         if (it != doze_cpu_snapshot_.end()) {
+             long long start_jiffies = it->second;
+             long long end_jiffies = sys_monitor_->get_app_stats(pid, "", 0).cpu_time_jiffies;
+             if (end_jiffies > start_jiffies) {
+                 app_cpu_delta[app_ptr->app_name] += (end_jiffies - start_jiffies);
+             }
+         }
+    }
+
+    if (app_cpu_delta.empty()) return;
+
+    std::vector<std::pair<std::string, long long>> sorted_apps(app_cpu_delta.begin(), app_cpu_delta.end());
+    std::sort(sorted_apps.begin(), sorted_apps.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    
+    json report_payload;
+    report_payload["title"] = "Doze期间应用的CPU活跃时间:";
+    json entries = json::array();
+    for (const auto& pair : sorted_apps) {
+        float active_time_sec = static_cast<float>(pair.second) / jiffy_hz;
+        if (active_time_sec > 0.1) {
+             entries.push_back({
+                {"app_name", pair.first},
+                {"active_time_sec", active_time_sec}
+            });
+        }
+    }
+    
+    if (!entries.empty()) {
+        report_payload["entries"] = entries;
+        db_manager_->log_event(LogEventType::DOZE_RESOURCE_REPORT, report_payload);
+    }
+    
+    doze_cpu_snapshot_.clear();
 }
 
 void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) {
@@ -511,7 +713,6 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
     };
     
     LogEventType event_type = LogEventType::GENERIC_INFO;
-
     bool is_session_active = (old_status == AppRuntimeState::Status::FOREGROUND || old_status == AppRuntimeState::Status::BACKGROUND_ACTIVE || old_status == AppRuntimeState::Status::BACKGROUND_IDLE);
 
     if (new_status == AppRuntimeState::Status::FROZEN || new_status == AppRuntimeState::Status::STOPPED) {
@@ -554,7 +755,6 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
         if (action_executor_->freeze_pids(app.pids)) {
             db_manager_->log_event(event_type, log_payload);
         } else {
-            LOGE("Freeze failed for %s, state transition aborted.", app.package_name.c_str());
             db_manager_->log_event(LogEventType::GENERIC_ERROR, {{"message", "Freeze failed for " + app.package_name}});
             return;
         }
@@ -572,19 +772,65 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
          }
     }
 
-    LOGI("State transition for %s (user %d): %s -> %s", app.package_name.c_str(), app.user_id, old_status_str.c_str(), new_status_str.c_str());
+    LOGI("State transition for %s (user %d): %s -> %s. Reason: %s", app.package_name.c_str(), app.user_id, old_status_str.c_str(), new_status_str.c_str(), reason.c_str());
     app.current_status = new_status;
     app.last_state_change_time = now;
 }
 
-bool StateManager::is_critical_system_app(const std::string& package_name) const {
-    if (package_name.rfind("com.miui.", 0) == 0 || package_name.rfind("com.huawei.android.", 0) == 0 ||
-        package_name.rfind("com.oppo.", 0) == 0 || package_name.rfind("com.vivo.", 0) == 0 ||
-        package_name.rfind("com.oneplus.", 0) == 0 || package_name.rfind("com.google.android.", 0) == 0 ||
-        package_name.rfind("com.android.", 0) == 0) {
-        return true;
+nlohmann::json StateManager::get_dashboard_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    json payload;
+    
+    json global_stats_json = {
+        {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent},
+        {"total_mem_kb", global_stats_.total_mem_kb},
+        {"avail_mem_kb", global_stats_.avail_mem_kb},
+        {"swap_total_kb", global_stats_.swap_total_kb},
+        {"swap_free_kb", global_stats_.swap_free_kb}
+    };
+
+    if(battery_stats_){
+        global_stats_json["battery_capacity"] = battery_stats_->capacity;
+        global_stats_json["battery_temp"] = static_cast<float>(battery_stats_->temp_deci_celsius) / 10.0f;
     }
-    return critical_system_apps_.count(package_name) > 0;
+
+    std::string profile_name = "⚡️ 省电模式";
+    if(doze_state_ == DozeState::DEEP_IDLE) profile_name = "🌙 深度休眠";
+    else if(is_screen_on_) profile_name = " balanced";
+    
+    global_stats_json["active_profile_name"] = profile_name;
+
+    payload["global_stats"] = global_stats_json;
+
+    json apps_state = json::array();
+    for (const auto& [key, app] : managed_apps_) {
+        if (!app.pids.empty() || app.current_status != AppRuntimeState::Status::STOPPED) { 
+            json app_json;
+            app_json["package_name"] = app.package_name;
+            app_json["app_name"] = app.app_name;
+            app_json["user_id"] = app.user_id;
+            app_json["display_status"] = status_to_string_local(app.current_status);
+            app_json["mem_usage_kb"] = app.mem_usage_kb;
+            app_json["swap_usage_kb"] = app.swap_usage_kb;
+            app_json["cpu_usage_percent"] = app.cpu_usage_percent;
+            app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name));
+            app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
+            app_json["hasPlayback"] = false;
+            app_json["hasNotification"] = app.has_notification;
+            app_json["hasNetworkActivity"] = app.has_network_activity;
+            
+            int pending_sec = 0;
+            if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - app.last_state_change_time).count();
+                pending_sec = AWAIT_FREEZE_SECONDS - elapsed > 0 ? AWAIT_FREEZE_SECONDS - elapsed : 0;
+            }
+            app_json["pendingFreezeSec"] = pending_sec;
+            
+            apps_state.push_back(app_json);
+        }
+    }
+    payload["apps_runtime_state"] = apps_state;
+    return payload;
 }
 
 void StateManager::update_app_config_from_ui(const AppConfig& new_config) {
@@ -644,48 +890,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     return &result.first->second;
 }
 
-nlohmann::json StateManager::get_dashboard_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    json payload;
-    payload["global_stats"] = {
-        {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent},
-        {"total_mem_kb", global_stats_.total_mem_kb},
-        {"avail_mem_kb", global_stats_.avail_mem_kb},
-        {"swap_total_kb", global_stats_.swap_total_kb},
-        {"swap_free_kb", global_stats_.swap_free_kb},
-        {"active_profile_name", "⚡️ 省电模式"}
-    };
-    json apps_state = json::array();
-    for (const auto& [key, app] : managed_apps_) {
-        if (!app.pids.empty() || app.current_status != AppRuntimeState::Status::STOPPED) { 
-            json app_json;
-            app_json["package_name"] = app.package_name;
-            app_json["app_name"] = app.app_name;
-            app_json["user_id"] = app.user_id;
-            app_json["display_status"] = status_to_string_local(app.current_status);
-            app_json["mem_usage_kb"] = app.mem_usage_kb;
-            app_json["swap_usage_kb"] = app.swap_usage_kb;
-            app_json["cpu_usage_percent"] = app.cpu_usage_percent;
-            app_json["is_whitelisted"] = (app.config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app.package_name));
-            app_json["is_foreground"] = (app.current_status == AppRuntimeState::Status::FOREGROUND);
-            app_json["hasPlayback"] = false;
-            app_json["hasNotification"] = app.has_notification;
-            app_json["hasNetworkActivity"] = app.has_network_activity;
-            
-            int pending_sec = 0;
-            if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - app.last_state_change_time).count();
-                pending_sec = 5 - elapsed > 0 ? 5 - elapsed : 0;
-            }
-            app_json["pendingFreezeSec"] = pending_sec;
-            
-            apps_state.push_back(app_json);
-        }
-    }
-    payload["apps_runtime_state"] = apps_state;
-    return payload;
-}
-
 void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) {
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
@@ -695,10 +899,9 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
         std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
         std::ifstream stat_file(stat_path);
         if (stat_file.is_open()) {
-            std::string temp;
-            stat_file >> temp;
-            stat_file >> temp;
-            app->app_name = temp.substr(1, temp.length() - 2);
+            std::string temp, name;
+            stat_file >> temp >> name;
+            app->app_name = name.substr(1, name.length() - 2);
         }
     }
 
@@ -725,15 +928,14 @@ void StateManager::remove_pid_from_app(int pid) {
     AppRuntimeState* app = it->second;
     pid_to_app_map_.erase(it);
 
-    auto& pids = app->pids;
-    auto pid_it = std::remove(pids.begin(), pids.end(), pid);
-    pids.erase(pid_it, pids.end());
+    if (app) {
+        auto& pids = app->pids;
+        auto pid_it = std::remove(pids.begin(), pids.end(), pid);
+        pids.erase(pid_it, pids.end());
 
-    if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
-        transition_state(*app, AppRuntimeState::Status::STOPPED, "All processes exited");
-        app->mem_usage_kb = 0;
-        app->swap_usage_kb = 0;
-        app->cpu_usage_percent = 0.0f;
+        if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
+            transition_state(*app, AppRuntimeState::Status::STOPPED, "All processes exited");
+        }
     }
 }
 
@@ -859,4 +1061,12 @@ void StateManager::update_all_resource_stats() {
         app.swap_usage_kb = total_stats.swap_usage_kb;
         app.cpu_usage_percent = total_stats.cpu_usage_percent;
     }
+}
+
+bool StateManager::is_critical_system_app(const std::string& package_name) const {
+    if (package_name.rfind("com.miui.", 0) == 0 ||
+        package_name.rfind("com.android.", 0) == 0) {
+        return true;
+    }
+    return critical_system_apps_.count(package_name) > 0;
 }

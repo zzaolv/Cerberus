@@ -6,6 +6,7 @@
 #include <mutex>
 #include <map>
 #include <chrono>
+#include <optional>
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -15,10 +16,22 @@ struct GlobalStatsData {
     long swap_free_kb = 0;
 };
 
+// [新增] 电池状态结构体
+struct BatteryStats {
+    int capacity = -1; // 电量百分比
+    int temp_deci_celsius = -1; // 温度 (摄氏度 * 10)
+    long voltage_uv = -1; // 电压 (微伏)
+    long current_ua = 0;  // 电流 (微安), 负值表示放电
+    std::string status;   // "Charging", "Discharging", "Full", etc.
+    float power_watt = 0.0f; // 功率 (瓦)
+};
+
 struct AppStatsData {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
+    // [新增] CPU时间(jiffies)，用于Doze统计
+    long long cpu_time_jiffies = 0;
 };
 
 struct AppNetworkStats {
@@ -40,8 +53,10 @@ public:
     void update_global_stats();
     GlobalStatsData get_global_stats() const;
 
+    // [新增] 获取电池状态
+    std::optional<BatteryStats> get_battery_stats();
+
     AppStatsData get_app_stats(int pid, const std::string& package_name, int user_id);
-    
     AppNetworkStats get_app_network_stats(int uid);
 
 private:

@@ -1,7 +1,6 @@
 // app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
-import android.app.Notification
 import android.content.ComponentName
 import android.content.pm.ApplicationInfo
 import android.os.Process
@@ -19,10 +18,7 @@ import java.lang.reflect.Method
 
 class ProbeHook : IXposedHookLoadPackage {
 
-    // 【核心修复】ProbeHook 自身也需要一个独立的、与 system_server 同生命周期的 CoroutineScope
     private val probeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    // 【核心修复】通过 getInstance() 获取全局单例
     private val udsClient = UdsClient.getInstance(probeScope)
     private val gson = Gson()
 
@@ -36,14 +32,51 @@ class ProbeHook : IXposedHookLoadPackage {
             return
         }
 
-        // 【核心修复】不再需要调用 udsClient.start()
-        // 它在被 getInstance() 首次调用时就会自动启动
-
-        XposedBridge.log("$TAG: Attached to system_server (PID: ${Process.myPid()}). UDS Client is managed globally.")
+        XposedBridge.log("$TAG: Attached to system_server (PID: ${Process.myPid()}).")
 
         hookActivityManagerService(lpparam.classLoader)
         hookPowerManagerService(lpparam.classLoader)
         hookNotificationManagerService(lpparam.classLoader)
+        // [新增] Hook Doze控制器
+        hookDeviceIdleController(lpparam.classLoader)
+    }
+
+    // [新增] Hook DeviceIdleController 以监控Doze状态
+    private fun hookDeviceIdleController(classLoader: ClassLoader) {
+        try {
+            val dicClass = XposedHelpers.findClass("com.android.server.DeviceIdleController", classLoader)
+            
+            // 这个方法是Doze状态机变化的核心
+            XposedHelpers.findAndHookMethod(dicClass, "becomeActiveLocked", String::class.java, Int::class.java, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val reason = param.args[0] as String
+                    XposedBridge.log("$TAG: Device becoming active, reason: $reason")
+                    sendEventToDaemon("event.doze_state_changed", mapOf(
+                        "state" to "ACTIVE",
+                        "debug" to "becomeActiveLocked, reason: $reason"
+                    ))
+                }
+            })
+
+            // 这个方法是进入各种IDLE状态的核心
+            XposedHelpers.findAndHookMethod(dicClass, "stepIdleStateLocked", String::class.java, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val mStateField = XposedHelpers.getObjectField(param.thisObject, "mState")
+                    val stateName = mStateField.toString() // enum.name()
+                    val reason = param.args[0] as String
+                     XposedBridge.log("$TAG: DeviceIdle step to state: $stateName, reason: $reason")
+                    sendEventToDaemon("event.doze_state_changed", mapOf(
+                        "state" to stateName,
+                        "debug" to "stepIdleStateLocked, reason: $reason"
+                    ))
+                }
+            })
+
+            XposedBridge.log("$TAG: Successfully hooked DeviceIdleController.")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: Failed to hook DeviceIdleController: ${t.message}")
+            XposedBridge.log(t)
+        }
     }
 
     private fun hookPowerManagerService(classLoader: ClassLoader) {

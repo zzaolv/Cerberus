@@ -9,19 +9,25 @@ class ActionExecutor {
 public:
     ActionExecutor();
 
-    // 【根本性重构】接口变更：不再使用包名，而是使用精准的PID列表
     bool freeze_pids(const std::vector<int>& pids);
     bool unfreeze_pids(const std::vector<int>& pids);
+
+    // [新增] 网络控制接口
+    bool block_network(int uid);
+    bool unblock_network(int uid);
+    void initialize_network_chains();
 
 private:
     enum class CgroupVersion { V1, V2, UNKNOWN };
     
-    // 【新增】初始化我们的专属cgroup
     void create_frozen_cgroup_if_needed();
     bool add_pids_to_frozen_cgroup(const std::vector<int>& pids);
 
     bool write_to_file(const std::string& path, const std::string& value);
     bool write_pids_to_file(const std::string& path, const std::vector<int>& pids);
+    
+    // [新增] 执行shell命令的辅助函数
+    bool execute_shell_command(const std::string& command);
 
     CgroupVersion cgroup_version_ = CgroupVersion::UNKNOWN;
     std::string frozen_cgroup_path_;

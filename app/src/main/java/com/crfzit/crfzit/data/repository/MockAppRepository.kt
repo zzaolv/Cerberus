@@ -3,14 +3,13 @@ package com.crfzit.crfzit.data.repository
 
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.LogEntry
-import com.crfzit.crfzit.data.model.LogLevel
+import com.crfzit.crfzit.data.model.LogEventType // 【修复】导入新的 LogEventType
 import com.crfzit.crfzit.data.model.Policy
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
 class MockAppRepository {
-    // 【修改】修正所有 AppInfo 的实例化
     private val mockApps = mutableListOf(
         AppInfo("com.tencent.mm", "微信", Policy.IMPORTANT),
         AppInfo("com.eg.android.AlipayGphone", "支付宝", Policy.IMPORTANT),
@@ -35,14 +34,60 @@ class MockAppRepository {
         }
     }
 
+    // 【核心修复】完全重写此函数以使用新的结构化日志模型
     fun getLogsStream(): Flow<List<LogEntry>> = flow {
+        val now = System.currentTimeMillis()
         val logs = listOf(
-            LogEntry(System.currentTimeMillis() - 1000, LogLevel.EVENT, "屏幕已关闭，进入后台计时。", null),
-            LogEntry(System.currentTimeMillis() - 5000, LogLevel.SUCCESS, "已将 [拼多多] 置于cgroup冻结状态 (原因: 后台超时)", "拼多多"),
-            LogEntry(System.currentTimeMillis() - 15000, LogLevel.INFO, "为 [微信] 解除冻结 (原因: 收到高优先级推送)", "微信"),
-            LogEntry(System.currentTimeMillis() - 25000, LogLevel.WARNING, "SELinux 策略加载成功，有 1 条未使用规则。", null),
-            LogEntry(System.currentTimeMillis() - 35000, LogLevel.ERROR, "连接探针失败，请检查 LSPosed 模块是否激活。", null),
-            LogEntry(System.currentTimeMillis() - 45000, LogLevel.EVENT, "守护进程启动成功 (PID: 12345)", null)
+            LogEntry(
+                now - 1000,
+                LogEventType.SCREEN_OFF,
+                mapOf("message" to "屏幕已关闭，进入后台计时。")
+            ),
+            LogEntry(
+                now - 5000,
+                LogEventType.APP_FROZEN,
+                mapOf(
+                    "app_name" to "拼多多",
+                    "package_name" to "com.xunmeng.pinduoduo",
+                    "reason" to "后台超时",
+                    "pid_count" to 2,
+                    "session_duration_s" to 180,
+                    "cumulative_duration_s" to 3600
+                )
+            ),
+            LogEntry(
+                now - 15000,
+                LogEventType.APP_UNFROZEN,
+                mapOf(
+                    "app_name" to "微信",
+                    "package_name" to "com.tencent.mm",
+                    "reason" to "收到高优先级推送"
+                )
+            ),
+            LogEntry(
+                now - 25000,
+                LogEventType.GENERIC_WARNING,
+                mapOf("message" to "SELinux 策略加载成功，有 1 条未使用规则。")
+            ),
+            LogEntry(
+                now - 35000,
+                LogEventType.GENERIC_ERROR,
+                mapOf("message" to "连接探针失败，请检查 LSPosed 模块是否激活。")
+            ),
+            LogEntry(
+                now - 45000,
+                LogEventType.DAEMON_START,
+                mapOf("message" to "守护进程启动成功 (PID: 12345)")
+            ),
+            LogEntry(
+                now - 55000,
+                LogEventType.APP_FOREGROUND,
+                mapOf(
+                    "app_name" to "微信",
+                    "package_name" to "com.tencent.mm",
+                    "reason" to "App became foreground"
+                )
+            )
         )
         emit(logs)
     }

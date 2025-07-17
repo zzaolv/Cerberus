@@ -15,6 +15,15 @@
 namespace fs = std::filesystem;
 constexpr int PER_USER_RANGE = 100000;
 
+// Helper to read a value from a sysfs file
+template<typename T>
+static bool read_sysfs_value(const std::string& path, T& out_value) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+    file >> out_value;
+    return !file.fail();
+}
+
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
         cgroup_version_ = CgroupVersion::V2;
@@ -39,6 +48,59 @@ GlobalStatsData SystemMonitor::get_global_stats() const {
     return current_stats_;
 }
 
+// [新增] 实现获取电池状态
+std::optional<BatteryStats> SystemMonitor::get_battery_stats() {
+    const std::string base_path = "/sys/class/power_supply/";
+    std::string supply_path;
+
+    // Find the primary battery directory
+    if (fs::exists(base_path + "battery")) {
+        supply_path = base_path + "battery/";
+    } else if (fs::exists(base_path + "main")) {
+        supply_path = base_path + "main/";
+    } else { // Fallback to searching
+        for (const auto& entry : fs::directory_iterator(base_path)) {
+            if (fs::exists(entry.path() / "type") && fs::exists(entry.path() / "capacity")) {
+                std::ifstream type_file(entry.path() / "type");
+                std::string type;
+                type_file >> type;
+                if (type == "Battery" || type == "Main") {
+                    supply_path = entry.path().string() + "/";
+                    break;
+                }
+            }
+        }
+    }
+
+    if (supply_path.empty()) {
+        LOGW("Could not find a valid power_supply directory.");
+        return std::nullopt;
+    }
+
+    BatteryStats stats;
+    read_sysfs_value(supply_path + "capacity", stats.capacity);
+    read_sysfs_value(supply_path + "temp", stats.temp_deci_celsius);
+    read_sysfs_value(supply_path + "status", stats.status);
+    
+    // Voltage and current can have different names
+    if (!read_sysfs_value(supply_path + "voltage_now", stats.voltage_uv)) {
+        read_sysfs_value(supply_path + "batt_vol", stats.voltage_uv);
+    }
+    if (!read_sysfs_value(supply_path + "current_now", stats.current_ua)) {
+        read_sysfs_value(supply_path + "batt_current", stats.current_ua);
+    }
+
+    // Calculate power in watts: P = V * I
+    if (stats.voltage_uv > 0) {
+        // Power (W) = (Voltage (μV) / 1,000,000) * (Current (μA) / 1,000,000)
+        // We take abs because current is negative for discharge
+        stats.power_watt = (static_cast<double>(stats.voltage_uv) / 1000000.0) * (std::abs(static_cast<double>(stats.current_ua)) / 1000000.0);
+    }
+
+    return stats;
+}
+
+
 AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_name, int user_id) {
     AppStatsData stats;
     if (pid <= 0) return stats;
@@ -51,7 +113,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_na
     if (rollup_file.is_open()) {
         std::string line;
         while (std::getline(rollup_file, line)) {
-            if (line.rfind("Pss:", 0) == 0) {
+            if (line.rfind("Rss:", 0) == 0) { // 使用 Rss 作为内存占用指标
                 std::stringstream ss(line);
                 std::string key;
                 long value;
@@ -77,6 +139,7 @@ AppStatsData SystemMonitor::get_app_stats(int pid, const std::string& package_na
         long long utime, stime;
         ss >> utime >> stime;
         long long current_app_jiffies = utime + stime;
+        stats.cpu_time_jiffies = current_app_jiffies; // [新增] 记录总的CPU时间
         
         long long current_total_jiffies = prev_cpu_times_.total();
         auto& cpu_state = app_cpu_states_[pid];
@@ -111,7 +174,6 @@ void SystemMonitor::update_network_stats_cache() {
 
     std::ifstream stats_file("/proc/net/xt_qtaguid/stats");
     if (!stats_file.is_open()) {
-        LOGW("Cannot open /proc/net/xt_qtaguid/stats. Network monitoring disabled.");
         return;
     }
 
@@ -121,9 +183,10 @@ void SystemMonitor::update_network_stats_cache() {
     while (std::getline(stats_file, line)) {
         std::stringstream ss(line);
         std::string iface, acct_tag;
-        int uid, set, tag_hex;
-        long long rx_bytes, rx_packets, tx_bytes, tx_packets;
+        int uid;
+        unsigned long long set, rx_bytes, rx_packets, tx_bytes, tx_packets;
 
+        // Skip index, iface, acct_tag_hex
         ss >> line >> iface >> acct_tag >> uid >> set >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
         
         if (ss.fail() || iface == "lo") {

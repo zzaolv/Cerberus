@@ -3,8 +3,6 @@ package com.crfzit.crfzit.data.model
 
 import android.graphics.drawable.Drawable
 
-//--- 配置页模型 ---
-
 // 应用策略等级
 enum class Policy {
     EXEMPTED, // 自由后台
@@ -23,10 +21,8 @@ data class AppInfo(
     val forcePlaybackExemption: Boolean = false,
     val forceNetworkExemption: Boolean = false
 )
-
 //--- 日志页模型 ---
-
-// 【重构】日志事件类型，与C++后端保持一致
+// [重构] 与C++后端完全同步的日志事件类型
 enum class LogEventType {
     GENERIC_INFO,
     GENERIC_SUCCESS,
@@ -42,14 +38,23 @@ enum class LogEventType {
     APP_BACKGROUND,
     APP_FROZEN,
     APP_UNFROZEN,
+    // [新增] 电源与Doze事件
+    POWER_UPDATE,
+    POWER_WARNING,
+    DOZE_STATE_CHANGE,
+    DOZE_RESOURCE_REPORT,
+    // [新增] 批量操作与网络控制事件
+    BATCH_OPERATION_START,
+    NETWORK_BLOCKED,
+    NETWORK_UNBLOCKED,
+    // [新增] 定时任务事件
+    SCHEDULED_TASK_EXEC,
     // 对于无法识别的类型
     UNKNOWN
 }
 
-
-// 【重构】新的日志条目数据类
 data class LogEntry(
     val timestamp: Long,
     val eventType: LogEventType,
-    val payload: Map<String, Any> // 使用Map来接收灵活的JSON payload
+    val payload: Map<String, Any>
 )
