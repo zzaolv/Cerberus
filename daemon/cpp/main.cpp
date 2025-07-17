@@ -13,7 +13,6 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
-#include <unistd.h>
 
 #define LOG_TAG "cerberusd"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -33,9 +32,7 @@ std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::shared_ptr<DatabaseManager> g_db_manager;
 std::atomic<bool> g_is_running = true;
 
-// 全局配置变量
-std::atomic<FreezerType> g_freezer_type = FreezerType::AUTO;
-std::atomic<int> g_periodic_unfreeze_interval_min = 0; // 0 for disabled
+std::atomic<bool> g_probe_connected = false;
 std::atomic<long long> g_last_probe_timestamp = 0;
 
 void handle_incoming_message(int client_fd, const std::string& message_str) {
@@ -45,14 +42,14 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
 
         LOGI("Handling message of type: %s", type.c_str());
 
-        // 探针事件现在会更新连接状态
         if (type.rfind("event.", 0) == 0) {
+            g_probe_connected = true;
             g_last_probe_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             if (g_state_manager) g_state_manager->handle_probe_event(msg);
-        } 
-        else if (type.rfind("cmd.", 0) == 0) {
-             const auto& payload = msg["payload"];
-             if (type == "cmd.set_policy") {
+
+        } else if (type.rfind("cmd.", 0) == 0) {
+            const auto& payload = msg["payload"];
+            if (type == "cmd.set_policy") {
                 AppConfig new_config;
                 new_config.package_name = payload.value("package_name", "");
                 int policy_int = payload.value("policy", 2);
@@ -60,33 +57,52 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                 new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
                 new_config.force_network_exempt = payload.value("force_network_exempt", false);
                 if (g_state_manager) g_state_manager->update_app_config_from_ui(new_config);
-             }
-             // 处理来自设置页的新命令
-             else if (type == "cmd.set_settings") {
+            } else if (type == "cmd.set_settings") {
                 int freezer_int = payload.value("freezer_type", 0);
-                g_freezer_type = static_cast<FreezerType>(freezer_int);
-
                 int unfreeze_interval = payload.value("unfreeze_interval", 0);
-                g_periodic_unfreeze_interval_min = unfreeze_interval;
+                
+                if (g_state_manager) {
+                    g_state_manager->set_freezer_type(static_cast<FreezerType>(freezer_int));
+                    g_state_manager->set_periodic_unfreeze_interval(unfreeze_interval);
+                }
+
                 LOGI("Settings updated: FreezerType=%d, UnfreezeInterval=%dmin", freezer_int, unfreeze_interval);
              } else if (type == "cmd.restart_daemon") {
                 LOGI("Restart command received. Shutting down...");
-                g_is_running = false; // 触发主循环退出，service.sh会负责重启
+                g_is_running = false;
                 if (g_server) g_server->stop();
              } else if (type == "cmd.clear_stats") {
-                if(g_db_manager) {
-                    if (g_db_manager->clear_all_stats()) {
-                        LOGI("All resource statistics have been cleared.");
-                    } else {
-                        LOGE("Failed to clear resource statistics.");
-                    }
-                }
+                if(g_db_manager) g_db_manager->clear_all_stats();
+                LOGI("All resource statistics have been cleared.");
              }
+
         } else if (type.rfind("query.", 0) == 0) {
             json response_payload;
             std::string response_type;
 
-            if (type == "query.get_all_policies") {
+            if (type == "query.get_resource_stats") {
+                response_type = "resp.resource_stats";
+                auto configs = g_db_manager->get_all_app_configs();
+                response_payload = json::array();
+                for (const auto& cfg : configs) {
+                    if (cfg.background_cpu_seconds > 0 || cfg.background_traffic_bytes > 0 || cfg.background_wakeups > 0) {
+                        response_payload.push_back({
+                            {"package_name", cfg.package_name},
+                            {"cpu_seconds", cfg.background_cpu_seconds},
+                            {"traffic_bytes", cfg.background_traffic_bytes},
+                            {"wakeups", cfg.background_wakeups}
+                        });
+                    }
+                }
+            } else if (type == "query.health_check") {
+                response_type = "resp.health_check";
+                long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                bool is_probe_alive = (now - g_last_probe_timestamp) < 30000;
+                response_payload = {
+                    {"daemon_pid", getpid()},
+                    {"is_probe_connected", is_probe_alive}
+                };
+            } else if (type == "query.get_all_policies") {
                 response_type = "resp.all_policies";
                 auto configs = g_db_manager->get_all_app_configs();
                 json configs_json = json::array();
@@ -117,28 +133,6 @@ void handle_incoming_message(int client_fd, const std::string& message_str) {
                     });
                 }
                 response_payload = logs_json;
-            } else if (type == "query.get_resource_stats") {
-                response_type = "resp.resource_stats";
-                auto configs = g_db_manager->get_all_app_configs();
-                response_payload = json::array();
-                for (const auto& cfg : configs) {
-                    if (cfg.background_cpu_seconds > 0 || cfg.background_traffic_bytes > 0 || cfg.background_wakeups > 0) {
-                        response_payload.push_back({
-                            {"package_name", cfg.package_name},
-                            {"cpu_seconds", cfg.background_cpu_seconds},
-                            {"traffic_bytes", cfg.background_traffic_bytes},
-                            {"wakeups", cfg.background_wakeups}
-                        });
-                    }
-                }
-            } else if (type == "query.health_check") {
-                response_type = "resp.health_check";
-                long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                bool is_probe_alive = (now - g_last_probe_timestamp.load()) < 30000; // 30秒内有通信则认为激活
-                response_payload = {
-                    {"daemon_pid", getpid()},
-                    {"is_probe_connected", is_probe_alive}
-                };
             }
             
             if (!response_type.empty()) {
