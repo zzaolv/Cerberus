@@ -13,6 +13,7 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
+#include <unistd.h> // 【核心修复】添加头文件以声明 getpid()
 
 #define LOG_TAG "cerberusd_main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
