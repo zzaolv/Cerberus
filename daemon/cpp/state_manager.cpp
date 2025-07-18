@@ -7,9 +7,9 @@
 #include <sstream>
 #include <unistd.h>
 #include <algorithm>
-#include <sys/stat.h> // [FIX] 添加缺失的头文件以定义 struct stat
+#include <sys/stat.h>
 
-#define LOG_TAG "cerberusd_state_v2.1"
+#define LOG_TAG "cerberusd_state_v3.0"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -33,8 +33,8 @@ static std::string status_to_string(AppRuntimeState::Status status) {
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v2.1, Expert Model) Initializing...");
-    critical_system_apps_ = {
+    LOGI("StateManager (v3.0, Preemptive Thaw Model) Initializing...");
+        critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
         "zygote",
@@ -375,6 +375,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.lineageos.updater.auto_generated_rro_product__",
         "org.protonaosp.deviceconfig.auto_generated_rro_product__",
     };
+    
     load_all_configs();
     initial_process_scan();
     LOGI("StateManager Initialized.");
@@ -502,9 +503,8 @@ void StateManager::on_system_state_changed_from_probe(const json& payload) {
     }
 }
 
-json StateManager::on_unfreeze_request_from_probe(const json& payload) {
+void StateManager::on_unfreeze_request_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    bool success = false;
     try {
         std::string pkg = payload.at("package_name").get<std::string>();
         int user_id = payload.at("user_id").get<int>();
@@ -512,17 +512,21 @@ json StateManager::on_unfreeze_request_from_probe(const json& payload) {
 
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) {
-            LOGI("Received immediate unfreeze request for '%s' (user %d).", pkg.c_str(), user_id);
-            transition_state(it->second, AppRuntimeState::Status::FOREGROUND, "unfreeze request from probe");
-            success = true;
+            LOGI("Received unfreeze request for frozen app '%s'. Executing reliable thaw.", pkg.c_str());
+            // 直接调用解冻，不再杀进程
+            if (!action_executor_->unfreeze_and_cleanup(key)) {
+                LOGE("Reliable unfreeze failed for '%s'.", pkg.c_str());
+            }
+            // 改变状态，让UI能看到变化
+            transition_state(it->second, AppRuntimeState::Status::BACKGROUND_IDLE, "unfrozen by user action");
         } else {
-             LOGW("Received unfreeze request for non-frozen or unknown app '%s'.", pkg.c_str());
+            LOGW("Received unfreeze request for non-frozen app %s. Ignoring.", pkg.c_str());
         }
     } catch (const std::exception& e) {
         LOGE("Error handling unfreeze request: %s", e.what());
     }
-    return {{"success", success}};
 }
+
 
 void StateManager::on_config_changed_from_ui(const AppConfig& new_config, int user_id) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -556,6 +560,7 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
 
     AppInstanceKey key = {app.package_name, app.user_id};
     
+    // 如果之前是冻结状态，但新的状态不是，则必须先解冻
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         action_executor_->unfreeze_and_cleanup(key);
     }

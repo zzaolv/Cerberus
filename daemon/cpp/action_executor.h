@@ -4,9 +4,8 @@
 
 #include <string>
 #include <vector>
-#include <utility> // For std::pair
+#include <utility> 
 
-// 使用 <包名, user_id> 作为应用实例的唯一标识符
 using AppInstanceKey = std::pair<std::string, int>;
 
 class ActionExecutor {
@@ -24,14 +23,14 @@ public:
     
     /**
      * @brief 解冻并彻底清理一个应用实例的cgroup。
-     * 这将解冻cgroup，将PID移回默认组，并删除专用cgroup目录。
+     * 这是一个可靠的版本，会回读内核状态确认解冻完成。
      * @param key 应用实例的唯一标识。
      * @return 操作是否成功。
      */
     bool unfreeze_and_cleanup(const AppInstanceKey& key);
 
     /**
-     * @brief [新增] 将一组PID移动到一个已存在的实例cgroup中。
+     * @brief 将一组PID移动到一个已存在的实例cgroup中。
      * 主要用于在父进程被冻结后，捕获并冻结其新生的子进程。
      * @param key 目标应用实例的唯一标识。
      * @param pids 要移动的PID列表。

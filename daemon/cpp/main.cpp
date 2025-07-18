@@ -16,7 +16,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v2.1"
+#define LOG_TAG "cerberusd_main_v3.0"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -39,12 +39,17 @@ std::atomic<bool> g_force_refresh_flag = false;
 std::mutex g_worker_mutex;
 std::condition_variable g_worker_cv;
 
+void trigger_state_broadcast() {
+    g_force_refresh_flag = true;
+    g_worker_cv.notify_one();
+}
+
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 2},
+            {"v", 3},
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
@@ -67,7 +72,12 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
+        // --- 事件处理 ---
         if (type.rfind("event.", 0) == 0) {
+            if (client_fd != g_probe_fd.load() && type != "event.probe_hello") {
+                LOGW("Ignoring event from non-probe client fd %d", client_fd);
+                return;
+            }
             if (type == "event.probe_hello") {
                 LOGI("Probe hello received from fd %d.", client_fd);
                 g_probe_fd = client_fd;
@@ -75,17 +85,36 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 notify_probe_of_config_change();
             } else if (type == "event.app_state_changed") {
                 if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
+                trigger_state_broadcast();
             } else if (type == "event.system_state_changed") {
                 if (g_state_manager) g_state_manager->on_system_state_changed_from_probe(msg.at("payload"));
+                trigger_state_broadcast();
             }
             return;
         }
         
+        // --- 命令与查询处理 ---
         json response_payload;
         std::string response_type;
 
-        if (type == "cmd.set_policy") {
+        if (type == "cmd.request_immediate_unfreeze") {
+            if (client_fd == g_probe_fd.load()) {
+                json payload = msg.at("payload");
+                if (g_state_manager) {
+                    g_state_manager->on_unfreeze_request_from_probe(payload);
+                    json response_msg = {
+                        {"v", 3},
+                        {"type", "resp.unfreeze_complete"},
+                        {"payload", payload}
+                    };
+                    g_server->send_message(client_fd, response_msg.dump());
+                    notify_probe_of_config_change();
+                    trigger_state_broadcast();
+                }
+            }
+        } else if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
+            LOGI("Received cmd.set_policy for %s", payload.value("package_name", "N/A").c_str());
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
             int user_id = payload.value("user_id", 0);
@@ -95,12 +124,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager) {
                 g_state_manager->on_config_changed_from_ui(new_config, user_id);
                 notify_probe_of_config_change();
-            }
-        } else if (type == "cmd.request_immediate_unfreeze") {
-             if (g_state_manager) {
-                response_payload = g_state_manager->on_unfreeze_request_from_probe(msg.at("payload"));
-                response_type = "resp.unfreeze_result";
-                notify_probe_of_config_change();
+                trigger_state_broadcast();
             }
         } else if (type == "query.get_all_policies") {
             if (g_state_manager) {
@@ -108,8 +132,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 response_type = "resp.all_policies";
             }
         } else if (type == "query.refresh_dashboard") {
-            g_force_refresh_flag = true;
-            g_worker_cv.notify_one();
+            trigger_state_broadcast();
         } else {
             LOGW("Received unknown message type from fd %d: %s", client_fd, type.c_str());
         }
@@ -117,7 +140,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         if (!response_type.empty()) {
             std::string req_id = msg.value("req_id", "");
             json response_msg = {
-                {"v", 2},
+                {"v", 3},
                 {"type", response_type},
                 {"req_id", req_id},
                 {"payload", response_payload}
@@ -149,7 +172,12 @@ void worker_thread_func() {
         }
 
         if (!g_is_running) break;
+        
+        if (g_force_refresh_flag.load()) {
+            LOGI("Forced refresh triggered.");
+        }
         g_force_refresh_flag = false;
+        
         if (g_state_manager) {
             g_state_manager->tick();
         }
@@ -157,7 +185,7 @@ void worker_thread_func() {
         if (g_server && g_server->has_clients()) {
             json payload = g_state_manager->get_dashboard_payload();
             json message = {
-                {"v", 2},
+                {"v", 3},
                 {"type", "stream.dashboard_update"},
                 {"payload", payload}
             };
@@ -171,7 +199,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v2.1 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v3.0 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -192,6 +220,7 @@ int main(int argc, char *argv[]) {
     g_proc_monitor->start([&](ProcessEventType type, int pid, int ppid) {
         if (g_state_manager) {
             g_state_manager->on_process_event(type, pid, ppid);
+            trigger_state_broadcast();
         }
     });
 

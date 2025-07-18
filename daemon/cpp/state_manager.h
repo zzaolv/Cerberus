@@ -60,7 +60,7 @@ public:
     void on_process_event(ProcessEventType type, int pid, int ppid);
     void on_app_state_changed_from_probe(const json& payload);
     void on_system_state_changed_from_probe(const json& payload);
-    json on_unfreeze_request_from_probe(const json& payload);
+    void on_unfreeze_request_from_probe(const json& payload); // 不再返回json
 
     // --- UI 指令与数据 ---
     void on_config_changed_from_ui(const AppConfig& new_config, int user_id);
@@ -98,7 +98,6 @@ private:
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
 
-    // [FIX] 添加缺失的成员变量声明，并初始化为-1表示无效
     int probe_fd_ = -1; 
 };
 

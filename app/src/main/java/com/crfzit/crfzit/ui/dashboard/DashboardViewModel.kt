@@ -11,7 +11,6 @@ import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
 import com.crfzit.crfzit.data.system.NetworkMonitor
 import com.crfzit.crfzit.data.system.NetworkSpeed
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -38,29 +37,26 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
 
-    private val appInfoCache = MutableStateFlow<Map<String, com.crfzit.crfzit.data.model.AppInfo>>(emptyMap())
-
     private val _uiState = MutableStateFlow(DashboardUiState())
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     init {
+        // [BUGFIX #3] 重构数据流，解决新应用不显示问题
         viewModelScope.launch {
-            val appInfos = appInfoRepository.getAllApps(forceRefresh = true)
-            appInfoCache.value = appInfos.associateBy { it.packageName }
-        }
+            // 初始加载一次，确保基础应用信息存在
+            appInfoRepository.getAllApps(forceRefresh = true)
 
-        viewModelScope.launch {
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
-                appInfoCache,
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
-            ) { dashboardPayload, speed, infoCache, showSystem ->
-
-                val sortedAndFilteredApps = dashboardPayload.appsRuntimeState
-                    .filter { it.memUsageKb > 0 || it.isForeground }
+            ) { dashboardPayload, speed, showSystem ->
+                // [BUGFIX #3] 在combine操作符内部动态处理应用信息
+                val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .mapNotNull { runtimeState ->
-                        infoCache[runtimeState.packageName]?.let { appInfo ->
+                        // 动态获取AppInfo，如果缓存没有会自动查询
+                        val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
+                        if (appInfo != null) {
                             UiAppRuntime(
                                 runtimeState = runtimeState,
                                 appName = appInfo.appName,
@@ -68,6 +64,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                                 isSystem = appInfo.isSystemApp,
                                 userId = runtimeState.userId
                             )
+                        } else {
+                            // 如果系统就是找不到这个应用（可能已卸载但后台有残留），则不显示
+                            null
                         }
                     }
                     .filter { showSystem || !it.isSystem }
@@ -76,12 +75,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
-                DashboardUiState(
+                // 返回一个新的、完整的UI状态
+                _uiState.value.copy(
                     isConnected = true,
-                    isRefreshing = _uiState.value.isRefreshing, // Preserve refreshing state
+                    isRefreshing = _uiState.value.isRefreshing,
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
-                    apps = sortedAndFilteredApps,
+                    apps = uiAppRuntimes,
                     showSystemApps = showSystem
                 )
             }
@@ -96,7 +96,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _uiState.update { it.copy(isRefreshing = true) }
             daemonRepository.requestDashboardRefresh()
-            delay(1500)
+            // 增加一点延迟让UI感知到刷新状态，同时等待后台响应
+            kotlinx.coroutines.delay(1000) 
             _uiState.update { it.copy(isRefreshing = false) }
         }
     }

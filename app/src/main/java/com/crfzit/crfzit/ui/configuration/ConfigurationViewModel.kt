@@ -35,31 +35,47 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            val policyConfig = daemonRepository.getAllPolicies()
+            // [BUGFIX #1] 核心修正：分离数据源，UI主导数据合并
+            // 步骤 1: 从前端仓库获取完整的、权威的基础应用列表
             val allInstalledApps = appInfoRepository.getAllApps(forceRefresh = true)
-            
-            if (policyConfig == null) {
-                _uiState.update { it.copy(isLoading = false, apps = allInstalledApps) }
-                return@launch
-            }
+            val baseAppInfoMap = allInstalledApps.associateBy { it.packageName }.toMutableMap()
 
-            val baseAppInfoMap = allInstalledApps.associateBy { it.packageName }
-            val mergedApps = policyConfig.policies.mapNotNull { policy ->
-                baseAppInfoMap[policy.packageName]?.let { baseInfo ->
-                    (if (policy.userId == 0) baseInfo else baseInfo.copy(userId = policy.userId))
-                    .apply {
-                        this.policy = Policy.fromInt(policy.policy)
-                        this.forcePlaybackExemption = policy.forcePlaybackExempt
-                        this.forceNetworkExemption = policy.forceNetworkExempt
-                    }
-                }
-            }.sortedWith(compareBy<AppInfo> { it.appName.lowercase(java.util.Locale.getDefault()) }.thenBy { it.userId })
+            // 步骤 2: 从后端获取策略配置和安全名单
+            val policyConfig = daemonRepository.getAllPolicies()
+            
+            val finalApps: List<AppInfo>
+            val finalSafetyNet: Set<String>
+
+            if (policyConfig != null) {
+                // 如果后端连接成功，合并数据
+                finalSafetyNet = policyConfig.hardSafetyNet
+                val policyMap = policyConfig.policies.associateBy { it.packageName to it.userId }
+
+                // 遍历完整的应用列表，用后端的策略去“更新”它们
+                finalApps = allInstalledApps.map { app ->
+                    // 尝试查找完全匹配（包名+用户ID）的策略
+                    val key = app.packageName to app.userId
+                    policyMap[key]?.let { policy ->
+                        // 找到了，更新应用信息
+                        app.copy(
+                            policy = Policy.fromInt(policy.policy),
+                            forcePlaybackExemption = policy.forcePlaybackExempt,
+                            forceNetworkExemption = policy.forceNetworkExempt
+                        )
+                    } ?: app //没找到，使用从AppInfoRepository加载的默认值
+                }.sortedWith(compareBy<AppInfo> { it.appName.lowercase(java.util.Locale.getDefault()) }.thenBy { it.userId })
+
+            } else {
+                // 如果后端连接失败，UI依然可以显示完整的应用列表，只是策略都是默认的
+                finalSafetyNet = emptySet()
+                finalApps = allInstalledApps.sortedWith(compareBy<AppInfo> { it.appName.lowercase(java.util.Locale.getDefault()) }.thenBy { it.userId })
+            }
             
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    apps = mergedApps,
-                    safetyNetApps = policyConfig.hardSafetyNet
+                    apps = finalApps,
+                    safetyNetApps = finalSafetyNet
                 )
             }
         }
@@ -95,6 +111,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                     app
                 }
             }
+            // 确保只在找到要更新的应用时才发送IPC消息
             updatedApp?.let { daemonRepository.setPolicy(it) }
             currentState.copy(apps = updatedApps)
         }
