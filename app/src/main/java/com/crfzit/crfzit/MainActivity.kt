@@ -1,3 +1,4 @@
+// app/src/main/java/com/crfzit/crfzit/MainActivity.kt
 package com.crfzit.crfzit
 
 import android.os.Bundle
@@ -20,7 +21,6 @@ class MainActivity : ComponentActivity() {
                    modifier = Modifier.fillMaxSize(),
                    color = MaterialTheme.colorScheme.background
                ) {
-                   // 应用的入口点现在是 MainScreen
                    MainScreen()
                }
             }

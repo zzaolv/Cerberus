@@ -1,6 +1,7 @@
+# magisk/module.prop
 id=cerberus
 name=Project Cerberus
-version=v1.0
-versionCode=1
+version=v1.1.1
+versionCode=111
 author=zzaolv
-description=An advanced system management framework for Android. Includes UI and system daemon.
+description=Initializing... A system-level guardian for performance and battery.

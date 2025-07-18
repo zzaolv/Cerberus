@@ -1,32 +1,37 @@
-// app/src/main/java/com/crfzit/crfzit/data/model/DashboardModels.kt
+// app/src/main/java/com/crfzit/crfzit/data/model/IPCModels.kt
 package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
 
 /**
- * UDS上交换消息的顶层结构
+ * UDS上交换的所有消息的通用顶层结构。
+ * @param V 协议版本号
+ * @param type 消息类型 (e.g., "stream.dashboard_update", "cmd.set_policy")
+ * @param reqId 可选，用于请求-响应模式的唯一ID
+ * @param payload 消息的具体负载，类型不确定，使用泛型
  */
-data class CerberusMessage(
+data class CerberusMessage<T>(
     @SerializedName("v")
     val version: Int,
     val type: String,
     @SerializedName("req_id")
-    val requestId: String?,
-    val payload: DashboardPayload
+    val requestId: String? = null,
+    val payload: T
 )
 
 /**
- * 'stream.dashboard_update' 消息的核心负载
+ * 'stream.dashboard_update' 消息的核心负载模型。
  */
 data class DashboardPayload(
     @SerializedName("global_stats")
     val globalStats: GlobalStats,
+    
     @SerializedName("apps_runtime_state")
     val appsRuntimeState: List<AppRuntimeState>
 )
 
 /**
- * 全局系统状态
+ * 全局系统状态模型，对应守护进程中的 GlobalStatsData。
  */
 data class GlobalStats(
     @SerializedName("total_cpu_usage_percent")
@@ -49,7 +54,7 @@ data class GlobalStats(
 )
 
 /**
- * 单个应用实例的实时运行状态
+ * 单个应用实例的实时运行状态模型，对应守护进程中的 AppRuntimeState。
  */
 data class AppRuntimeState(
     @SerializedName("package_name")
@@ -59,19 +64,16 @@ data class AppRuntimeState(
     val appName: String,
 
     @SerializedName("user_id")
-    val userId: Int = 0, // 核心字段：用于区分主应用(0)和分身(>0)
+    val userId: Int = 0,
 
     @SerializedName("display_status")
-    val displayStatus: DisplayStatus = DisplayStatus.UNKNOWN,
-
-    @SerializedName("active_freeze_mode")
-    val activeFreezeMode: FreezeMode? = null,
+    val displayStatus: String = "UNKNOWN", // 直接使用字符串，UI层再解析
 
     @SerializedName("mem_usage_kb")
-    val memUsageKb: Long = 0L, // VmRSS, 常驻内存
+    val memUsageKb: Long = 0L,
 
     @SerializedName("swap_usage_kb")
-    val swapUsageKb: Long = 0L, // VmSwap, 应用占用的交换空间
+    val swapUsageKb: Long = 0L,
 
     @SerializedName("cpu_usage_percent")
     val cpuUsagePercent: Float = 0f,
@@ -85,30 +87,7 @@ data class AppRuntimeState(
     val hasPlayback: Boolean = false,
     val hasNotification: Boolean = false,
     val hasNetworkActivity: Boolean = false,
+    
+    @SerializedName("pendingFreezeSec")
     val pendingFreezeSec: Int = 0
 )
-
-/**
- * UI上显示的应用状态枚举
- */
-enum class DisplayStatus {
-    STOPPED,
-    FOREGROUND,
-    FOREGROUND_GAME,
-    BACKGROUND_ACTIVE,
-    BACKGROUND_IDLE,
-    AWAITING_FREEZE,
-    FROZEN,
-    KILLED,
-    EXEMPTED,
-    UNKNOWN
-}
-
-/**
- * 冻结模式枚举
- */
-enum class FreezeMode {
-    CGROUP,
-    SIGSTOP,
-    UNKNOWN
-}

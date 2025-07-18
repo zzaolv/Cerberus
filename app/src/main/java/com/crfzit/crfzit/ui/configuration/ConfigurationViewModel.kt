@@ -7,129 +7,118 @@ import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.AppInfoRepository
-import com.crfzit.crfzit.data.uds.UdsClient
-import com.google.gson.Gson
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
+import com.crfzit.crfzit.data.repository.DaemonRepository
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 data class ConfigurationUiState(
     val isLoading: Boolean = true,
-    val allApps: List<AppInfo> = emptyList(),
+    val apps: List<AppInfo> = emptyList(),
+    val safetyNetApps: Set<String> = emptySet(), // 硬性安全网列表
     val searchQuery: String = "",
     val showSystemApps: Boolean = false
 )
 
-// 【核心修改】继承 AndroidViewModel 以获取 Context
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
-    // 【核心修改】获取 AppInfoRepository 单例
+    private val daemonRepository = DaemonRepository(viewModelScope)
     private val appInfoRepository = AppInfoRepository.getInstance(application)
-    
-    // 【核心修改】引入 UDS Client 和 Gson
-    private val udsClient = UdsClient(viewModelScope)
-    private val gson = Gson()
 
     private val _uiState = MutableStateFlow(ConfigurationUiState())
     val uiState: StateFlow<ConfigurationUiState> = _uiState.asStateFlow()
 
     init {
-        // 【核心修改】启动 UDS 客户端
-        udsClient.start()
-        loadApps()
+        loadConfiguration()
     }
 
-    private fun loadApps() {
+    // [COMPLETE IMPLEMENTATION]
+    fun loadConfiguration() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            // 强制刷新加载所有应用
-            appInfoRepository.loadAllInstalledApps(forceRefresh = true)
+
+            // 1. 从守护进程异步获取配置数据
+            val policyConfig = daemonRepository.getAllPolicies()
+            
+            // 2. 从本地异步获取所有已安装应用的基本信息
+            val allInstalledApps = appInfoRepository.getAllApps(forceRefresh = true)
+            
+            // 如果与守护进程通信失败，只显示应用列表，并结束加载状态
+            if (policyConfig == null) {
+                _uiState.update { it.copy(isLoading = false, apps = allInstalledApps.sortedBy { it.appName.lowercase() }) }
+                return@launch
+            }
+
+            // 3. 合并守护进程的配置和本地的应用信息
+            val policyMap = policyConfig.policies.associateBy { it.packageName }
+            val mergedApps = allInstalledApps.map { appInfo ->
+                policyMap[appInfo.packageName]?.let { policy ->
+                    // 如果守护进程有此应用的配置，则应用它
+                    appInfo.apply {
+                        this.policy = Policy.fromInt(policy.policy)
+                        this.forcePlaybackExemption = policy.forcePlaybackExempt
+                        this.forceNetworkExemption = policy.forceNetworkExempt
+                    }
+                } ?: appInfo // 如果守护进程没有配置，则使用 appInfo 的默认值 (Policy.EXEMPTED)
+            }.sortedBy { it.appName.lowercase() } // 按应用名排序
+            
+            // 4. 更新UI状态
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    // 从缓存中获取应用列表
-                    allApps = appInfoRepository.getCachedApps().values.sortedBy { app -> app.appName }
+                    apps = mergedApps,
+                    safetyNetApps = policyConfig.hardSafetyNet
                 )
             }
         }
     }
-
-    // 【核心修改】发送指令到守护进程
-    private fun sendPolicyUpdate(appInfo: AppInfo) {
-        val payload = mapOf(
-            "package_name" to appInfo.packageName,
-            "policy" to appInfo.policy.ordinal,
-            "force_playback_exempt" to appInfo.forcePlaybackExemption,
-            "force_network_exempt" to appInfo.forceNetworkExemption
-        )
-        val message = mapOf(
-            "v" to 1,
-            "type" to "cmd.set_policy",
-            "payload" to payload
-        )
-        udsClient.sendMessage(gson.toJson(message))
-    }
     
+    // [COMPLETE IMPLEMENTATION]
     fun onSearchQueryChanged(query: String) {
         _uiState.update { it.copy(searchQuery = query) }
     }
 
+    // [COMPLETE IMPLEMENTATION]
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
+
+    fun setPolicy(packageName: String, newPolicy: Policy) {
+        updateAndSend(packageName) { it.copy(policy = newPolicy) }
+    }
     
-    // 【核心修改】setPolicy 现在会发送消息
-    fun setPolicy(packageName: String, policy: Policy) {
-        var updatedApp: AppInfo? = null
-        _uiState.update { currentState ->
-            val updatedApps = currentState.allApps.map { app ->
-                if (app.packageName == packageName) {
-                    app.copy(policy = policy).also { updatedApp = it }
-                } else {
-                    app
-                }
-            }
-            currentState.copy(allApps = updatedApps)
-        }
-        updatedApp?.let { sendPolicyUpdate(it) }
-    }
-
-    // 【核心修改】setPlaybackExemption 现在会发送消息
     fun setPlaybackExemption(packageName: String, isExempt: Boolean) {
-        var updatedApp: AppInfo? = null
-        _uiState.update { currentState ->
-            val updatedApps = currentState.allApps.map { app ->
-                if (app.packageName == packageName) {
-                    app.copy(forcePlaybackExemption = isExempt).also { updatedApp = it }
-                } else {
-                    app
-                }
-            }
-            currentState.copy(allApps = updatedApps)
-        }
-        updatedApp?.let { sendPolicyUpdate(it) }
+        updateAndSend(packageName) { it.copy(forcePlaybackExemption = isExempt) }
     }
 
-    // 【核心修改】setNetworkExemption 现在会发送消息
     fun setNetworkExemption(packageName: String, isExempt: Boolean) {
-        var updatedApp: AppInfo? = null
-        _uiState.update { currentState ->
-            val updatedApps = currentState.allApps.map { app ->
+        updateAndSend(packageName) { it.copy(forceNetworkExemption = isExempt) }
+    }
+
+    /**
+     * 通用的更新函数，用于更新本地UI状态并发送指令给守护进程。
+     * @param packageName 要更新的应用包名。
+     * @param transform 一个lambda函数，接收旧的AppInfo，返回更新后的AppInfo。
+     */
+    private fun updateAndSend(packageName: String, transform: (AppInfo) -> AppInfo) {
+         _uiState.update { currentState ->
+            var updatedApp: AppInfo? = null
+            val updatedApps = currentState.apps.map { app ->
                 if (app.packageName == packageName) {
-                    app.copy(forceNetworkExemption = isExempt).also { updatedApp = it }
+                    // 应用变换，并捕获更新后的对象
+                    transform(app).also { updatedApp = it }
                 } else {
                     app
                 }
             }
-            currentState.copy(allApps = updatedApps)
+            // 确保更新后的AppInfo不为空，然后通过仓库发送给守护进程
+            updatedApp?.let { daemonRepository.setPolicy(it) }
+            // 返回包含更新后列表的新状态
+            currentState.copy(apps = updatedApps)
         }
-        updatedApp?.let { sendPolicyUpdate(it) }
     }
 
     override fun onCleared() {
         super.onCleared()
-        udsClient.stop()
+        daemonRepository.stop()
     }
 }

@@ -3,42 +3,54 @@ package com.crfzit.crfzit.data.model
 
 import android.graphics.drawable.Drawable
 
-//--- 配置页模型 ---
+/**
+ * 应用策略等级枚举，值必须与守护进程中的 AppPolicy 枚举完全对应。
+ * EXEMPTED = 0, IMPORTANT = 1, STANDARD = 2, STRICT = 3
+ */
+enum class Policy(val value: Int) {
+    EXEMPTED(0),
+    IMPORTANT(1),
+    STANDARD(2),
+    STRICT(3);
 
-// 应用策略等级
-enum class Policy {
-    EXEMPTED, // 自由后台
-    IMPORTANT, // 重要
-    STANDARD, // 智能
-    STRICT, // 严格
+    companion object {
+        fun fromInt(value: Int) = entries.find { it.value == value } ?: EXEMPTED
+    }
 }
 
-// 应用信息，【已合并】用于配置列表和UI显示
+/**
+ * 用于配置页和UI显示的聚合应用信息模型。
+ */
 data class AppInfo(
+    // 从 PackageManager 获取
     val packageName: String,
     val appName: String,
-    val policy: Policy,
-    val icon: Drawable? = null, // 【新增】用于UI显示，可为空
-    val isSystemApp: Boolean = false,
-    val forcePlaybackExemption: Boolean = false,
-    val forceNetworkExemption: Boolean = false
+    val icon: Drawable?,
+    val isSystemApp: Boolean,
+    
+    // 从守护进程获取并合并
+    var policy: Policy = Policy.EXEMPTED, // 默认为豁免，符合用户自选原则
+    var forcePlaybackExemption: Boolean = false,
+    var forceNetworkExemption: Boolean = false
 )
 
-//--- 日志页模型 ---
-
-// 日志级别
+/**
+ * 日志级别枚举
+ */
 enum class LogLevel {
-    INFO, // 信息
-    SUCCESS, // 成功
-    WARNING, // 警告
-    ERROR, // 错误
-    EVENT // 事件
+    INFO,
+    SUCCESS,
+    WARNING,
+    ERROR,
+    EVENT 
 }
 
-// 单条日志条目
+/**
+ * 单条日志条目模型
+ */
 data class LogEntry(
     val timestamp: Long,
     val level: LogLevel,
     val message: String,
-    val appName: String? = null
+    val appName: String? = null // 可选，关联的应用名
 )

@@ -18,6 +18,7 @@ class NetworkMonitor {
     private var lastTimestamp: Long = 0
 
     init {
+        // 初始化时获取一次基准值
         lastTotalRxBytes = TrafficStats.getTotalRxBytes()
         lastTotalTxBytes = TrafficStats.getTotalTxBytes()
         lastTimestamp = System.currentTimeMillis()
@@ -30,10 +31,12 @@ class NetworkMonitor {
             val currentTimestamp = System.currentTimeMillis()
 
             val durationMs = currentTimestamp - lastTimestamp
-            if (durationMs > 0 && lastTotalRxBytes > 0) {
+            // 确保持续时间大于0，且初始值有效
+            if (durationMs > 0 && lastTotalRxBytes != TrafficStats.UNSUPPORTED.toLong()) {
                 val deltaRx = currentRxBytes - lastTotalRxBytes
                 val deltaTx = currentTxBytes - lastTotalTxBytes
 
+                // 每秒比特数 = (字节差 * 1000 / 毫秒差) * 8
                 val downSpeed = if (deltaRx >= 0) (deltaRx * 1000 / durationMs) * 8 else 0
                 val upSpeed = if (deltaTx >= 0) (deltaTx * 1000 / durationMs) * 8 else 0
 
@@ -42,12 +45,13 @@ class NetworkMonitor {
                  emit(NetworkSpeed(0, 0))
             }
 
-
+            // 更新基准值
             lastTotalRxBytes = currentRxBytes
             lastTotalTxBytes = currentTxBytes
             lastTimestamp = currentTimestamp
 
-            delay(1000)
+            // [FIX] 刷新间隔改为3秒
+            delay(3000)
         }
     }
 }

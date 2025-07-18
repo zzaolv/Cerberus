@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
+import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.pm.ApplicationInfo
 import android.os.Process
@@ -17,7 +18,8 @@ import kotlinx.coroutines.SupervisorJob
 import java.lang.reflect.Method
 
 /**
- * 这是我们的 LSPosed 模块的入口点。
+ * Project Cerberus - System Probe.
+ * 职责：捕获系统事件，格式化为JSON，发送给守护进程。不包含任何决策逻辑。
  */
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -27,84 +29,86 @@ class ProbeHook : IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "CerberusProbe"
-        // Android User ID 分隔符
+        // Android User ID 的计算基数
         private const val PER_USER_RANGE = 100000
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 只注入 system_server 进程
+        // 严格确保只注入 system_server 进程
         if (lpparam.packageName != "android" || lpparam.processName != "android") {
             return
         }
         
-        // 启动UDS客户端
+        // 启动与守护进程的UDS通信
         udsClient.start()
-        XposedBridge.log("$TAG: Attached to system_server (PID: ${Process.myPid()})")
+        log("Attached to system_server (PID: ${Process.myPid()}). Probe is active.")
+        
         hookActivityManagerService(lpparam.classLoader)
+        // 未来可以增加对 PowerManagerService, NotificationManagerService 等的 Hook
     }
 
     private fun hookActivityManagerService(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
 
-            // Hook cleanUpRemovedTask - 任务被移除，视为应用被杀死
-            XposedHelpers.findAndHookMethod(
-                amsClass,
-                "cleanUpRemovedTask",
-                "com.android.server.wm.Task",
-                Boolean::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val task = param.args[0]
-                            val baseIntent = XposedHelpers.getObjectField(task, "mBaseIntent")
-                            val componentName = XposedHelpers.callMethod(baseIntent, "getComponent") as ComponentName?
-                            val packageName = componentName?.packageName
-                            // 【核心重构】从Task中获取发起者的UserID，这是最可靠的方式
-                            val userId = XposedHelpers.callMethod(task, "getUserId") as Int
-                            
-                            if (packageName != null) {
-                                XposedBridge.log("$TAG: App task removed: $packageName, user: $userId")
-                                sendEventToDaemon("event.app_killed", mapOf("package_name" to packageName, "user_id" to userId))
-                            }
-                        } catch (t: Throwable) {
-                            XposedBridge.log("$TAG: Error in cleanUpRemovedTask hook: ${t.message}")
-                        }
-                    }
-                }
-            )
-            
-            // Hook 'startProcess' - 进程启动
-            // 找到最通用的 startProcess 方法，它有多个重载
+            // Hook: 应用启动
+            // 这个方法是启动应用进程的核心，参数中有 ApplicationInfo
             val startProcessMethods = amsClass.declaredMethods.filter { it.name == "startProcess" }
             startProcessMethods.forEach { method ->
                  XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        val appInfo = param.args.firstOrNull { it is ApplicationInfo } as? ApplicationInfo
-                        if (appInfo != null) {
-                            val packageName = appInfo.packageName
-                            // 【核心重构】从 ApplicationInfo 中获取完整的 UID，并计算出 UserID
-                            val uid = appInfo.uid
-                            val userId = uid / PER_USER_RANGE
-                            
-                            XposedBridge.log("$TAG: App process starting: $packageName, user: $userId (uid: $uid)")
-                            sendEventToDaemon("event.app_start", mapOf(
-                                "package_name" to packageName,
-                                "user_id" to userId
-                            ))
-                        }
+                        val appInfo = param.args.firstOrNull { it is ApplicationInfo } as? ApplicationInfo ?: return
+                        val packageName = appInfo.packageName
+                        // 从 ApplicationInfo 中获取完整的 UID，并计算出 UserID
+                        val uid = appInfo.uid
+                        val userId = uid / PER_USER_RANGE
+                        
+                        log("Event: App process starting. Pkg: $packageName, User: $userId")
+                        sendEventToDaemon(
+                            "event.app_start",
+                            mapOf("package_name" to packageName, "user_id" to userId)
+                        )
                     }
                 })
             }
 
-            XposedBridge.log("$TAG: Successfully hooked AMS methods for app lifecycle.")
-
+            // Hook: 应用被真正杀死 (任务被移除)
+            // 'cleanUpRemovedTask' 是一个非常好的 Hook 点，表示用户从最近任务列表划掉一个应用
+            XposedHelpers.findAndHookMethod(
+                amsClass,
+                "cleanUpRemovedTask",
+                // 不同安卓版本，TaskRecord 的类名可能在不同的包下
+                XposedHelpers.findClass("com.android.server.wm.Task", classLoader),
+                Boolean::class.javaPrimitiveType, // wasKilled
+                Boolean::class.javaPrimitiveType, // detach
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val task = param.args[0] ?: return
+                        try {
+                            val realActivity = XposedHelpers.getObjectField(task, "realActivity") as ComponentName?
+                            val packageName = realActivity?.packageName ?: return
+                            val userId = XposedHelpers.callMethod(task, "getUserId") as Int
+                            
+                            log("Event: App task removed. Pkg: $packageName, User: $userId")
+                            sendEventToDaemon(
+                                "event.app_killed",
+                                mapOf("package_name" to packageName, "user_id" to userId)
+                            )
+                        } catch (t: Throwable) {
+                            logError("Error in cleanUpRemovedTask hook: $t")
+                        }
+                    }
+                }
+            )
+            log("Successfully hooked AMS methods for app lifecycle.")
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: Failed to hook ActivityManagerService.")
-            XposedBridge.log(t)
+            logError("Failed to hook ActivityManagerService: $t")
         }
     }
     
+    /**
+     * 将事件格式化为JSON并发送给守护进程
+     */
     private fun sendEventToDaemon(type: String, payload: Map<String, Any>) {
         try {
             val message = mapOf(
@@ -115,7 +119,10 @@ class ProbeHook : IXposedHookLoadPackage {
             val jsonString = gson.toJson(message)
             udsClient.sendMessage(jsonString)
         } catch (e: Exception) {
-            XposedBridge.log("$TAG: Error sending event to daemon: ${e.message}")
+            logError("Error sending event '$type' to daemon: ${e.message}")
         }
     }
+
+    private fun log(message: String) = XposedBridge.log("$TAG: $message")
+    private fun logError(message: String) = XposedBridge.log("$TAG: [ERROR] $message")
 }

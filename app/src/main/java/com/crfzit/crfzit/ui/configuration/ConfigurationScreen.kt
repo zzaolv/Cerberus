@@ -1,59 +1,38 @@
 // app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
 package com.crfzit.crfzit.ui.configuration
 
-import android.app.Application
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
-import com.crfzit.crfzit.navigation.Screen
-import com.crfzit.crfzit.ui.icons.AppIcons
-import kotlinx.coroutines.launch
-
-// 【新增】ViewModel 工厂
-class ConfigurationViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
-    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
-        if (modelClass.isAssignableFrom(ConfigurationViewModel::class.java)) {
-            @Suppress("UNCHECKED_CAST")
-            return ConfigurationViewModel(application) as T
-        }
-        throw IllegalArgumentException("Unknown ViewModel class")
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConfigurationScreen(
     navController: NavController,
-    // 【核心修改】使用工厂来创建ViewModel
-    viewModel: ConfigurationViewModel = viewModel(
-        factory = ConfigurationViewModelFactory(LocalContext.current.applicationContext as Application)
-    )
+    viewModel: ConfigurationViewModel
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val scope = rememberCoroutineScope()
-    var selectedApp by remember { mutableStateOf<AppInfo?>(null) }
-
-    val filteredApps = remember(uiState.allApps, uiState.searchQuery, uiState.showSystemApps) {
-        uiState.allApps.filter { app ->
+    
+    // 根据搜索和过滤条件计算显示的列表
+    val filteredApps = remember(uiState.apps, uiState.searchQuery, uiState.showSystemApps) {
+        uiState.apps.filter { app ->
             (uiState.showSystemApps || !app.isSystemApp) &&
             (app.appName.contains(uiState.searchQuery, ignoreCase = true) ||
              app.packageName.contains(uiState.searchQuery, ignoreCase = true))
@@ -61,167 +40,96 @@ fun ConfigurationScreen(
     }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("应用配置") },
-                actions = {
-                    IconButton(onClick = { navController.navigate(Screen.ProfileManagement.route) }) {
-                        Icon(AppIcons.Style, contentDescription = "情景模式管理")
-                    }
-                    var showMenu by remember { mutableStateOf(false) }
-                    IconButton(onClick = { showMenu = !showMenu }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "更多选项")
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
-                            onClick = {
-                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
-                                showMenu = false
-                            }
-                        )
-                    }
-                }
-            )
-        }
+        topBar = { TopAppBar(title = { Text("应用配置") }) }
     ) { padding ->
         Column(Modifier.padding(padding)) {
+            // 搜索框
             OutlinedTextField(
                 value = uiState.searchQuery,
                 onValueChange = viewModel::onSearchQueryChanged,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                label = { Text("搜索应用") },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                label = { Text("搜索应用或包名") },
+                leadingIcon = { Icon(Icons.Default.Search, null) },
                 singleLine = true
             )
-
+            // 列表
             if (uiState.isLoading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
             } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(filteredApps, key = { it.packageName }) { app ->
-                        AppPolicyItem(app = app) {
-                            selectedApp = app
-                            scope.launch { sheetState.show() }
-                        }
+                        val isProtected = uiState.safetyNetApps.contains(app.packageName)
+                        AppPolicyItem(
+                            app = app,
+                            isProtected = isProtected,
+                            onPolicyChange = { newPolicy ->
+                                if (!isProtected) viewModel.setPolicy(app.packageName, newPolicy)
+                            }
+                        )
                     }
                 }
             }
         }
     }
-
-    if (selectedApp != null) {
-        ModalBottomSheet(
-            onDismissRequest = { selectedApp = null },
-            sheetState = sheetState,
-        ) {
-            AppPolicyBottomSheetContent(
-                app = selectedApp!!,
-                viewModel = viewModel,
-                onPolicyChange = { newPolicy ->
-                    viewModel.setPolicy(selectedApp!!.packageName, newPolicy)
-                    scope.launch { sheetState.hide() }.invokeOnCompletion {
-                        if (!sheetState.isVisible) {
-                            selectedApp = null
-                        }
-                    }
-                }
-            )
-        }
-    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppPolicyItem(app: AppInfo, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -> Unit) {
+    var showMenu by remember { mutableStateOf(false) }
+    
+    val itemAlpha = if (isProtected) 0.6f else 1.0f
+
+    Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
         Row(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier.padding(16.dp).clickable(enabled = !isProtected) { showMenu = true },
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 【UI改进】显示应用图标
             Image(
-                painter = rememberAsyncImagePainter(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
-                        .crossfade(true)
-                        .build(),
-                ),
-                contentDescription = "${app.appName} icon",
+                painter = rememberAsyncImagePainter(ImageRequest.Builder(LocalContext.current).data(app.icon).crossfade(true).build()),
+                contentDescription = app.appName,
                 modifier = Modifier.size(40.dp)
             )
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Text(app.appName, fontWeight = FontWeight.Bold)
                 Text(app.packageName, style = MaterialTheme.typography.bodySmall)
             }
-            Text(
-                text = getPolicyLabel(app.policy).first,
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
+            
+            Box {
+                val (label, icon) = getPolicyLabel(if(isProtected) Policy.EXEMPTED else app.policy)
+                Text(
+                    text = "$icon $label",
+                    color = if(isProtected) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
 
-
-@Composable
-fun AppPolicyBottomSheetContent(
-    app: AppInfo,
-    viewModel: ConfigurationViewModel,
-    onPolicyChange: (Policy) -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .padding(16.dp)
-            .navigationBarsPadding(), 
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(app.appName, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.align(Alignment.CenterHorizontally))
-        HorizontalDivider()
-        Text("策略等级", style = MaterialTheme.typography.titleMedium)
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Policy.entries.forEach { policy ->
-                val (label, icon) = getPolicyLabel(policy)
-                Button(
-                    onClick = { onPolicyChange(policy) },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = app.policy != policy
+                // 下拉菜单用于修改策略
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false }
                 ) {
-                    Text("$icon $label")
+                    Policy.entries.forEach { policy ->
+                        DropdownMenuItem(
+                            text = { 
+                                val (policyLabel, policyIcon) = getPolicyLabel(policy)
+                                Text("$policyIcon $policyLabel")
+                            },
+                            onClick = {
+                                onPolicyChange(policy)
+                                showMenu = false
+                            }
+                        )
+                    }
                 }
             }
         }
-        HorizontalDivider()
-        Text("手动豁免", style = MaterialTheme.typography.titleMedium)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("强制后台播放豁免", modifier = Modifier.weight(1f))
-            Switch(
-                checked = app.forcePlaybackExemption,
-                onCheckedChange = { viewModel.setPlaybackExemption(app.packageName, it) }
-            )
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("强制网络活动豁免", modifier = Modifier.weight(1f))
-            Switch(
-                checked = app.forceNetworkExemption,
-                onCheckedChange = { viewModel.setNetworkExemption(app.packageName, it) }
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 
-fun getPolicyLabel(policy: Policy): Pair<String, String> {
+// 提取标签和图标的逻辑
+@Composable
+private fun getPolicyLabel(policy: Policy): Pair<String, String> {
     return when (policy) {
         Policy.EXEMPTED -> "自由后台" to "🛡️"
         Policy.IMPORTANT -> "重要" to "✅"

@@ -5,30 +5,31 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.Policy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
-// 【修改】将 AppInfoRepository 变成一个单例，以实现全局缓存
-class AppInfoRepository private constructor(context: Context) {
+/**
+ * 单例仓库，负责加载并缓存所有已安装应用的基本信息（包名、应用名、图标、是否系统应用）。
+ * 这些信息相对静态，只需加载一次。应用的动态策略由其他仓库负责。
+ */
+class AppInfoRepository private constructor(private val context: Context) {
 
     private val packageManager: PackageManager = context.packageManager
-    // 【修改】使用 ConcurrentHashMap 确保线程安全
     private val appInfoCache: MutableMap<String, AppInfo> = ConcurrentHashMap()
 
-    // 【修改】对外提供获取已缓存数据的方法
-    fun getCachedApps(): Map<String, AppInfo> {
-        return appInfoCache.toMap()
-    }
-
-    // 【修改】加载函数现在只负责填充缓存
-    suspend fun loadAllInstalledApps(forceRefresh: Boolean = false) {
+    suspend fun getAllApps(forceRefresh: Boolean = false): List<AppInfo> {
         if (appInfoCache.isNotEmpty() && !forceRefresh) {
-            return
+            return appInfoCache.values.toList()
         }
         
+        loadAllInstalledApps()
+        return appInfoCache.values.toList()
+    }
+
+    private suspend fun loadAllInstalledApps() {
         withContext(Dispatchers.IO) {
+            appInfoCache.clear()
             val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filterNotNull()
                 .mapNotNull { appInfo ->
@@ -37,31 +38,25 @@ class AppInfoRepository private constructor(context: Context) {
                             packageName = appInfo.packageName,
                             appName = appInfo.loadLabel(packageManager).toString(),
                             icon = appInfo.loadIcon(packageManager),
-                            policy = Policy.STANDARD,
                             isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
                         )
                     } catch (e: Exception) {
+                        // 某些应用（如卸载残留）可能无法加载标签
                         null
                     }
                 }
-                .associateBy { it.packageName }
             
-            // 【修改】填充缓存
-            appInfoCache.clear()
-            appInfoCache.putAll(apps)
+            appInfoCache.putAll(apps.associateBy { it.packageName })
         }
     }
 
-    // 【新增】单例模式的实现
     companion object {
         @Volatile
         private var INSTANCE: AppInfoRepository? = null
 
         fun getInstance(context: Context): AppInfoRepository {
             return INSTANCE ?: synchronized(this) {
-                val instance = AppInfoRepository(context.applicationContext)
-                INSTANCE = instance
-                instance
+                INSTANCE ?: AppInfoRepository(context.applicationContext).also { INSTANCE = it }
             }
         }
     }

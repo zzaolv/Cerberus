@@ -1,14 +1,12 @@
+// app/src/main/java/com/crfzit/crfzit/MainScreen.kt
 package com.crfzit.crfzit
 
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -17,9 +15,10 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.crfzit.crfzit.navigation.Screen
 import com.crfzit.crfzit.ui.configuration.ConfigurationScreen
+import com.crfzit.crfzit.ui.configuration.ConfigurationViewModel
 import com.crfzit.crfzit.ui.dashboard.DashboardScreen
+import com.crfzit.crfzit.ui.dashboard.DashboardViewModel
 import com.crfzit.crfzit.ui.logs.LogsScreen
-import com.crfzit.crfzit.ui.profiles.ProfileManagementScreen // <-- 关键修正：添加 import
 import com.crfzit.crfzit.ui.settings.SettingsScreen
 
 @Composable
@@ -40,7 +39,7 @@ fun MainScreen() {
 
                 screens.forEach { screen ->
                     NavigationBarItem(
-                        icon = { Icon(screen.icon, contentDescription = null) },
+                        icon = { Icon(screen.icon, contentDescription = screen.label) },
                         label = { Text(screen.label) },
                         selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
                         onClick = {
@@ -62,16 +61,18 @@ fun MainScreen() {
             startDestination = Screen.Dashboard.route,
             modifier = Modifier.padding(innerPadding)
         ) {
-            composable(Screen.Dashboard.route) { DashboardScreen() }
+            composable(Screen.Dashboard.route) {
+                // ViewModel 在此级别创建，可以实现跨屏幕共享
+                val dashboardViewModel: DashboardViewModel = viewModel()
+                DashboardScreen(viewModel = dashboardViewModel)
+            }
             composable(Screen.Configuration.route) {
-                // <-- 关键修正：传入 navController
-                ConfigurationScreen(navController = navController)
+                val configViewModel: ConfigurationViewModel = viewModel()
+                ConfigurationScreen(navController = navController, viewModel = configViewModel)
             }
             composable(Screen.Logs.route) { LogsScreen() }
             composable(Screen.Settings.route) { SettingsScreen() }
-            composable(Screen.ProfileManagement.route) {
-                ProfileManagementScreen(onNavigateBack = { navController.popBackStack() })
-            }
+            // composable(Screen.ProfileManagement.route) { ... } // 未来实现
         }
     }
 }
