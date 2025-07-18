@@ -13,11 +13,16 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * 封装所有与守护进程 (`cerberusd`) 的通信逻辑。
+ * 这是 UI ViewModel 的唯一数据源。
+ */
 class DaemonRepository(
     private val scope: CoroutineScope
 ) {
     private val udsClient = UdsClient(scope)
     private val gson = Gson()
+
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     init {
@@ -63,7 +68,7 @@ class DaemonRepository(
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
-        
+
         val requestMsg = CerberusMessage(1, "query.get_all_policies", reqId, EmptyPayload)
         udsClient.sendMessage(gson.toJson(requestMsg))
 
@@ -78,13 +83,18 @@ class DaemonRepository(
             null
         }
     }
-    
+
+    fun requestDashboardRefresh() {
+        val message = CerberusMessage(1, "query.refresh_dashboard", null, EmptyPayload)
+        udsClient.sendMessage(gson.toJson(message))
+    }
+
     fun stop() {
         udsClient.stop()
         pendingRequests.values.forEach { it.cancel("Repository is stopping.") }
         pendingRequests.clear()
     }
-    
+
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
 }
@@ -94,6 +104,7 @@ data class PolicyConfigPayload(
     val hardSafetyNet: Set<String>,
     val policies: List<AppPolicyPayload>
 )
+
 data class AppPolicyPayload(
     @SerializedName("package_name")
     val packageName: String,

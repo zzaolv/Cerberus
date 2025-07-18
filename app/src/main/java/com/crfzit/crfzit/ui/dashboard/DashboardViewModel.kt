@@ -37,7 +37,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val daemonRepository = DaemonRepository(viewModelScope)
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
-    
+
     private val appInfoCache = MutableStateFlow<Map<String, com.crfzit.crfzit.data.model.AppInfo>>(emptyMap())
 
     private val _uiState = MutableStateFlow(DashboardUiState())
@@ -56,7 +56,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 appInfoCache,
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, infoCache, showSystem ->
-                
+
                 val sortedAndFilteredApps = dashboardPayload.appsRuntimeState
                     .filter { it.memUsageKb > 0 || it.isForeground }
                     .mapNotNull { runtimeState ->
@@ -73,36 +73,34 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     .filter { showSystem || !it.isSystem }
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
-                        .thenByDescending { it.runtimeState.memUsageKb }
+                            .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
                 DashboardUiState(
                     isConnected = true,
-                    isRefreshing = _uiState.value.isRefreshing,
+                    isRefreshing = _uiState.value.isRefreshing, // Preserve refreshing state
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = sortedAndFilteredApps,
                     showSystemApps = showSystem
                 )
             }
-            .catch { 
-                emit(_uiState.value.copy(isConnected = false, isRefreshing = false))
-            }
-            .collect { newState ->
-                _uiState.value = newState
-            }
+                .catch { emit(_uiState.value.copy(isConnected = false)) }
+                .collect { newState ->
+                    _uiState.value = newState
+                }
         }
     }
-    
+
     fun refresh() {
         viewModelScope.launch {
             _uiState.update { it.copy(isRefreshing = true) }
             daemonRepository.requestDashboardRefresh()
-            delay(1500) 
+            delay(1500)
             _uiState.update { it.copy(isRefreshing = false) }
         }
     }
-    
+
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }

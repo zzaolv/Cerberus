@@ -23,10 +23,15 @@ annotation = "1.9.1"
 # Gson
 gson = "2.13.1"
 materialIconsCore = "1.7.8"
-material3PullToRefresh = "1.0.0"
+androidxMaterial3 = "1.3.2"
+accompanist = "0.34.0"
 
 [libraries]
-androidx-compose-material3-pulltorefresh = { group = "androidx.compose.material3", name = "material3-pull-to-refresh", version.ref = "material3PullToRefresh" }
+accompanist-swiperefresh = { group = "com.google.accompanist", name = "accompanist-swiperefresh", version.ref = "accompanist" }
+# androidx-compose-material3-pulltorefresh = { group = "androidx.compose.material3", name = "material3-pull-to-refresh", version.ref = "material3PullToRefresh" }
+# androidx-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "androidxMaterial3" }
+#androidx-material-pullrefresh = { group = "androidx.compose.material", name = "material-pull-refresh", version.ref = "androidxPullRefresh" }
+
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
