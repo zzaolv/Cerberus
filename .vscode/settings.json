@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "*.mmd": "markdown",
-        "functional": "cpp"
+        "functional": "cpp",
+        "filesystem": "cpp"
     }
 }

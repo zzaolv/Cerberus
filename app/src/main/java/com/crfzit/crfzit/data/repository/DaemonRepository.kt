@@ -13,28 +13,20 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * 封装所有与守护进程 (`cerberusd`) 的通信逻辑。
- * 这是 UI ViewModel 的唯一数据源。
- */
 class DaemonRepository(
     private val scope: CoroutineScope
 ) {
     private val udsClient = UdsClient(scope)
     private val gson = Gson()
-
-    // [FIX] Added necessary imports.
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     init {
         udsClient.start()
-        // [FIX] Added coroutine scope for launch.
         scope.launch(Dispatchers.IO) {
             udsClient.incomingMessages.collect { jsonLine ->
                 try {
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
                     if (baseMsg.type.startsWith("resp.") && baseMsg.requestId != null) {
-                        // [FIX] Correctly complete the deferred object.
                         pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
                     }
                 } catch (e: JsonSyntaxException) {
@@ -58,6 +50,7 @@ class DaemonRepository(
     fun setPolicy(config: AppInfo) {
         val payload = mapOf(
             "package_name" to config.packageName,
+            "user_id" to config.userId,
             "policy" to config.policy.value,
             "force_playback_exempt" to config.forcePlaybackExemption,
             "force_network_exempt" to config.forceNetworkExemption
@@ -68,18 +61,15 @@ class DaemonRepository(
 
     suspend fun getAllPolicies(): PolicyConfigPayload? {
         val reqId = UUID.randomUUID().toString()
-        // [FIX] Corrected CompletableDeferred import.
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
-
+        
         val requestMsg = CerberusMessage(1, "query.get_all_policies", reqId, EmptyPayload)
         udsClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
-            // [FIX] Corrected withTimeout import.
             val responseJson = withTimeout(5000) { deferred.await() }
             val type = object : TypeToken<CerberusMessage<PolicyConfigPayload>>() {}.type
-            // [FIX] Corrected logic to access payload.
             val message = gson.fromJson<CerberusMessage<PolicyConfigPayload>>(responseJson, type)
             message.payload
         } catch (e: Exception) {
@@ -88,14 +78,13 @@ class DaemonRepository(
             null
         }
     }
-
+    
     fun stop() {
         udsClient.stop()
-        // [FIX] Correct way to cancel pending deferreds.
         pendingRequests.values.forEach { it.cancel("Repository is stopping.") }
         pendingRequests.clear()
     }
-
+    
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
 }
@@ -108,6 +97,8 @@ data class PolicyConfigPayload(
 data class AppPolicyPayload(
     @SerializedName("package_name")
     val packageName: String,
+    @SerializedName("user_id")
+    val userId: Int,
     val policy: Int,
     @SerializedName("force_playback_exempt")
     val forcePlaybackExempt: Boolean,

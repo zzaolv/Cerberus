@@ -14,12 +14,12 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
-// [FIX 1.1] UiAppRuntime现在包含完整的应用名和图标
 data class UiAppRuntime(
     val runtimeState: AppRuntimeState,
     val appName: String,
     val icon: Drawable?,
     val isSystem: Boolean,
+    val userId: Int
 )
 
 data class DashboardUiState(
@@ -27,8 +27,7 @@ data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    // [FIX 1.3] 默认不显示系统应用
-    val showSystemApps: Boolean = false
+    val showSystemApps: Boolean = false 
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -36,49 +35,43 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val daemonRepository = DaemonRepository(viewModelScope)
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
-
-    // [FIX 1.1] 缓存AppInfo对象，而不仅仅是布尔值
+    
     private val appInfoCache = MutableStateFlow<Map<String, com.crfzit.crfzit.data.model.AppInfo>>(emptyMap())
 
     private val _uiState = MutableStateFlow(DashboardUiState())
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     init {
-        // 1. 预加载应用列表信息到缓存
         viewModelScope.launch {
             val appInfos = appInfoRepository.getAllApps(forceRefresh = true)
             appInfoCache.value = appInfos.associateBy { it.packageName }
         }
 
-        // 2. 组合所有数据流来构建完整的UI状态
         viewModelScope.launch {
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
                 appInfoCache,
-                _uiState.map { it.showSystemApps }.distinctUntilChanged() // 只在开关变化时触发
+                _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, infoCache, showSystem ->
-
-                // [FIX] 完整的过滤和排序逻辑
+                
                 val sortedAndFilteredApps = dashboardPayload.appsRuntimeState
-                    // [FIX 1.2] 只显示有前台活动或正在冻结过程中的应用
-                    .filter { it.isForeground || it.displayStatus.uppercase() == "AWAITING_FREEZE" || it.displayStatus.uppercase() == "FROZEN" }
+                    .filter { it.memUsageKb > 0 || it.cpuUsagePercent > 0.1f || it.isForeground }
                     .mapNotNull { runtimeState ->
-                        // [FIX 1.1] 合并数据，如果缓存没有则不显示该项
                         infoCache[runtimeState.packageName]?.let { appInfo ->
                             UiAppRuntime(
                                 runtimeState = runtimeState,
                                 appName = appInfo.appName,
                                 icon = appInfo.icon,
-                                isSystem = appInfo.isSystemApp
+                                isSystem = appInfo.isSystemApp,
+                                userId = runtimeState.userId
                             )
                         }
                     }
-                    // [FIX 1.3] 根据开关过滤系统应用
                     .filter { showSystem || !it.isSystem }
                     .sortedWith(
-                        compareBy<UiAppRuntime> { !it.runtimeState.isForeground } // 前台应用优先
-                        .thenByDescending { it.runtimeState.memUsageKb } // 然后按内存降序
+                        compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
+                        .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
                 DashboardUiState(

@@ -14,11 +14,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.Policy
 
@@ -30,7 +32,6 @@ fun ConfigurationScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     
-    // 根据搜索和过滤条件计算显示的列表
     val filteredApps = remember(uiState.apps, uiState.searchQuery, uiState.showSystemApps) {
         uiState.apps.filter { app ->
             (uiState.showSystemApps || !app.isSystemApp) &&
@@ -43,7 +44,6 @@ fun ConfigurationScreen(
         topBar = { TopAppBar(title = { Text("应用配置") }) }
     ) { padding ->
         Column(Modifier.padding(padding)) {
-            // 搜索框
             OutlinedTextField(
                 value = uiState.searchQuery,
                 onValueChange = viewModel::onSearchQueryChanged,
@@ -52,20 +52,19 @@ fun ConfigurationScreen(
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 singleLine = true
             )
-            // 列表
             if (uiState.isLoading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
             } else {
                 LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(filteredApps, key = { it.packageName }) { app ->
+                    items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { app ->
                         val isProtected = uiState.safetyNetApps.contains(app.packageName)
                         AppPolicyItem(
                             app = app,
                             isProtected = isProtected,
                             onPolicyChange = { newPolicy ->
-                                if (!isProtected) viewModel.setPolicy(app.packageName, newPolicy)
+                                if (!isProtected) viewModel.setPolicy(app.packageName, app.userId, newPolicy)
                             }
                         )
                     }
@@ -78,12 +77,13 @@ fun ConfigurationScreen(
 @Composable
 fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -> Unit) {
     var showMenu by remember { mutableStateOf(false) }
-    
     val itemAlpha = if (isProtected) 0.6f else 1.0f
 
     Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
         Row(
-            modifier = Modifier.padding(16.dp).clickable(enabled = !isProtected) { showMenu = true },
+            modifier = Modifier
+                .padding(16.dp)
+                .clickable(enabled = !isProtected) { showMenu = true },
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
@@ -92,7 +92,18 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
                 modifier = Modifier.size(40.dp)
             )
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
-                Text(app.appName, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(app.appName, fontWeight = FontWeight.Bold)
+                    if (app.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${app.userId})",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                }
                 Text(app.packageName, style = MaterialTheme.typography.bodySmall)
             }
             
@@ -104,7 +115,6 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
                     fontWeight = FontWeight.Bold
                 )
 
-                // 下拉菜单用于修改策略
                 DropdownMenu(
                     expanded = showMenu,
                     onDismissRequest = { showMenu = false }
@@ -127,7 +137,6 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
     }
 }
 
-// 提取标签和图标的逻辑
 @Composable
 private fun getPolicyLabel(policy: Policy): Pair<String, String> {
     return when (policy) {

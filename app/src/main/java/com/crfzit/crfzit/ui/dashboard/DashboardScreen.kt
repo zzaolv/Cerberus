@@ -10,7 +10,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,15 +18,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
@@ -121,7 +124,6 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     
     val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
     
-    // [FIX 2.1] formatSpeed现在会过滤低速率
     val downSpeed = formatSpeed(speed.downloadSpeedBps)
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
@@ -214,7 +216,6 @@ fun StatusGridItem(
     }
 }
 
-
 @Composable
 fun AppRuntimeCard(app: UiAppRuntime) {
     val state = app.runtimeState
@@ -223,16 +224,15 @@ fun AppRuntimeCard(app: UiAppRuntime) {
             modifier = Modifier.padding(12.dp).fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // [FIX 1.1] Image现在使用ViewModel中提供的图标
             Image(
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon) // 使用合并后的icon
+                        .data(app.icon)
                         .placeholder(android.R.drawable.sym_def_app_icon)
                         .error(android.R.drawable.sym_def_app_icon)
                         .crossfade(true).build()
                 ),
-                contentDescription = app.appName, // 使用合并后的appName
+                contentDescription = app.appName,
                 modifier = Modifier.size(48.dp)
             )
             
@@ -242,20 +242,28 @@ fun AppRuntimeCard(app: UiAppRuntime) {
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = app.appName, // 使用合并后的appName
+                        text = app.appName,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false)
                     )
-                    Spacer(Modifier.width(8.dp))
+                    if (app.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${app.userId})",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
                     AppStatusIcons(state = state)
                 }
                 
-                // [FIX 1.4] 动态构建资源占用字符串
                 val resourceText = buildAnnotatedString {
                     append("MEM: ${formatMemory(state.memUsageKb)}")
-                    if (state.swapUsageKb > 1024) { // 只在SWAP大于1KB时显示
+                    if (state.swapUsageKb > 1024) {
                         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
                             append(" (+${formatMemory(state.swapUsageKb)} S)")
                         }
@@ -289,11 +297,11 @@ fun AppStatusIcons(state: AppRuntimeState) {
         if (state.hasPlayback) Text("🎵", iconModifier)
         if (state.hasNotification) Text("🔔", iconModifier)
         if (state.hasNetworkActivity) Text("📡", iconModifier)
+
         when (state.displayStatus.uppercase()) {
             "FROZEN" -> Text("❄️", iconModifier)
             "KILLED" -> Text("🧊", iconModifier)
             "AWAITING_FREEZE" -> Text("⏳", iconModifier)
-            else -> {}
         }
     }
 }
@@ -323,35 +331,17 @@ private fun formatMemory(kb: Long): String {
     }
 }
 
-// [FIX 2.1] 修改 formatSpeed 函数以过滤低速率
 private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     if (bitsPerSecond < 50000) return Pair("0.0", "Kbps")
     return when {
-        bitsPerSecond < 1_000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
-        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1_000_000.0), "Mbps")
+        bitsPerSecond < 1000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
+        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000_000.0), "Mbps")
     }
 }
 
 private fun formatStatus(state: AppRuntimeState): String {
     return when (state.displayStatus.uppercase()) {
         "AWAITING_FREEZE" -> "等待冻结 (${state.pendingFreezeSec}s)"
-        else -> state.displayStatus.lowercase().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-    }
-}
-
-@Preview(showBackground = true)
-@Composable
-fun DashboardPreview() {
-    CRFzitTheme {
-        DashboardContent(
-            globalStats = GlobalStats(activeProfileName = "🎮 游戏模式"),
-            networkSpeed = NetworkSpeed(),
-            apps = listOf(
-                UiAppRuntime(
-                    AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = true, displayStatus = "FOREGROUND"),
-                    appName = "示例应用", icon = null, isSystem = false
-                )
-            )
-        )
+        else -> state.displayStatus.lowercase(Locale.getDefault()).replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
     }
 }
