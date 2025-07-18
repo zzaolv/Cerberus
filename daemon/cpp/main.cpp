@@ -16,7 +16,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v3.0"
+#define LOG_TAG "cerberusd_main_v3.1"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -47,6 +47,7 @@ void trigger_state_broadcast() {
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
+        LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
             {"v", 3},
@@ -68,21 +69,22 @@ void handle_client_disconnect(int client_fd) {
 }
 
 void handle_client_message(int client_fd, const std::string& message_str) {
+    LOGI("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // --- 事件处理 ---
+        // --- 事件处理 (主要来自Probe) ---
         if (type.rfind("event.", 0) == 0) {
             if (client_fd != g_probe_fd.load() && type != "event.probe_hello") {
-                LOGW("Ignoring event from non-probe client fd %d", client_fd);
+                LOGW("Ignoring event '%s' from non-probe client fd %d", type.c_str(), client_fd);
                 return;
             }
             if (type == "event.probe_hello") {
-                LOGI("Probe hello received from fd %d.", client_fd);
+                LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
                 g_probe_fd = client_fd;
                 if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-                notify_probe_of_config_change();
+                notify_probe_of_config_change(); // Probe连接后立即下发一次配置
             } else if (type == "event.app_state_changed") {
                 if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
                 trigger_state_broadcast();
@@ -93,36 +95,50 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
         
-        // --- 命令与查询处理 ---
+        // --- 命令与查询处理 (主要来自UI和Probe) ---
         json response_payload;
         std::string response_type;
 
         if (type == "cmd.request_immediate_unfreeze") {
-            if (client_fd == g_probe_fd.load()) {
-                json payload = msg.at("payload");
-                if (g_state_manager) {
-                    g_state_manager->on_unfreeze_request_from_probe(payload);
-                    json response_msg = {
-                        {"v", 3},
-                        {"type", "resp.unfreeze_complete"},
-                        {"payload", payload}
-                    };
-                    g_server->send_message(client_fd, response_msg.dump());
-                    notify_probe_of_config_change();
-                    trigger_state_broadcast();
-                }
+            if (client_fd != g_probe_fd.load()) {
+                 LOGW("Ignoring unfreeze request from non-probe client fd %d", client_fd);
+                 return;
+            }
+            json payload = msg.at("payload");
+            if (g_state_manager) {
+                LOGI("Processing unfreeze request from Probe for %s", payload.dump().c_str());
+                bool success = g_state_manager->on_unfreeze_request_from_probe(payload);
+                
+                // [FIX #4] 无论成功与否，立即响应Probe，解除其阻塞
+                json response_msg = {
+                    {"v", 3},
+                    {"type", "resp.unfreeze_complete"},
+                    {"req_id", msg.value("req_id", "")}, // 捎带上req_id
+                    {"payload", {
+                        {"package_name", payload.value("package_name", "")},
+                        {"user_id", payload.value("user_id", 0)},
+                        {"success", success}
+                    }}
+                };
+                g_server->send_message(client_fd, response_msg.dump());
+                LOGI("Sent unfreeze confirmation to Probe.");
+
+                // 解冻后状态发生变化，立即通知Probe和UI
+                notify_probe_of_config_change();
+                trigger_state_broadcast();
             }
         } else if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
-            LOGI("Received cmd.set_policy for %s", payload.value("package_name", "N/A").c_str());
+            LOGI("Processing set_policy for %s", payload.value("package_name", "N/A").c_str());
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
-            int user_id = payload.value("user_id", 0);
+            // [FIX] 从v2协议中，我们不再通过UI传递user_id，因为策略是针对包名全局的
+            // user_id 只在运行时状态中有意义
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
             if (g_state_manager) {
-                g_state_manager->on_config_changed_from_ui(new_config, user_id);
+                g_state_manager->on_config_changed_from_ui(new_config);
                 notify_probe_of_config_change();
                 trigger_state_broadcast();
             }
@@ -148,8 +164,10 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_server) g_server->send_message(client_fd, response_msg.dump());
         }
 
+    } catch (const json::exception& e) {
+        LOGE("JSON Error handling message from fd %d: %s. Message: %s", client_fd, e.what(), message_str.c_str());
     } catch (const std::exception& e) {
-        LOGE("Error handling message from fd %d: %s. Message: %s", client_fd, e.what(), message_str.c_str());
+        LOGE("Generic Error handling message from fd %d: %s. Message: %s", client_fd, e.what(), message_str.c_str());
     }
 }
 
@@ -166,29 +184,35 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
+            // [FIX] 确保即使没有通知，每3秒也会醒来一次
             g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
-                return !g_is_running || g_force_refresh_flag.load();
+                return !g_is_running.load() || g_force_refresh_flag.load();
             });
         }
 
         if (!g_is_running) break;
         
+        // [LOGGING] 确认工作线程在活动
+        LOGI("Worker thread tick!");
+
         if (g_force_refresh_flag.load()) {
             LOGI("Forced refresh triggered.");
         }
-        g_force_refresh_flag = false;
+        g_force_refresh_flag = false; // 重置标志位
         
         if (g_state_manager) {
             g_state_manager->tick();
         }
 
         if (g_server && g_server->has_clients()) {
+            LOGI("Broadcasting dashboard update...");
             json payload = g_state_manager->get_dashboard_payload();
             json message = {
                 {"v", 3},
                 {"type", "stream.dashboard_update"},
                 {"payload", payload}
             };
+            // 广播给所有非Probe客户端（即UI客户端）
             g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
         }
     }
@@ -199,7 +223,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v3.0 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v3.1 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {

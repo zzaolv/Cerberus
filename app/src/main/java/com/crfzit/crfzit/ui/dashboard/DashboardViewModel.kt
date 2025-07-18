@@ -41,9 +41,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     init {
-        // [BUGFIX #3] 重构数据流，解决新应用不显示问题
         viewModelScope.launch {
-            // 初始加载一次，确保基础应用信息存在
+            // 启动时强制刷新一次应用列表，确保基础数据是最新的
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
@@ -51,40 +50,37 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, showSystem ->
-                // [BUGFIX #3] 在combine操作符内部动态处理应用信息
+                // [FIX #2] 增强数据合并逻辑的鲁棒性
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
-                    .mapNotNull { runtimeState ->
-                        // 动态获取AppInfo，如果缓存没有会自动查询
+                    .map { runtimeState ->
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
-                        if (appInfo != null) {
-                            UiAppRuntime(
-                                runtimeState = runtimeState,
-                                appName = appInfo.appName,
-                                icon = appInfo.icon,
-                                isSystem = appInfo.isSystemApp,
-                                userId = runtimeState.userId
-                            )
-                        } else {
-                            // 如果系统就是找不到这个应用（可能已卸载但后台有残留），则不显示
-                            null
-                        }
+                        // [FIX #2] 如果 appInfo 为 null (刚安装的应用，仓库来不及更新)
+                        // 仍然创建一个临时的 UiAppRuntime 对象进行显示，避免新应用消失
+                        UiAppRuntime(
+                            runtimeState = runtimeState,
+                            appName = appInfo?.appName ?: runtimeState.packageName, // 找不到名字就用包名
+                            icon = appInfo?.icon, // 找不到图标就为空
+                            isSystem = appInfo?.isSystemApp ?: false,
+                            userId = runtimeState.userId
+                        )
                     }
                     .filter { showSystem || !it.isSystem }
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
-                            .thenByDescending { it.runtimeState.memUsageKb }
+                            .thenByDescending { it.runtimeState.cpu_usage_percent }
+                            .thenByDescending { it.runtimeState.mem_usage_kb }
                     )
 
-                // 返回一个新的、完整的UI状态
                 _uiState.value.copy(
                     isConnected = true,
-                    isRefreshing = _uiState.value.isRefreshing,
+                    isRefreshing = false, // 收到新数据流，刷新状态自动结束
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = uiAppRuntimes,
                     showSystemApps = showSystem
                 )
             }
+                .onStart { _uiState.update { it.copy(isConnected = false) } }
                 .catch { emit(_uiState.value.copy(isConnected = false)) }
                 .collect { newState ->
                     _uiState.value = newState
@@ -96,15 +92,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _uiState.update { it.copy(isRefreshing = true) }
             daemonRepository.requestDashboardRefresh()
-            // 增加一点延迟让UI感知到刷新状态，同时等待后台响应
-            kotlinx.coroutines.delay(1000) 
-            _uiState.update { it.copy(isRefreshing = false) }
+            // 移除手动延迟，让数据流驱动UI
         }
     }
 
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
+
+
 
     override fun onCleared() {
         super.onCleared()

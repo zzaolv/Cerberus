@@ -8,6 +8,7 @@ import android.os.Process
 import com.crfzit.crfzit.data.model.*
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -18,18 +19,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Project Cerberus - System Probe (v3.0, Preemptive Thaw & ANR Intervention)
- * 职责:
- * 1. [感知] Hook Framework API，感知应用和系统状态变化。
- * 2. [抢占] 完全接管对已冻结应用的启动请求，实现先解冻、后启动的可靠流程。
- * 3. [干预] 阻止系统对正在解冻的应用弹出ANR对话框或执行ANR查杀。
- * 4. [协作] 与Daemon进行双向通信。
+ * Project Cerberus - System Probe (v3.1, Reliable Thaw)
  */
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -37,33 +34,40 @@ class ProbeHook : IXposedHookLoadPackage {
     private val udsClient = UdsClient(probeScope)
     private val gson = Gson()
 
+    // [FIX] 使用 StateFlow 来确保新订阅者能立即获取最新状态
     private val frozenAppsCache = MutableStateFlow<Set<AppInstanceKey>>(emptySet())
-    // 存储正在进行解冻的异步任务，用于ANR干预检查
     private val pendingUnfreezeJobs = ConcurrentHashMap<AppInstanceKey, CompletableFuture<Boolean>>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v3.0"
-        private const val PER_USER_RANGE = 100000
+        private const val TAG = "CerberusProbe_v3.1"
     }
+    
+    // 定义一个简单的响应模型来解析解冻结果
+    data class UnfreezeResponsePayload(
+        @SerializedName("package_name") val packageName: String,
+        @SerializedName("user_id") val userId: Int,
+        val success: Boolean
+    )
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android" || lpparam.processName != "android") {
             return
         }
-        log("Attaching to system_server (PID: ${Process.myPid()}). Probe v3.0 is activating...")
+        log("Attaching to system_server (PID: ${Process.myPid()}). Probe v3.1 is activating...")
         setupUdsCommunication()
         hookActivityManagerService(lpparam.classLoader)
-        hookAppErrors(lpparam.classLoader) // ANR干预
+        hookAppErrors(lpparam.classLoader)
         hookPowerManagerService(lpparam.classLoader)
-        log("Probe v3.0 attachment complete.")
+        log("Probe v3.1 attachment complete.")
     }
 
     private fun setupUdsCommunication() {
         udsClient.start()
 
-        probeScope.launch {
-            delay(2000)
-            sendToDaemon("event.probe_hello", mapOf("version" to "3.0.0", "pid" to Process.myPid()))
+        probeScope.launch(Dispatchers.IO) {
+            // 延时一下等daemon启动
+            delay(2000) 
+            sendToDaemon("event.probe_hello", mapOf("version" to "3.1.0", "pid" to Process.myPid()))
 
             udsClient.incomingMessages.collectLatest { jsonLine ->
                 try {
@@ -78,16 +82,17 @@ class ProbeHook : IXposedHookLoadPackage {
                                 log("Frozen app cache updated. Size: ${newCache.size}")
                             }
                         }
+                        // [FIX #4] 正确处理来自daemon的解冻完成响应
                         "resp.unfreeze_complete" -> {
-                            val type = object : TypeToken<CerberusMessage<AppInstanceKey>>() {}.type
-                            val msg = gson.fromJson<CerberusMessage<AppInstanceKey>>(jsonLine, type)
-                            log("Received unfreeze confirmation for ${msg.payload.packageName}")
-                            // 标记对应的异步任务已完成
-                            pendingUnfreezeJobs.remove(msg.payload)?.complete(true)
+                            val type = object : TypeToken<CerberusMessage<UnfreezeResponsePayload>>() {}.type
+                            val msg = gson.fromJson<CerberusMessage<UnfreezeResponsePayload>>(jsonLine, type)
+                            val key = AppInstanceKey(msg.payload.packageName, msg.payload.userId)
+                            log("Received unfreeze confirmation for $key. Success: ${msg.payload.success}")
+                            pendingUnfreezeJobs.remove(key)?.complete(msg.payload.success)
                         }
                     }
                 } catch (e: Exception) {
-                    logError("Error processing message from daemon: $e")
+                    logError("Error processing message from daemon: $e. JSON: $jsonLine")
                 }
             }
         }
@@ -97,21 +102,19 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
 
-            // 使用 XC_MethodReplacement 完全接管 startActivityAsUser
-            // 这是 startActivity 的最终调用点，Hook这里最有效
             XposedHelpers.findAndHookMethod(
                 amsClass, "startActivityAsUser",
-                "android.app.IApplicationThread", // caller
-                String::class.java, // callingPackage
-                Intent::class.java, // intent
-                String::class.java, // resolvedType
-                "android.os.IBinder", // resultTo
-                String::class.java, // resultWho
-                Int::class.javaPrimitiveType, // requestCode
-                Int::class.javaPrimitiveType, // flags
-                "android.app.ProfilerInfo", // profilerInfo
-                "android.os.Bundle", // options
-                Int::class.javaPrimitiveType, // userId
+                "android.app.IApplicationThread", 
+                String::class.java, 
+                Intent::class.java, 
+                String::class.java, 
+                "android.os.IBinder", 
+                String::class.java, 
+                Int::class.javaPrimitiveType, 
+                Int::class.javaPrimitiveType, 
+                "android.app.ProfilerInfo", 
+                "android.os.Bundle", 
+                Int::class.javaPrimitiveType, 
                 object : XC_MethodReplacement() {
                     override fun replaceHookedMethod(param: MethodHookParam): Any {
                         val intent = param.args[2] as Intent
@@ -120,11 +123,9 @@ class ProbeHook : IXposedHookLoadPackage {
                         
                         val key = AppInstanceKey(component.packageName, userId)
 
-                        // 核心逻辑：如果是冻结应用，则执行“抢占式解冻”
                         if (frozenAppsCache.value.contains(key)) {
                             log("Gatekeeper: Intercepted start request for frozen app $key. Starting preemptive thaw.")
                             
-                            // 启动异步解冻并重新启动的工作流
                             probeScope.launch {
                                 val future = CompletableFuture<Boolean>()
                                 pendingUnfreezeJobs[key] = future
@@ -132,24 +133,26 @@ class ProbeHook : IXposedHookLoadPackage {
                                 sendToDaemon("cmd.request_immediate_unfreeze", key)
 
                                 try {
-                                    // 等待Daemon的确认，设置超时
-                                    withTimeout(4500) { // 4.5秒超时，略小于系统ANR时间
-                                        future.get(4500, TimeUnit.MILLISECONDS)
+                                    val unfreezeSuccess = withTimeout(4500) { future.get() }
+                                    
+                                    if(unfreezeSuccess) {
+                                        log("Thaw confirmed for $key. Re-invoking original startActivity.")
+                                        XposedBridge.invokeOriginalMethod(param.method, param.thisObject, param.args)
+                                    } else {
+                                        logError("Daemon reported thaw FAILED for $key. Aborting start.")
                                     }
-                                    log("Thaw confirmed for $key. Re-invoking original startActivity.")
-                                    // 成功解冻后，重新调用原始的startActivity
-                                    XposedBridge.invokeOriginalMethod(param.method, param.thisObject, param.args)
+
                                 } catch (e: Exception) {
-                                    logError("Failed to thaw $key in time: ${e.message}. ANR intervention may be needed.")
-                                    // 即使超时，也尝试再次调用，让ANR干预机制来处理
+                                    logError("Failed to thaw $key in time: ${e.message}. The app will likely ANR. Calling original method anyway.")
+                                    // 超时后，我们无能为力，只能让系统去处理，ANR干预机制可能会起作用
                                     XposedBridge.invokeOriginalMethod(param.method, param.thisObject, param.args)
                                 } finally {
                                     pendingUnfreezeJobs.remove(key)
                                 }
                             }
                             
-                            // “欺骗”AMS，立即返回成功，避免阻塞system_server
-                            return ActivityManager.START_SUCCESS
+                            // 立即返回成功，避免阻塞system_server
+                            return 0
                         }
 
                         // 如果不是冻结应用，则正常执行
@@ -158,11 +161,10 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             )
             
-            // Hook 应用进程状态变化（如oom_adj），这是感知前后台的补充
             XposedHelpers.findAndHookMethod(
                 "com.android.server.am.ProcessList", classLoader, "updateOomAdj",
                 "com.android.server.am.ProcessRecord",
-                Boolean::class.javaPrimitiveType, // knownToBeForeground
+                Boolean::class.javaPrimitiveType, 
                 "com.android.server.am.OomAdjuster",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
@@ -172,8 +174,7 @@ class ProbeHook : IXposedHookLoadPackage {
                             val packageName = appInfo.packageName
                             val userId = XposedHelpers.getIntField(processRecord, "userId")
                             val oomAdj = XposedHelpers.getIntField(processRecord, "mState.mCurAdj")
-
-                            val isForeground = oomAdj < 100 
+                            val isForeground = oomAdj < 200 // OOM_ADJ_PERCEPTIBLE_APP as threshold
 
                             val payload = ProbeAppStateChangedPayload(
                                 packageName = packageName,
@@ -200,7 +201,6 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             val appErrorsClass = XposedHelpers.findClass("com.android.server.am.AppErrors", classLoader)
             
-            // Hook "应用无响应" 对话框的显示
             XposedHelpers.findAndHookMethod(appErrorsClass, "handleShowAnrUi", "com.android.server.am.ProcessRecord", String::class.java, object: XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val processRecord = param.args[0]
@@ -211,10 +211,9 @@ class ProbeHook : IXposedHookLoadPackage {
                     
                     val key = AppInstanceKey(packageName, userId)
                     
-                    // 如果ANR的应用是我们正在解冻的，则阻止弹窗
                     if (pendingUnfreezeJobs.containsKey(key)) {
                         log("ANR Intervention: Suppressing ANR dialog for thawing app $key.")
-                        param.result = null // 阻止原始方法执行
+                        param.result = null 
                     }
                 }
             })
@@ -229,7 +228,6 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             val pmsClass = XposedHelpers.findClass("com.android.server.power.PowerManagerService", classLoader)
             
-            // Hook goToSleep (息屏)
             XposedHelpers.findAndHookMethod(pmsClass, "goToSleep", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, object : XC_MethodHook(){
                 override fun afterHookedMethod(param: MethodHookParam?) {
                     log("Event: System is going to sleep (screen off).")
@@ -237,7 +235,6 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             })
             
-            // Hook wakeUp (亮屏)
             XposedHelpers.findAndHookMethod(pmsClass, "wakeUp", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java, String::class.java, object : XC_MethodHook(){
                 override fun afterHookedMethod(param: MethodHookParam?) {
                     log("Event: System is waking up (screen on).")
@@ -254,7 +251,9 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun sendToDaemon(type: String, payload: Any) {
         probeScope.launch {
             try {
-                val message = CerberusMessage(3, type, null, payload)
+                // [FIX] 增加请求ID，便于追踪
+                val reqId = if (type.startsWith("cmd.")) UUID.randomUUID().toString() else null
+                val message = CerberusMessage(3, type, reqId, payload)
                 val jsonString = gson.toJson(message)
                 udsClient.sendMessage(jsonString)
             } catch (e: Exception) {

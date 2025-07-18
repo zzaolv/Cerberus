@@ -60,10 +60,12 @@ public:
     void on_process_event(ProcessEventType type, int pid, int ppid);
     void on_app_state_changed_from_probe(const json& payload);
     void on_system_state_changed_from_probe(const json& payload);
-    void on_unfreeze_request_from_probe(const json& payload); // 不再返回json
+    // [FIX #4] 返回操作是否成功
+    bool on_unfreeze_request_from_probe(const json& payload);
 
     // --- UI 指令与数据 ---
-    void on_config_changed_from_ui(const AppConfig& new_config, int user_id);
+    // [FIX #1] 策略是包名全局的，不再需要user_id
+    void on_config_changed_from_ui(const AppConfig& new_config);
     json get_dashboard_payload();
     json get_full_config_for_ui();
     
