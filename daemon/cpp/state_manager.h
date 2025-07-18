@@ -58,8 +58,11 @@ public:
     
     // UI 数据生成与指令处理
     nlohmann::json get_dashboard_payload();
-    void update_app_config_from_ui(const AppConfig& new_config);
-    nlohmann::json get_full_config_for_ui(); // 【新增】为UI提供配置页数据
+
+    // [FIX] Corrected function declaration to match implementation.
+    void update_app_config_from_ui(const AppConfig& new_config, int user_id);
+    
+    nlohmann::json get_full_config_for_ui();
 
 private:
     void initial_process_scan();
@@ -75,7 +78,6 @@ private:
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
 
-    // 【安全网】核心安全检查函数
     bool is_critical_system_app(const std::string& package_name) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -85,17 +87,13 @@ private:
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
 
-    // 使用 <包名, user_id> 作为Key，确保能管理应用分身
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     
-    // PID到App状态的快速映射
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     
-    // 【安全网】硬性安全网列表
     std::unordered_set<std::string> critical_system_apps_;
     
-    // 当前前台应用信息
     std::string foreground_package_;
     int foreground_uid_ = -1;
 };
