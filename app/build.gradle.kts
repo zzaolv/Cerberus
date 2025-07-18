@@ -69,6 +69,7 @@ android {
 }
 
 dependencies {
+    implementation(libs.androidx.compose.material3.pulltorefresh)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.ktx)

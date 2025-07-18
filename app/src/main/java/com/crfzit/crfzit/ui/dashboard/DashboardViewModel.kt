@@ -11,6 +11,7 @@ import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
 import com.crfzit.crfzit.data.system.NetworkMonitor
 import com.crfzit.crfzit.data.system.NetworkSpeed
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -24,10 +25,11 @@ data class UiAppRuntime(
 
 data class DashboardUiState(
     val isConnected: Boolean = false,
+    val isRefreshing: Boolean = false,
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    val showSystemApps: Boolean = false 
+    val showSystemApps: Boolean = false
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -56,7 +58,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             ) { dashboardPayload, speed, infoCache, showSystem ->
                 
                 val sortedAndFilteredApps = dashboardPayload.appsRuntimeState
-                    .filter { it.memUsageKb > 0 || it.cpuUsagePercent > 0.1f || it.isForeground }
+                    .filter { it.memUsageKb > 0 || it.isForeground }
                     .mapNotNull { runtimeState ->
                         infoCache[runtimeState.packageName]?.let { appInfo ->
                             UiAppRuntime(
@@ -76,19 +78,31 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
                 DashboardUiState(
                     isConnected = true,
+                    isRefreshing = _uiState.value.isRefreshing,
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = sortedAndFilteredApps,
                     showSystemApps = showSystem
                 )
             }
-            .catch { emit(_uiState.value.copy(isConnected = false)) }
+            .catch { 
+                emit(_uiState.value.copy(isConnected = false, isRefreshing = false))
+            }
             .collect { newState ->
                 _uiState.value = newState
             }
         }
     }
-
+    
+    fun refresh() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isRefreshing = true) }
+            daemonRepository.requestDashboardRefresh()
+            delay(1500) 
+            _uiState.update { it.copy(isRefreshing = false) }
+        }
+    }
+    
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }

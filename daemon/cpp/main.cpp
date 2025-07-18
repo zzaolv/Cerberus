@@ -13,6 +13,7 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
+#include <condition_variable>
 #include <unistd.h> // 【核心修复】添加头文件以声明 getpid()
 
 #define LOG_TAG "cerberusd_main"
@@ -29,10 +30,13 @@ const std::string DATA_DIR = "/data/adb/cerberus";
 const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 
 std::atomic<bool> g_is_running = true;
-
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
 std::unique_ptr<ProcessMonitor> g_proc_monitor;
+
+std::atomic<bool> g_force_refresh_flag = false;
+std::mutex g_worker_mutex;
+std::condition_variable g_worker_cv;
 
 
 // --- 消息处理 ---
@@ -46,6 +50,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json response_payload;
         std::string response_type;
 
+        // 处理指令 (cmd.*)
         if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
             AppConfig new_config;
@@ -59,24 +64,34 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 g_state_manager->update_app_config_from_ui(new_config, user_id);
             }
         }
+        // 处理来自Probe的事件 (event.*)
         else if (type.rfind("event.", 0) == 0) {
              if (g_state_manager) {
                 g_state_manager->handle_probe_event(msg);
              }
         }
+        // 处理查询 (query.*)
         else if (type == "query.get_all_policies") {
             if (g_state_manager) {
                 response_payload = g_state_manager->get_full_config_for_ui();
                 response_type = "resp.all_policies";
             }
-        } else if (type == "query.health_check") {
+        } 
+        else if (type == "query.refresh_dashboard") {
+            LOGI("Received manual refresh request from client fd %d", client_fd);
+            g_force_refresh_flag = true;
+            g_worker_cv.notify_one();
+        }
+        else if (type == "query.health_check") {
             response_payload = { {"status", "ok"}, {"daemon_pid", getpid()} };
             response_type = "resp.health_check";
         }
+        // 其他未知消息
         else {
             LOGW("Received unknown message type: %s", type.c_str());
         }
 
+        // 如果是查询请求，则发送响应
         if (!response_type.empty() && !req_id.empty()) {
             json response_msg = {
                 {"v", 1},
@@ -98,6 +113,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
+    g_worker_cv.notify_one();
     if (g_server) g_server->stop();
     if (g_proc_monitor) g_proc_monitor->stop();
 }
@@ -105,12 +121,23 @@ void signal_handler(int signum) {
 void worker_thread_func() {
     LOGI("Worker thread started.");
     while (g_is_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (!g_is_running) break;
+        {
+            std::unique_lock<std::mutex> lock(g_worker_mutex);
+            g_worker_cv.wait_for(lock, std::chrono::seconds(1), [&]{
+                return !g_is_running || g_force_refresh_flag.load();
+            });
+        }
 
-        if (g_state_manager) g_state_manager->tick();
+        if (!g_is_running) break;
+        
+        g_force_refresh_flag = false;
+
+        if (g_state_manager) {
+            g_state_manager->tick();
+        }
 
         if (g_server && g_server->has_clients()) {
+            std::string dashboard_json_string;
             if (g_state_manager) {
                 json payload = g_state_manager->get_dashboard_payload();
                 json message = {
@@ -118,7 +145,10 @@ void worker_thread_func() {
                     {"type", "stream.dashboard_update"},
                     {"payload", payload}
                 };
-                g_server->broadcast_message(message.dump());
+                dashboard_json_string = message.dump();
+            }
+            if (!dashboard_json_string.empty()) {
+                g_server->broadcast_message(dashboard_json_string);
             }
         }
     }
@@ -127,7 +157,7 @@ void worker_thread_func() {
 
 
 // --- 主函数 ---
-int main() {
+int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
@@ -159,7 +189,7 @@ int main() {
 
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);
     g_server->set_message_handler(handle_client_message);
-    g_server->run(); 
+    g_server->run();
 
     LOGI("Server loop has finished. Cleaning up...");
     g_is_running = false;

@@ -10,13 +10,17 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshContainer
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
@@ -27,6 +31,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
@@ -35,7 +40,7 @@ import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.icons.AppIcons
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
-import java.util.Locale
+import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -73,11 +78,32 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
             label = "ConnectionState"
         ) { isConnected ->
             if (isConnected) {
-                DashboardContent(
-                    globalStats = uiState.globalStats,
-                    networkSpeed = uiState.networkSpeed,
-                    apps = uiState.apps
-                )
+                val pullToRefreshState = rememberPullToRefreshState()
+                if (pullToRefreshState.isRefreshing) {
+                    LaunchedEffect(true) {
+                        viewModel.refresh()
+                    }
+                }
+                
+                LaunchedEffect(uiState.isRefreshing) {
+                    if (uiState.isRefreshing) {
+                        pullToRefreshState.startRefresh()
+                    } else {
+                        pullToRefreshState.endRefresh()
+                    }
+                }
+
+                Box(modifier = Modifier.nestedScroll(pullToRefreshState.nestedScrollConnection)) {
+                    DashboardContent(
+                        globalStats = uiState.globalStats,
+                        networkSpeed = uiState.networkSpeed,
+                        apps = uiState.apps
+                    )
+                    PullToRefreshContainer(
+                        state = pullToRefreshState,
+                        modifier = Modifier.align(Alignment.TopCenter)
+                    )
+                }
             } else {
                 ConnectionLoadingIndicator()
             }
@@ -216,6 +242,7 @@ fun StatusGridItem(
     }
 }
 
+
 @Composable
 fun AppRuntimeCard(app: UiAppRuntime) {
     val state = app.runtimeState
@@ -278,7 +305,7 @@ fun AppRuntimeCard(app: UiAppRuntime) {
                 )
 
                 Text(
-                    text = "STATUS: ${formatStatus(state)}",
+                    text = "状态：${formatStatus(state)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Bold
@@ -300,8 +327,8 @@ fun AppStatusIcons(state: AppRuntimeState) {
 
         when (state.displayStatus.uppercase()) {
             "FROZEN" -> Text("❄️", iconModifier)
-            "KILLED" -> Text("🧊", iconModifier)
             "AWAITING_FREEZE" -> Text("⏳", iconModifier)
+            else -> {}
         }
     }
 }
@@ -334,14 +361,41 @@ private fun formatMemory(kb: Long): String {
 private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     if (bitsPerSecond < 50000) return Pair("0.0", "Kbps")
     return when {
-        bitsPerSecond < 1000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
-        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000_000.0), "Mbps")
+        bitsPerSecond < 1_000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
+        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1_000_000.0), "Mbps")
     }
 }
 
 private fun formatStatus(state: AppRuntimeState): String {
     return when (state.displayStatus.uppercase()) {
+        "STOPPED" -> "未运行"
+        "FOREGROUND" -> "前台运行"
+        "BACKGROUND_ACTIVE" -> "后台活动"
+        "BACKGROUND_IDLE" -> "后台空闲"
         "AWAITING_FREEZE" -> "等待冻结 (${state.pendingFreezeSec}s)"
-        else -> state.displayStatus.lowercase(Locale.getDefault()).replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+        "FROZEN" -> "已冻结"
+        "EXEMPTED" -> "自由后台"
+        else -> "状态未知"
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun DashboardPreview() {
+    CRFzitTheme {
+        DashboardContent(
+            globalStats = GlobalStats(activeProfileName = "🎮 游戏模式"),
+            networkSpeed = NetworkSpeed(),
+            apps = listOf(
+                UiAppRuntime(
+                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = true, displayStatus = "FOREGROUND", userId = 0),
+                    appName = "示例应用", icon = null, isSystem = false, userId = 0
+                ),
+                 UiAppRuntime(
+                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = false, displayStatus = "BACKGROUND_IDLE", userId = 999),
+                    appName = "示例应用 (分身)", icon = null, isSystem = false, userId = 999
+                )
+            )
+        )
     }
 }

@@ -7,8 +7,9 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
-#include <sys/select.h>
+#include <vector>
 #include <cstddef>
+#include <sys/select.h>
 
 #define LOG_TAG "cerberusd_uds"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -68,7 +69,6 @@ void UdsServer::broadcast_message(const std::string& message) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     if (client_fds_.empty()) return;
 
-    // 创建一个副本进行遍历，防止在send_message中修改client_fds_导致迭代器失效
     auto clients_copy = client_fds_;
     for (int fd : clients_copy) {
         send_message(fd, message);
@@ -80,33 +80,36 @@ void UdsServer::handle_client_data(int client_fd) {
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
 
     if (bytes_read <= 0) {
-        // 连接关闭或出错
         remove_client(client_fd);
         return;
     }
 
-    // 将收到的数据加入对应客户端的缓冲区
     std::string received_data(buffer, bytes_read);
-    
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    auto buffer_it = client_buffers_.find(client_fd);
-    if (buffer_it == client_buffers_.end()) return; // 客户端已断开
-    
-    buffer_it->second += received_data;
-    std::string& client_buffer = buffer_it->second;
+    std::vector<std::string> messages_to_process;
 
-    // 按行分割消息 (JSON Lines协议)
-    size_t pos;
-    while ((pos = client_buffer.find('\n')) != std::string::npos) {
-        std::string message = client_buffer.substr(0, pos);
-        client_buffer.erase(0, pos + 1);
+    // [FIX] 在锁内处理缓冲区，提取出完整的消息
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        auto buffer_it = client_buffers_.find(client_fd);
+        if (buffer_it == client_buffers_.end()) return;
         
-        if (on_message_received_ && !message.empty()) {
-            // 解锁后调用回调，避免在锁内执行耗时操作
-            // 需要复制一份消息，因为回调可能是异步的
-            std::string msg_copy = message;
-            // 暂时在锁内调用，如果回调函数耗时则需要改为任务队列
-            on_message_received_(client_fd, msg_copy);
+        buffer_it->second += received_data;
+        std::string& client_buffer = buffer_it->second;
+
+        size_t pos;
+        while ((pos = client_buffer.find('\n')) != std::string::npos) {
+            std::string message = client_buffer.substr(0, pos);
+            if (!message.empty()) {
+                messages_to_process.push_back(message);
+            }
+            client_buffer.erase(0, pos + 1);
+        }
+    }
+
+    // [FIX] 在锁外调用回调函数，避免回调函数中的锁与 client_mutex_ 形成死锁
+    if (on_message_received_ && !messages_to_process.empty()) {
+        for (const auto& msg : messages_to_process) {
+            on_message_received_(client_fd, msg);
         }
     }
 }
@@ -141,10 +144,8 @@ void UdsServer::run() {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // 使用抽象命名空间socket，路径前加一个空字符
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
-    // 长度需要计算到抽象命名空间
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_name_.length() + 1;
 
     if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
@@ -176,7 +177,6 @@ void UdsServer::run() {
             }
         }
         
-        // 设置1秒超时，使循环有机会检查 is_running_ 标志
         struct timeval tv { .tv_sec = 1, .tv_usec = 0 };
 
         int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
@@ -188,10 +188,8 @@ void UdsServer::run() {
         }
 
         if (!is_running_) break;
+        if (activity == 0) continue;
 
-        if (activity == 0) continue; // 超时，继续循环
-
-        // 检查新连接
         if (FD_ISSET(server_fd_, &read_fds)) {
             int new_socket = accept(server_fd_, nullptr, nullptr);
             if (new_socket >= 0) {
@@ -199,7 +197,6 @@ void UdsServer::run() {
             }
         }
         
-        // 检查客户端数据
         std::vector<int> clients_to_check;
         {
             std::lock_guard<std::mutex> lock(client_mutex_);
