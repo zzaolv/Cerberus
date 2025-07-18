@@ -7,7 +7,7 @@ project(cerberusd CXX C)
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 # --- 2. 构建 sqlite3 库 (如果使用系统库，可以省略) ---
-add_library(sqlite3_lib STATIC ${THIRDPARTY_DIR}/sqlite/sqlite3.c)
+add_library(sqlite3_lib STATIC ${THIRDPARTY_DIR}/sqlite3/sqlite3.c)
 target_include_directories(sqlite3_lib PUBLIC ${THIRDPARTY_DIR}/sqlite)
 
 # --- 3. 构建 SQLiteCpp 库 ---
