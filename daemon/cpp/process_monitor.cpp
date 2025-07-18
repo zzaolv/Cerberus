@@ -50,7 +50,6 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
     char msg_buf[NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))];
     struct nlmsghdr* nl_hdr = (struct nlmsghdr*)msg_buf;
     struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
-    // 使用指针直接在 cn_msg 后面写入数据，避免结构体嵌套
     enum proc_cn_mcast_op* op = (enum proc_cn_mcast_op*)cn_msg->data;
 
     memset(msg_buf, 0, sizeof(msg_buf));
@@ -79,7 +78,6 @@ void ProcessMonitor::stop() {
     if (!is_running_.exchange(false)) return;
 
     if (netlink_socket_ >= 0) {
-        // 关闭socket会导致recvmsg立即返回，从而退出循环
         shutdown(netlink_socket_, SHUT_RDWR);
         close(netlink_socket_);
         netlink_socket_ = -1;
@@ -91,15 +89,15 @@ void ProcessMonitor::stop() {
 }
 
 void ProcessMonitor::monitor_loop() {
-    std::vector<char> buf(8192); // 8KB buffer
+    std::vector<char> buf(8192);
     while (is_running_) {
         ssize_t len = recv(netlink_socket_, buf.data(), buf.size(), 0);
         if (len <= 0) {
-            if (errno == EINTR) continue; // 被信号中断，继续
-            if(is_running_.load()) { // 如果不是主动停止，则记录错误
+            if (errno == EINTR) continue;
+            if(is_running_.load()) {
                 LOGE("Error receiving from netlink socket: %s. Stopping monitor.", strerror(errno));
             }
-            break; // 退出循环
+            break;
         }
 
         for (struct nlmsghdr* nl_hdr = (struct nlmsghdr*)buf.data(); NLMSG_OK(nl_hdr, len); nl_hdr = NLMSG_NEXT(nl_hdr, len)) {
@@ -109,13 +107,16 @@ void ProcessMonitor::monitor_loop() {
                     struct proc_event* ev = (struct proc_event*)cn_msg->data;
                     if (callback_) {
                         switch (ev->what) {
-                            case proc_event::PROC_EVENT_FORK:
+                            // [FIX] Removed 'proc_event::' scope qualifier. These are global enums.
+                            case PROC_EVENT_FORK:
                                 callback_(ProcessEventType::FORK, ev->event_data.fork.child_pid, ev->event_data.fork.parent_pid);
                                 break;
-                            case proc_event::PROC_EVENT_EXEC:
+                            // [FIX] Removed 'proc_event::' scope qualifier.
+                            case PROC_EVENT_EXEC:
                                 callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_pid);
                                 break;
-                            case proc_event::PROC_EVENT_EXIT:
+                            // [FIX] Removed 'proc_event::' scope qualifier.
+                            case PROC_EVENT_EXIT:
                                 callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_pid);
                                 break;
                             default:
