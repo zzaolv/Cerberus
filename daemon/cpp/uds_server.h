@@ -4,41 +4,53 @@
 
 #include <string>
 #include <vector>
-#include <thread>
 #include <mutex>
 #include <atomic>
 #include <functional>
 #include <map>
 
+// UDS 服务器，用于和 UI/Probe 通信
 class UdsServer {
 public:
-    explicit UdsServer(const std::string& socket_path);
+    explicit UdsServer(const std::string& socket_name);
     ~UdsServer();
 
-    void run();
-    void stop();
-    void broadcast_message(const std::string& message);
-    void set_message_handler(std::function<void(const std::string&)> handler);
+    UdsServer(const UdsServer&) = delete;
+    UdsServer& operator=(const UdsServer&) = delete;
 
-    /**
-     * @brief 检查当前是否有任何客户端连接。
-     * @return 如果至少有一个客户端连接，则返回 true，否则返回 false。
-     */
-    bool has_clients();
+    // 运行服务器的事件循环（阻塞）
+    void run();
+    // 停止服务器
+    void stop();
+    
+    // 向所有连接的客户端广播消息
+    void broadcast_message(const std::string& message);
+    
+    // 设置收到完整消息（以\n结尾）时的回调
+    void set_message_handler(std::function<void(int client_fd, const std::string&)> handler);
+    
+    // 向指定客户端发送消息
+    bool send_message(int client_fd, const std::string& message);
+    
+    // 检查是否有客户端连接
+    bool has_clients() const;
 
 private:
     void add_client(int client_fd);
     void remove_client(int client_fd);
     void handle_client_data(int client_fd);
 
-    std::string socket_path_;
+    std::string socket_name_;
     int server_fd_;
     std::atomic<bool> is_running_;
     
     std::vector<int> client_fds_;
-    std::mutex client_mutex_;
+    mutable std::mutex client_mutex_;
 
-    std::function<void(const std::string&)> on_message_received_;
+    // 回调函数，int是来源客户端的fd
+    std::function<void(int, const std::string&)> on_message_received_;
+    
+    // 每个客户端的接收缓冲区，用于处理粘包
     std::map<int, std::string> client_buffers_;
 };
 

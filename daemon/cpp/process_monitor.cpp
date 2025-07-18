@@ -46,14 +46,14 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
         return;
     }
 
-    // 【核心修复】使用更标准的、非嵌套的方式构造Netlink消息，以消除GNU扩展警告
+    // 发送监听指令给内核
     char msg_buf[NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))];
     struct nlmsghdr* nl_hdr = (struct nlmsghdr*)msg_buf;
     struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
-    enum proc_cn_mcast_op* op = (enum proc_cn_mcast_op*)(cn_msg + 1);
+    // 使用指针直接在 cn_msg 后面写入数据，避免结构体嵌套
+    enum proc_cn_mcast_op* op = (enum proc_cn_mcast_op*)cn_msg->data;
 
     memset(msg_buf, 0, sizeof(msg_buf));
-
     nl_hdr->nlmsg_len = sizeof(msg_buf);
     nl_hdr->nlmsg_pid = getpid();
     nl_hdr->nlmsg_type = NLMSG_DONE;
@@ -61,7 +61,6 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
     cn_msg->id.idx = CN_IDX_PROC;
     cn_msg->id.val = CN_VAL_PROC;
     cn_msg->len = sizeof(enum proc_cn_mcast_op);
-
     *op = PROC_CN_MCAST_LISTEN;
 
     if (send(netlink_socket_, nl_hdr, nl_hdr->nlmsg_len, 0) < 0) {
@@ -77,10 +76,10 @@ void ProcessMonitor::start(ProcessEventCallback callback) {
 }
 
 void ProcessMonitor::stop() {
-    if (!is_running_) return;
+    if (!is_running_.exchange(false)) return;
 
-    is_running_ = false;
     if (netlink_socket_ >= 0) {
+        // 关闭socket会导致recvmsg立即返回，从而退出循环
         shutdown(netlink_socket_, SHUT_RDWR);
         close(netlink_socket_);
         netlink_socket_ = -1;
@@ -92,44 +91,37 @@ void ProcessMonitor::stop() {
 }
 
 void ProcessMonitor::monitor_loop() {
-    std::vector<char> buf(8192);
+    std::vector<char> buf(8192); // 8KB buffer
     while (is_running_) {
-        struct iovec iov = { buf.data(), buf.size() };
-        struct sockaddr_nl sa_nl;
-        struct msghdr msg_hdr = { &sa_nl, sizeof(sa_nl), &iov, 1, nullptr, 0, 0 };
-
-        ssize_t len = recvmsg(netlink_socket_, &msg_hdr, 0);
+        ssize_t len = recv(netlink_socket_, buf.data(), buf.size(), 0);
         if (len <= 0) {
-            if (errno == EINTR) continue;
-            if(is_running_.load()) {
+            if (errno == EINTR) continue; // 被信号中断，继续
+            if(is_running_.load()) { // 如果不是主动停止，则记录错误
                 LOGE("Error receiving from netlink socket: %s. Stopping monitor.", strerror(errno));
             }
-            break;
+            break; // 退出循环
         }
 
         for (struct nlmsghdr* nl_hdr = (struct nlmsghdr*)buf.data(); NLMSG_OK(nl_hdr, len); nl_hdr = NLMSG_NEXT(nl_hdr, len)) {
             if (nl_hdr->nlmsg_type == NLMSG_DONE) {
                 struct cn_msg* cn_msg = (struct cn_msg*)NLMSG_DATA(nl_hdr);
-                struct proc_event* ev = (struct proc_event*)cn_msg->data;
-
-                switch (ev->what) {
-                    case PROC_EVENT_FORK:
-                        if (callback_) {
-                            callback_(ProcessEventType::FORK, ev->event_data.fork.child_pid, ev->event_data.fork.parent_pid);
+                if(cn_msg->id.idx == CN_IDX_PROC && cn_msg->id.val == CN_VAL_PROC){
+                    struct proc_event* ev = (struct proc_event*)cn_msg->data;
+                    if (callback_) {
+                        switch (ev->what) {
+                            case proc_event::PROC_EVENT_FORK:
+                                callback_(ProcessEventType::FORK, ev->event_data.fork.child_pid, ev->event_data.fork.parent_pid);
+                                break;
+                            case proc_event::PROC_EVENT_EXEC:
+                                callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_pid);
+                                break;
+                            case proc_event::PROC_EVENT_EXIT:
+                                callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_pid);
+                                break;
+                            default:
+                                break;
                         }
-                        break;
-                    case PROC_EVENT_EXEC:
-                         if (callback_) {
-                            callback_(ProcessEventType::EXEC, ev->event_data.exec.process_pid, ev->event_data.exec.process_pid);
-                        }
-                        break;
-                    case PROC_EVENT_EXIT:
-                         if (callback_) {
-                            callback_(ProcessEventType::EXIT, ev->event_data.exit.process_pid, ev->event_data.exit.process_pid);
-                        }
-                        break;
-                    default:
-                        break;
+                    }
                 }
             }
         }

@@ -6,22 +6,27 @@
 #include <thread>
 #include <atomic>
 
-// 定义进程事件类型
+// 内核发出的进程事件类型
 enum class ProcessEventType {
-    FORK,  // 进程创建
-    EXEC,  // 进程执行新程序
+    FORK,  // 进程创建 (fork)
+    EXEC,  // 执行新程序 (exec)
     EXIT   // 进程退出
 };
 
-// 定义进程事件的回调函数类型
+// 进程事件回调函数签名
 using ProcessEventCallback = std::function<void(ProcessEventType type, int pid, int ppid)>;
 
+// 通过Netlink实时监控系统进程事件
 class ProcessMonitor {
 public:
     ProcessMonitor();
     ~ProcessMonitor();
 
-    // 开始监听进程事件
+    // 禁止拷贝和赋值
+    ProcessMonitor(const ProcessMonitor&) = delete;
+    ProcessMonitor& operator=(const ProcessMonitor&) = delete;
+
+    // 开始监听进程事件，传入回调函数
     void start(ProcessEventCallback callback);
     // 停止监听
     void stop();
