@@ -35,6 +35,12 @@ public:
     // 检查是否有客户端连接
     bool has_clients() const;
 
+    // [NEW] 向除指定fd外的所有客户端广播
+    void broadcast_message_except(const std::string& message, int excluded_fd);
+    
+    // [NEW] 设置客户端断开连接时的回调
+    void set_disconnect_handler(std::function<void(int client_fd)> handler);
+
 private:
     void add_client(int client_fd);
     void remove_client(int client_fd);
@@ -49,7 +55,7 @@ private:
 
     // 回调函数，int是来源客户端的fd
     std::function<void(int, const std::string&)> on_message_received_;
-    
+    std::function<void(int)> on_disconnect_;
     // 每个客户端的接收缓冲区，用于处理粘包
     std::map<int, std::string> client_buffers_;
 };

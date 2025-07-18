@@ -15,32 +15,38 @@
 #include "process_monitor.h"
 
 class ActionExecutor;
+using json = nlohmann::json;
 
-// 应用的完整运行时状态
+// [REFACTOR] 运行时状态增加更多由Probe感知的字段
 struct AppRuntimeState {
     std::string package_name;
-    std::string app_name; // 应用名，用于UI显示
+    std::string app_name;
     int uid = -1;
     int user_id = 0;
     std::vector<int> pids; 
 
-    AppConfig config; // 从数据库加载的或默认的配置
+    AppConfig config;
 
     enum class Status {
-        STOPPED,          // 无运行中进程
-        FOREGROUND,       // 前台运行
-        BACKGROUND_IDLE,  // 后台空闲 (等待超时)
-        AWAITING_FREEZE,  // 等待冻结 (宽限期)
-        FROZEN,           // 已冻结
-        EXEMPTED          // 豁免 (硬性安全网或用户配置)
+        STOPPED,
+        FOREGROUND,
+        BACKGROUND_IDLE,
+        AWAITING_FREEZE,
+        FROZEN,
+        EXEMPTED
     } current_status = Status::STOPPED;
 
     std::chrono::steady_clock::time_point last_state_change_time;
 
-    // 资源占用统计
+    // 资源占用
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
+    
+    // [NEW] 由Probe更新的状态
+    bool is_foreground = false;
+    bool has_audio = false;
+    bool has_notification = false;
 };
 
 class StateManager {
@@ -49,20 +55,23 @@ public:
                  std::shared_ptr<SystemMonitor> sys, 
                  std::shared_ptr<ActionExecutor> act);
 
-    // 事件处理入口
-    void handle_process_event(ProcessEventType type, int pid, int ppid);
-    void handle_probe_event(const nlohmann::json& event);
-
-    // 定时任务，由主线程循环调用
     void tick(); 
     
-    // UI 数据生成与指令处理
-    nlohmann::json get_dashboard_payload();
+    // --- [NEW] 事件处理入口 ---
+    void on_probe_hello(int probe_fd);
+    void on_probe_disconnect();
+    void on_process_event(ProcessEventType type, int pid, int ppid);
+    void on_app_state_changed_from_probe(const json& payload);
+    void on_system_state_changed_from_probe(const json& payload);
+    json on_unfreeze_request_from_probe(const json& payload);
 
-    // [FIX] Corrected function declaration to match implementation.
-    void update_app_config_from_ui(const AppConfig& new_config, int user_id);
+    // --- UI 指令与数据 ---
+    void on_config_changed_from_ui(const AppConfig& new_config, int user_id);
+    json get_dashboard_payload();
+    json get_full_config_for_ui();
     
-    nlohmann::json get_full_config_for_ui();
+    // [NEW] 获取下发给Probe的配置
+    json get_probe_config_payload();
 
 private:
     void initial_process_scan();
@@ -73,11 +82,9 @@ private:
     void remove_pid_from_app(int pid);
     
     void transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
-    void check_foreground_app();
-
+    
     AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
-
     bool is_critical_system_app(const std::string& package_name) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -86,16 +93,15 @@ private:
 
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
+    
+    // [NEW] 系统全局状态
+    bool is_screen_on_ = true;
 
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     
     std::map<int, AppRuntimeState*> pid_to_app_map_;
-    
     std::unordered_set<std::string> critical_system_apps_;
-    
-    std::string foreground_package_;
-    int foreground_uid_ = -1;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H

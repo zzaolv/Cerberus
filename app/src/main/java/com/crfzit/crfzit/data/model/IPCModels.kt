@@ -3,13 +3,10 @@ package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
 
-/**
- * UDS上交换的所有消息的通用顶层结构。
- * @param V 协议版本号
- * @param type 消息类型 (e.g., "stream.dashboard_update", "cmd.set_policy")
- * @param reqId 可选，用于请求-响应模式的唯一ID
- * @param payload 消息的具体负载，类型不确定，使用泛型
- */
+// =======================================================================================
+// 通用消息结构 (保持不变)
+// =======================================================================================
+
 data class CerberusMessage<T>(
     @SerializedName("v")
     val version: Int,
@@ -18,6 +15,10 @@ data class CerberusMessage<T>(
     val requestId: String? = null,
     val payload: T
 )
+
+// =======================================================================================
+// UI <-> Daemon 核心模型 (保持不变，但DashboardPayload会由更丰富的数据构成)
+// =======================================================================================
 
 /**
  * 'stream.dashboard_update' 消息的核心负载模型。
@@ -67,7 +68,7 @@ data class AppRuntimeState(
     val userId: Int = 0,
 
     @SerializedName("display_status")
-    val displayStatus: String = "UNKNOWN", // 直接使用字符串，UI层再解析
+    val displayStatus: String = "UNKNOWN",
 
     @SerializedName("mem_usage_kb")
     val memUsageKb: Long = 0L,
@@ -83,11 +84,61 @@ data class AppRuntimeState(
 
     @SerializedName("is_foreground")
     val isForeground: Boolean = false,
-
+    
+    // [REFACTOR] 新增字段，由Probe感知，Daemon决策后通过流更新到UI
     val hasPlayback: Boolean = false,
     val hasNotification: Boolean = false,
     val hasNetworkActivity: Boolean = false,
     
     @SerializedName("pendingFreezeSec")
     val pendingFreezeSec: Int = 0
+)
+
+// =======================================================================================
+// [NEW] Probe <-> Daemon 新增的专用模型
+// =======================================================================================
+
+/**
+ * Probe向Daemon发送的 `event.app_state_changed` 事件负载。
+ */
+data class ProbeAppStateChangedPayload(
+    @SerializedName("package_name")
+    val packageName: String,
+    @SerializedName("user_id")
+    val userId: Int,
+    @SerializedName("is_foreground")
+    val isForeground: Boolean,
+    @SerializedName("has_ui")
+    val hasUi: Boolean,
+    @SerializedName("oom_adj")
+    val oomAdj: Int,
+    val reason: String
+)
+
+/**
+ * Probe向Daemon发送的 `event.system_state_changed` 事件负载。
+ */
+data class ProbeSystemStateChangedPayload(
+    @SerializedName("screen_on")
+    val screenOn: Boolean? = null,
+    // 这里可以扩展更多系统状态
+)
+
+/**
+ * Daemon向Probe下发的配置更新 `stream.probe_config_update` 的负载。
+ */
+data class ProbeConfigUpdatePayload(
+    val policies: List<AppPolicyPayload>, // 复用之前的 AppPolicyPayload
+    @SerializedName("frozen_apps")
+    val frozenApps: List<AppInstanceKey>
+)
+
+/**
+ * 应用实例的唯一标识
+ */
+data class AppInstanceKey(
+    @SerializedName("package_name")
+    val packageName: String,
+    @SerializedName("user_id")
+    val userId: Int
 )

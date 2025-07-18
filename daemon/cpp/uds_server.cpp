@@ -39,6 +39,11 @@ void UdsServer::add_client(int client_fd) {
     LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
 }
 
+void UdsServer::set_disconnect_handler(std::function<void(int)> handler) {
+    on_disconnect_ = std::move(handler);
+}
+
+
 void UdsServer::remove_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
@@ -47,6 +52,22 @@ void UdsServer::remove_client(int client_fd) {
         client_buffers_.erase(client_fd);
         close(client_fd);
         LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
+        // [NEW] 调用断连回调
+        if (on_disconnect_) {
+            on_disconnect_(client_fd);
+        }
+    }
+}
+
+void UdsServer::broadcast_message_except(const std::string& message, int excluded_fd) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    if (client_fds_.empty()) return;
+
+    auto clients_copy = client_fds_;
+    for (int fd : clients_copy) {
+        if (fd != excluded_fd) {
+            send_message(fd, message);
+        }
     }
 }
 
