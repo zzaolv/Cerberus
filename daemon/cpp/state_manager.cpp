@@ -434,7 +434,7 @@ void StateManager::tick() {
                 if (timeout_sec > 0) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
                     if (elapsed > timeout_sec) { 
-                        LOGI("App '%s' background timeout reached (%ld > %ld).", app.package_name.c_str(), elapsed, timeout_sec);
+                        LOGI("App '%s' background timeout reached (%lld > %ld).", app.package_name.c_str(), elapsed, timeout_sec);
                         transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE, "background timeout");
                     }
                 }

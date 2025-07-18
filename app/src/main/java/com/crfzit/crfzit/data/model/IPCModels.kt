@@ -63,6 +63,7 @@ data class GlobalStats(
 
 /**
  * 单个应用实例的实时运行状态模型，对应守护进程中的 AppRuntimeState。
+ * [FIX] 补充缺失的字段以匹配ViewModel的引用和后端JSON。
  */
 data class AppRuntimeState(
     @SerializedName("package_name")
@@ -77,12 +78,14 @@ data class AppRuntimeState(
     @SerializedName("display_status")
     val displayStatus: String = "UNKNOWN",
 
+    // [FIX] 确保这两个字段存在，以修复编译错误
     @SerializedName("mem_usage_kb")
     val memUsageKb: Long = 0L,
 
     @SerializedName("swap_usage_kb")
     val swapUsageKb: Long = 0L,
 
+    // [FIX] 确保这个字段存在，以修复编译错误
     @SerializedName("cpu_usage_percent")
     val cpuUsagePercent: Float = 0f,
 
@@ -101,7 +104,7 @@ data class AppRuntimeState(
 )
 
 /**
- * [NEW LOCATION] UI向Daemon查询所有策略配置 (`query.get_all_policies`) 的响应负载。
+ * UI向Daemon查询所有策略配置 (`query.get_all_policies`) 的响应负载。
  */
 data class PolicyConfigPayload(
     @SerializedName("hard_safety_net")
@@ -110,7 +113,7 @@ data class PolicyConfigPayload(
 )
 
 /**
- * [NEW LOCATION] 单个应用的持久化策略模型，用于IPC。
+ * 单个应用的持久化策略模型，用于IPC。
  */
 data class AppPolicyPayload(
     @SerializedName("package_name")
@@ -156,7 +159,7 @@ data class ProbeSystemStateChangedPayload(
  * Daemon向Probe下发的配置更新 `stream.probe_config_update` 的负载。
  */
 data class ProbeConfigUpdatePayload(
-    val policies: List<AppPolicyPayload>, // 复用IPC模型
+    val policies: List<AppPolicyPayload>,
     @SerializedName("frozen_apps")
     val frozenApps: List<AppInstanceKey>
 )
