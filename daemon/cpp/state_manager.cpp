@@ -7,6 +7,7 @@
 #include <sstream>
 #include <unistd.h>
 #include <algorithm>
+#include <sys/stat.h> // [FIX] 添加缺失的头文件以定义 struct stat
 
 #define LOG_TAG "cerberusd_state_v2.1"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -741,12 +742,11 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name; // Fallback name
+    new_state.app_name = package_name;
     
     if (is_critical_system_app(package_name)) {
         new_state.config.policy = AppPolicy::EXEMPTED;
         new_state.current_status = AppRuntimeState::Status::EXEMPTED;
-        LOGI("SafetyNet: Critical app '%s' forced to EXEMPTED.", package_name.c_str());
     } else {
         auto config_opt = db_manager_->get_app_config(package_name);
         if(config_opt) {
@@ -754,7 +754,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         } else {
             new_state.config.policy = AppPolicy::EXEMPTED;
             new_state.current_status = AppRuntimeState::Status::EXEMPTED;
-            LOGI("Opt-In: No config for '%s', defaulting to EXEMPTED.", package_name.c_str());
         }
     }
     
@@ -775,8 +774,6 @@ json StateManager::get_full_config_for_ui() {
     response["hard_safety_net"] = json(critical_system_apps_);
     
     json policies = json::array();
-    // To ensure UI gets all apps (even those not running), we might need to combine with DB data
-    // For now, only send running apps' configs
     for (const auto& [key, app] : managed_apps_) {
         json app_policy;
         app_policy["package_name"] = app.package_name;

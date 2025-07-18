@@ -17,7 +17,6 @@
 class ActionExecutor;
 using json = nlohmann::json;
 
-// [REFACTOR] 运行时状态增加更多由Probe感知的字段
 struct AppRuntimeState {
     std::string package_name;
     std::string app_name;
@@ -38,12 +37,10 @@ struct AppRuntimeState {
 
     std::chrono::steady_clock::time_point last_state_change_time;
 
-    // 资源占用
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
     
-    // [NEW] 由Probe更新的状态
     bool is_foreground = false;
     bool has_audio = false;
     bool has_notification = false;
@@ -57,7 +54,7 @@ public:
 
     void tick(); 
     
-    // --- [NEW] 事件处理入口 ---
+    // --- 事件处理入口 ---
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
     void on_process_event(ProcessEventType type, int pid, int ppid);
@@ -70,7 +67,6 @@ public:
     json get_dashboard_payload();
     json get_full_config_for_ui();
     
-    // [NEW] 获取下发给Probe的配置
     json get_probe_config_payload();
 
 private:
@@ -94,7 +90,6 @@ private:
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
     
-    // [NEW] 系统全局状态
     bool is_screen_on_ = true;
 
     using AppInstanceKey = std::pair<std::string, int>; 
@@ -102,6 +97,9 @@ private:
     
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
+
+    // [FIX] 添加缺失的成员变量声明，并初始化为-1表示无效
+    int probe_fd_ = -1; 
 };
 
 #endif //CERBERUS_STATE_MANAGER_H
