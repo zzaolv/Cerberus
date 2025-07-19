@@ -12,7 +12,7 @@
 #include <set>
 #include <tuple>
 
-#define LOG_TAG "cerberusd_state_v11.0_refactored"
+#define LOG_TAG "cerberusd_state_v11.1_fix" // Version bump for fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -53,7 +53,7 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v11.0, Refactored) Initializing...");
+    LOGI("StateManager (v11.1, Refactored) Initializing...");
     
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -398,11 +398,46 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     };
    
     
-    
     load_all_configs();
-    reconcile_process_state();
+    reconcile_process_state(); // This call requires the function to be defined.
     LOGI("StateManager Initialized.");
 }
+
+// [FIX] Added back the missing implementation of reconcile_process_state
+void StateManager::reconcile_process_state() {
+    // This is a simplified version for initialization and periodic checks.
+    // It finds all relevant processes and ensures they are known to the StateManager.
+    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        try {
+            int pid = std::stoi(entry.path().filename().string());
+            int uid = -1, user_id = -1;
+            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+            if (!pkg_name.empty()) {
+                current_pids[pid] = {pkg_name, user_id, uid};
+            }
+        } catch (...) { continue; }
+    }
+
+    // Un-track dead PIDs
+    std::vector<int> dead_pids;
+    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
+        if (current_pids.find(pid) == current_pids.end()) {
+            dead_pids.push_back(pid);
+        }
+    }
+    for (int pid : dead_pids) remove_pid_from_app(pid);
+
+    // Track new PIDs
+    for(const auto& [pid, info_tuple] : current_pids) {
+        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
+            const auto& [pkg_name, user_id, uid] = info_tuple;
+            add_pid_to_app(pid, pkg_name, user_id, uid);
+        }
+    }
+}
+
 
 bool StateManager::on_unfreeze_request(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -431,7 +466,6 @@ ProbeEventResult StateManager::on_app_state_changed_from_probe(const json& paylo
         bool is_foreground = payload.value("is_foreground", false);
         bool is_cached = payload.value("is_cached", false);
         
-        // [FIX] Declare the 'key' variable right after parsing the necessary info.
         AppInstanceKey key = {pkg, user_id};
 
         AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
@@ -449,7 +483,7 @@ ProbeEventResult StateManager::on_app_state_changed_from_probe(const json& paylo
         } else if (is_cached) {
             if (app->config.policy >= AppPolicy::STANDARD && app->current_status != AppRuntimeState::Status::FROZEN) {
                 LOGI("[FREEZE] App %s (user %d) is cached with policy %d, freezing.", pkg.c_str(), user_id, (int)app->config.policy);
-                if (action_executor_->freeze(key, app->pids)) { // Now 'key' is declared and valid
+                if (action_executor_->freeze(key, app->pids)) {
                     if (transition_state(*app, AppRuntimeState::Status::FROZEN, "app cached by system")) {
                         return { .state_changed = true, .config_maybe_changed = true };
                     }
@@ -469,38 +503,20 @@ ProbeEventResult StateManager::on_app_state_changed_from_probe(const json& paylo
 
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    bool state_changed = false;
-
-    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        try {
-            int pid = std::stoi(entry.path().filename().string());
-            int uid = -1, user_id = -1;
-            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
-            if (!pkg_name.empty()) {
-                current_pids[pid] = {pkg_name, user_id, uid};
-            }
-        } catch (...) { continue; }
-    }
-
+    
+    // In the new model, the primary role of tick() is just to find dead processes
+    // that the probe might not have reported.
+    bool state_changed_due_to_death = false;
     std::vector<int> dead_pids;
     for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (current_pids.find(pid) == current_pids.end()) {
+        if (!fs::exists("/proc/" + std::to_string(pid))) {
             dead_pids.push_back(pid);
-            state_changed = true;
+            state_changed_due_to_death = true;
         }
     }
     for (int pid : dead_pids) remove_pid_from_app(pid);
 
-    for(const auto& [pid, info_tuple] : current_pids) {
-        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
-            const auto& [pkg_name, user_id, uid] = info_tuple;
-            add_pid_to_app(pid, pkg_name, user_id, uid);
-            state_changed = true;
-        }
-    }
-
+    // And to update resource stats
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
     for (auto& [key, app] : managed_apps_) {
@@ -509,7 +525,7 @@ bool StateManager::tick() {
         }
     }
     
-    return state_changed;
+    return state_changed_due_to_death;
 }
 
 AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) {
