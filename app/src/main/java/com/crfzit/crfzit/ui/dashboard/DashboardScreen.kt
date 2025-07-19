@@ -56,18 +56,26 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
                     IconButton(onClick = { showMenu = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = "更多")
                     }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
-                            onClick = {
-                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
-                                showMenu = false
-                            }
-                        )
-                    }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
+                        onClick = {
+                            viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
+                            showMenu = false
+                        }
+                    )
+                    // [FIX #1] 新增菜单项
+                    DropdownMenuItem(
+                        text = { Text(if (uiState.showOnlyForeground) "显示所有进程" else "仅显示前台") },
+                        onClick = {
+                            viewModel.onShowOnlyForegroundChanged(!uiState.showOnlyForeground)
+                            showMenu = false
+                        }
+                    )
+                }
                 }
             )
         }

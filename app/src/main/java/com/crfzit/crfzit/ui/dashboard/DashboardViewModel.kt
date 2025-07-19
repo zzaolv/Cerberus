@@ -29,6 +29,7 @@ data class DashboardUiState(
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
     val showSystemApps: Boolean = false
+    val showOnlyForeground: Boolean = false // [FIX #1] 新增状态
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -47,11 +48,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
-                _uiState.map { it.showSystemApps }.distinctUntilChanged()
-            ) { dashboardPayload, speed, showSystem ->
+                _uiState.map { it.showSystemApps }.distinctUntilChanged(),
+                _uiState.map { it.showOnlyForeground }.distinctUntilChanged() // [FIX #1] 监听新状态
+            ) { dashboardPayload, speed, showSystem, showOnlyFg -> // [FIX #1] 接收新状态
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
-                        val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
+                        val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName, runtimeState.userId)
                         UiAppRuntime(
                             runtimeState = runtimeState,
                             appName = appInfo?.appName ?: runtimeState.packageName,
@@ -61,9 +63,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                     .filter { showSystem || !it.isSystem }
+                    // [FIX #1] 新增过滤逻辑
+                    .filter { !showOnlyFg || it.runtimeState.isForeground }
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
-                            // [FIX] 使用Kotlin的驼峰式(camelCase)属性名进行访问
                             .thenByDescending { it.runtimeState.cpuUsagePercent }
                             .thenByDescending { it.runtimeState.memUsageKb }
                     )
@@ -74,7 +77,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = uiAppRuntimes,
-                    showSystemApps = showSystem
+                    showSystemApps = showSystem,
+                    showOnlyForeground = showOnlyFg // [FIX #1] 更新状态
                 )
             }
                 .onStart { _uiState.update { it.copy(isConnected = false) } }
@@ -95,6 +99,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
+    // [FIX #1] 新增方法来改变过滤状态
+    fun onShowOnlyForegroundChanged(show: Boolean) {
+        _uiState.update { it.copy(showOnlyForeground = show) }
 
     override fun onCleared() {
         super.onCleared()

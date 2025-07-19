@@ -4,6 +4,8 @@ package com.crfzit.crfzit.data.repository
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Process
+import android.os.UserManager
 import com.crfzit.crfzit.data.model.AppInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -11,78 +13,97 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * 单例仓库，负责加载并缓存所有已安装应用的基本信息。
- * [BUGFIX #3] 增加动态获取单个应用信息并更新缓存的能力。
- */
 class AppInfoRepository private constructor(private val context: Context) {
 
     private val packageManager: PackageManager = context.packageManager
-    private val appInfoCache: ConcurrentHashMap<String, AppInfo> = ConcurrentHashMap()
-    private val cacheMutex = Mutex() // 用于保护缓存的加载过程
+    // [FIX #2] 缓存的Key需要包含userId，以区分不同用户的同一个应用
+    private val appInfoCache: ConcurrentHashMap<Pair<String, Int>, AppInfo> = ConcurrentHashMap()
+    private val cacheMutex = Mutex()
 
     suspend fun getAllApps(forceRefresh: Boolean = false): List<AppInfo> {
         cacheMutex.withLock {
             if (appInfoCache.isNotEmpty() && !forceRefresh) {
                 return appInfoCache.values.toList()
             }
-            loadAllInstalledApps()
+            loadAllInstalledAppsForAllUsers()
             return appInfoCache.values.toList()
         }
     }
 
-    /**
-     * [BUGFIX #3] 新增：动态获取单个应用信息。
-     * 如果缓存中不存在，则从系统中查询并添加到缓存中。
-     */
-    suspend fun getAppInfo(packageName: String): AppInfo? {
-        // 先快速检查缓存，无锁
-        appInfoCache[packageName]?.let { return it }
+    suspend fun getAppInfo(packageName: String, userId: Int): AppInfo? {
+        val key = packageName to userId
+        appInfoCache[key]?.let { return it }
 
-        // 缓存未命中，加锁进行查询和更新
         return cacheMutex.withLock {
-            // 双重检查，防止在等待锁的过程中其他协程已经加载了缓存
-            appInfoCache[packageName]?.let { return@withLock it }
-
-            val app = loadSingleApp(packageName)
-            app?.let { appInfoCache[packageName] = it }
+            appInfoCache[key]?.let { return@withLock it }
+            
+            // [FIX #2] 需要为指定用户加载应用信息
+            val app = loadSingleAppForUser(packageName, userId)
+            app?.let { appInfoCache[key] = it }
             app
         }
     }
-
-    private suspend fun loadAllInstalledApps() {
-        // 这个函数应在持有 cacheMutex 锁的情况下被调用
+    
+    // [FIX #2] 重写加载逻辑，使其遍历所有用户
+    private suspend fun loadAllInstalledAppsForAllUsers() {
         withContext(Dispatchers.IO) {
             appInfoCache.clear()
-            val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-                .filterNotNull()
-                .mapNotNull { appInfo ->
-                    try {
-                        createAppInfoFrom(appInfo)
-                    } catch (e: Exception) {
-                        null
+            val userManager = context.getSystemService(UserManager::class.java)
+            val userHandles = userManager.userProfiles
+
+            userHandles.forEach { userHandle ->
+                val userId = userManager.getSerialNumberForUser(userHandle).toInt()
+                // 安卓内部API，用以获取指定用户的Context，从而获取其PackageManager
+                val userContext = context.createPackageContextAsUser(
+                    context.packageName, 0, userHandle
+                )
+                val userPackageManager = userContext.packageManager
+
+                val appsForUser = userPackageManager.getInstalledApplications(PackageManager.GET_META_DATA)
+                    .filterNotNull()
+                    .mapNotNull { appInfo ->
+                        try {
+                            // 使用userPackageManager来加载应用名和图标
+                            createAppInfoFrom(appInfo, userPackageManager, userId)
+                        } catch (e: Exception) {
+                            null
+                        }
                     }
-                }
-            
-            appInfoCache.putAll(apps.associateBy { it.packageName })
+                
+                appInfoCache.putAll(appsForUser.associateBy { it.packageName to it.userId })
+            }
         }
     }
     
-    private suspend fun loadSingleApp(packageName: String): AppInfo? = withContext(Dispatchers.IO) {
+    private suspend fun loadSingleAppForUser(packageName: String, userId: Int): AppInfo? = withContext(Dispatchers.IO) {
         try {
-            val appInfo = packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
-            createAppInfoFrom(appInfo)
+            val userManager = context.getSystemService(UserManager::class.java)
+            val userHandle = userManager.getUserForSerialNumber(userId.toLong()) ?: return@withContext null
+            
+            val userContext = context.createPackageContextAsUser(context.packageName, 0, userHandle)
+            val userPackageManager = userContext.packageManager
+
+            val appInfo = userPackageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+            createAppInfoFrom(appInfo, userPackageManager, userId)
         } catch (e: PackageManager.NameNotFoundException) {
-            null // 应用可能已被卸载
+            null
+        } catch (e: Exception) {
+            // IllegalArgumentException if user does not exist
+            null
         }
     }
     
-    private fun createAppInfoFrom(appInfo: ApplicationInfo): AppInfo {
+    private fun createAppInfoFrom(
+        appInfo: ApplicationInfo, 
+        pm: PackageManager, // 传入对应的PackageManager
+        userId: Int
+    ): AppInfo {
          return AppInfo(
             packageName = appInfo.packageName,
-            appName = appInfo.loadLabel(packageManager).toString(),
-            icon = appInfo.loadIcon(packageManager),
-            isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            appName = appInfo.loadLabel(pm).toString(),
+            icon = appInfo.loadIcon(pm),
+            isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+            userId = userId // 明确设置userId
         )
     }
 

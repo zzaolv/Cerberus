@@ -442,6 +442,8 @@ void StateManager::tick() {
                 if (elapsed > 5) {
                     if (action_executor_->freeze(key, app.pids)) {
                         transition_state(app, AppRuntimeState::Status::FROZEN, "grace period ended");
+                        // [FIX #3] 核心修复：应用被冻结后，立即通知Probe更新其缓存
+                        notify_probe_of_config_change(); 
                     } else {
                         LOGW("Failed to freeze '%s', reverting to BACKGROUND_IDLE", (app.package_name + "_" + std::to_string(app.user_id)).c_str());
                         transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "freeze failed");
@@ -449,9 +451,6 @@ void StateManager::tick() {
                 }
                 break;
             }
-            default:
-                break;
-        }
     }
 }
 
