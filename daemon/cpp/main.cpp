@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v6.1" // Version bump for the fix
+#define LOG_TAG "cerberusd_main_v8" // Version bump for the fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -46,7 +46,7 @@ void notify_probe_of_config_change() {
         LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 6},
+            {"v", 8},
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
