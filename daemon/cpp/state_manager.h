@@ -24,17 +24,19 @@ struct AppRuntimeState {
     std::vector<int> pids; 
     AppConfig config;
     enum class Status {
-        STOPPED, FOREGROUND, BACKGROUND_IDLE, FROZEN, EXEMPTED
-        // [REMOVED] AWAITING_FREEZE is no longer needed as freeze is now instant.
+        STOPPED, FOREGROUND, BACKGROUND_IDLE, 
+        AWAITING_FREEZE, // [FIX] Re-added for timeout-based freezing
+        FROZEN, EXEMPTED
     } current_status = Status::STOPPED;
     std::chrono::steady_clock::time_point last_state_change_time;
+    // [NEW] Timestamp for when the app went to background, used for freeze timeout.
+    std::chrono::steady_clock::time_point last_background_time;
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
-    bool is_foreground = false; // Kept for UI display purposes
+    bool is_foreground = false;
 };
 
-// [NEW] Struct to return multiple results from probe event handlers
 struct ProbeEventResult {
     bool state_changed = false;
     bool config_maybe_changed = false;
@@ -46,19 +48,16 @@ public:
                  std::shared_ptr<SystemMonitor> sys, 
                  std::shared_ptr<ActionExecutor> act);
 
-    // [REFACTORED] tick is now a lightweight maintenance function
     bool tick();
     
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
     
-    // Handles high-priority, synchronous unfreeze requests from Probe (e.g. for cold starts)
     bool on_unfreeze_request(const json& payload);
     
-    // [NEW] Handles detailed state changes from Probe (foreground, cached, etc.)
+    // [REFACTORED] Now primarily updates foreground state and background timestamp
     ProbeEventResult on_app_state_changed_from_probe(const json& payload);
     
-    // Handles config changes from UI. Returns true if a probe config update is needed.
     bool on_config_changed_from_ui(const AppConfig& new_config);
 
     json get_dashboard_payload();
@@ -73,7 +72,6 @@ private:
     void add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid);
     void remove_pid_from_app(int pid);
     
-    // Returns true if the freeze state (frozen vs not-frozen) changed.
     bool transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
@@ -86,7 +84,6 @@ private:
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
     
-    // is_screen_on_ can be updated by probe events
     bool is_screen_on_ = true;
 
     using AppInstanceKey = std::pair<std::string, int>; 

@@ -12,7 +12,7 @@
 #include <set>
 #include <tuple>
 
-#define LOG_TAG "cerberusd_state_v11.1_fix" // Version bump for fix
+#define LOG_TAG "cerberusd_state_v11.2_hotfix" // Version bump
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,16 +21,19 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// [FIX] Re-added AWAITING_FREEZE state and updated the to_string function
 static std::string status_to_string(AppRuntimeState::Status status) {
     switch (status) {
         case AppRuntimeState::Status::STOPPED: return "STOPPED";
         case AppRuntimeState::Status::FOREGROUND: return "FOREGROUND";
         case AppRuntimeState::Status::BACKGROUND_IDLE: return "BACKGROUND_IDLE";
+        case AppRuntimeState::Status::AWAITING_FREEZE: return "AWAITING_FREEZE";
         case AppRuntimeState::Status::FROZEN: return "FROZEN";
         case AppRuntimeState::Status::EXEMPTED: return "EXEMPTED";
     }
     return "UNKNOWN";
 }
+
 
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
@@ -53,7 +56,7 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v11.1, Refactored) Initializing...");
+    LOGI("StateManager (v11.2, Hotfix) Initializing...");
     
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -399,14 +402,11 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
    
     
     load_all_configs();
-    reconcile_process_state(); // This call requires the function to be defined.
+    reconcile_process_state();
     LOGI("StateManager Initialized.");
 }
 
-// [FIX] Added back the missing implementation of reconcile_process_state
 void StateManager::reconcile_process_state() {
-    // This is a simplified version for initialization and periodic checks.
-    // It finds all relevant processes and ensures they are known to the StateManager.
     std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
@@ -420,7 +420,6 @@ void StateManager::reconcile_process_state() {
         } catch (...) { continue; }
     }
 
-    // Un-track dead PIDs
     std::vector<int> dead_pids;
     for(const auto& [pid, app_ptr] : pid_to_app_map_) {
         if (current_pids.find(pid) == current_pids.end()) {
@@ -429,32 +428,11 @@ void StateManager::reconcile_process_state() {
     }
     for (int pid : dead_pids) remove_pid_from_app(pid);
 
-    // Track new PIDs
     for(const auto& [pid, info_tuple] : current_pids) {
         if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
             const auto& [pkg_name, user_id, uid] = info_tuple;
             add_pid_to_app(pid, pkg_name, user_id, uid);
         }
-    }
-}
-
-
-bool StateManager::on_unfreeze_request(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    try {
-        std::string pkg = payload.at("package_name").get<std::string>();
-        int user_id = payload.at("user_id").get<int>();
-        AppInstanceKey key = {pkg, user_id};
-        LOGW("[UNFREEZE] High-priority unfreeze request for %s (user %d)", pkg.c_str(), user_id);
-        auto it = managed_apps_.find(key);
-        if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) {
-            transition_state(it->second, AppRuntimeState::Status::BACKGROUND_IDLE, "unfrozen by high-priority request");
-            return true;
-        }
-        return true; 
-    } catch (const json::exception& e) {
-        LOGE("JSON error in on_unfreeze_request: %s", e.what());
-        return false;
     }
 }
 
@@ -464,171 +442,125 @@ ProbeEventResult StateManager::on_app_state_changed_from_probe(const json& paylo
         std::string pkg = payload.at("package_name").get<std::string>();
         int user_id = payload.value("user_id", 0);
         bool is_foreground = payload.value("is_foreground", false);
-        bool is_cached = payload.value("is_cached", false);
         
-        AppInstanceKey key = {pkg, user_id};
-
         AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
-        if (!app) return {};
+        if (!app || app->config.policy == AppPolicy::EXEMPTED) {
+            return {};
+        }
 
         app->is_foreground = is_foreground;
 
         if (is_foreground) {
-            if (app->current_status == AppRuntimeState::Status::FROZEN) {
-                LOGI("[UNFREEZE] App %s (user %d) became foreground, unfreezing.", pkg.c_str(), user_id);
-                if (transition_state(*app, AppRuntimeState::Status::FOREGROUND, "app foregrounded")) {
-                    return { .state_changed = true, .config_maybe_changed = true };
-                }
-            }
-        } else if (is_cached) {
-            if (app->config.policy >= AppPolicy::STANDARD && app->current_status != AppRuntimeState::Status::FROZEN) {
-                LOGI("[FREEZE] App %s (user %d) is cached with policy %d, freezing.", pkg.c_str(), user_id, (int)app->config.policy);
-                if (action_executor_->freeze(key, app->pids)) {
-                    if (transition_state(*app, AppRuntimeState::Status::FROZEN, "app cached by system")) {
-                        return { .state_changed = true, .config_maybe_changed = true };
-                    }
-                }
-            }
+            // App came to foreground, it must be running and not frozen.
+            LOGI("Probe: %s (user %d) is now FOREGROUND.", pkg.c_str(), user_id);
+            transition_state(*app, AppRuntimeState::Status::FOREGROUND, "app foregrounded");
         } else {
-            if (app->current_status == AppRuntimeState::Status::FROZEN) {
-                 transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "external unfreeze detected");
-            }
+            // App went to background. Start the clock for freezing.
+            LOGI("Probe: %s (user %d) is now BACKGROUND.", pkg.c_str(), user_id);
+            app->last_background_time = std::chrono::steady_clock::now();
+            transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "app backgrounded");
         }
-
+        return { .state_changed = true };
     } catch (const json::exception& e) {
         LOGE("JSON error in on_app_state_changed_from_probe: %s", e.what());
     }
     return {};
 }
 
+// [CRITICAL FIX] Reintroduced and refined the timeout-based freeze logic in tick().
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    // In the new model, the primary role of tick() is just to find dead processes
-    // that the probe might not have reported.
-    bool state_changed_due_to_death = false;
-    std::vector<int> dead_pids;
-    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (!fs::exists("/proc/" + std::to_string(pid))) {
-            dead_pids.push_back(pid);
-            state_changed_due_to_death = true;
-        }
-    }
-    for (int pid : dead_pids) remove_pid_from_app(pid);
+    bool state_changed = false;
+    auto now = std::chrono::steady_clock::now();
 
-    // And to update resource stats
+    // Run reconciliation to find newly started or terminated apps
+    reconcile_process_state();
+
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
     for (auto& [key, app] : managed_apps_) {
         if (!app.pids.empty()) {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         }
-    }
-    
-    return state_changed_due_to_death;
-}
 
-AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) {
-    if (package_name.empty()) return nullptr;
-    AppInstanceKey key = {package_name, user_id};
-    auto it = managed_apps_.find(key);
-    if (it != managed_apps_.end()) return &it->second;
-    
-    AppRuntimeState new_state;
-    new_state.package_name = package_name;
-    new_state.user_id = user_id;
-    new_state.app_name = package_name;
-    auto config_opt = db_manager_->get_app_config(package_name, user_id);
-    
-    if (is_critical_system_app(package_name)) {
-        new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED, false, false};
-        LOGW("SafetyNet: App '%s' is critical, forcing EXEMPTED policy.", package_name.c_str());
-    } else {
-        new_state.config = config_opt.value_or(AppConfig{package_name, user_id, AppPolicy::EXEMPTED, false, false});
-    }
+        // Freeze logic is now back here, but more robust.
+        // It only triggers for apps in BACKGROUND_IDLE state.
+        if (app.current_status == AppRuntimeState::Status::BACKGROUND_IDLE && !app.is_foreground) {
+            long timeout_sec = -1;
+            if (app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
+            else if (app.config.policy == AppPolicy::STANDARD) timeout_sec = is_screen_on_ ? 90 : 45;
+            
+            if (timeout_sec > 0 && std::chrono::duration_cast<std::chrono::seconds>(now - app.last_background_time).count() >= timeout_sec) { 
+                if (transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE, "background timeout")) {
+                    state_changed = true;
+                }
+            }
+        }
 
-    new_state.current_status = new_state.pids.empty() ? AppRuntimeState::Status::STOPPED : 
-                               (new_state.config.policy == AppPolicy::EXEMPTED ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE);
-
-    auto [map_iterator, success] = managed_apps_.emplace(key, new_state);
-    return &map_iterator->second;
-}
-
-void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) {
-    AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
-    if (!app) return;
-    if (app->uid == -1) app->uid = uid;
-    if (app->app_name.empty() || app->app_name == app->package_name) {
-        app->app_name = sys_monitor_->get_app_name_from_pid(pid);
-        if(app->app_name.empty()) app->app_name = package_name;
-    }
-    if (std::find(app->pids.begin(), app->pids.end(), pid) == app->pids.end()) {
-        app->pids.push_back(pid);
-        pid_to_app_map_[pid] = app;
-        if (app->current_status == AppRuntimeState::Status::STOPPED) {
-            auto initial_status = (app->config.policy == AppPolicy::EXEMPTED) ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE;
-            transition_state(*app, initial_status, "process started");
-        } else if (app->current_status == AppRuntimeState::Status::FROZEN) {
-            LOGW("New PID %d born into frozen app %s. Freezing immediately.", pid, package_name.c_str());
-            action_executor_->move_pids_to_instance_cgroup({package_name, user_id}, {pid});
+        // The actual freeze action is triggered from AWAITING_FREEZE state.
+        if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
+             if (std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count() >= 5) { // 5s grace period
+                if (action_executor_->freeze(key, app.pids)) {
+                    if (transition_state(app, AppRuntimeState::Status::FROZEN, "grace period ended")) {
+                        state_changed = true;
+                    }
+                } else {
+                    transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "freeze action failed");
+                }
+            }
         }
     }
+    
+    return state_changed;
 }
 
-bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) { 
-    std::lock_guard<std::mutex> lock(state_mutex_); 
-    if (is_critical_system_app(new_config.package_name) && new_config.policy != AppPolicy::EXEMPTED) { 
-        LOGW("Attempt to set non-exempt policy for critical system app %s was denied.", new_config.package_name.c_str()); 
-        return false; 
-    } 
-    db_manager_->set_app_config(new_config); 
-    AppRuntimeState* app_state_ptr = get_or_create_app_state(new_config.package_name, new_config.user_id); 
-    bool config_changed = false; 
-    if (app_state_ptr) { 
-        AppRuntimeState& app_state = *app_state_ptr; 
-        app_state.config = new_config; 
-        LOGI("Applied new config for %s. Policy is now %d.", app_state.package_name.c_str(), (int)app_state.config.policy); 
-        AppRuntimeState::Status old_status = app_state.current_status; 
-        if (app_state.config.policy == AppPolicy::EXEMPTED) { 
-            if (transition_state(app_state, AppRuntimeState::Status::EXEMPTED, "policy changed to exempted")) config_changed = true; 
-        } else if (old_status == AppRuntimeState::Status::EXEMPTED && !app_state.pids.empty()) { 
-            if (transition_state(app_state, app_state.is_foreground ? AppRuntimeState::Status::FOREGROUND : AppRuntimeState::Status::BACKGROUND_IDLE, "policy changed to managed")) config_changed = true; 
-        } 
-    } 
-    return config_changed; 
+// [CRITICAL FIX] Solves problem 1 (missing clones) by merging DB and live processes.
+json StateManager::get_full_config_for_ui() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // Create a map to hold the final, merged list of apps.
+    std::map<AppInstanceKey, AppConfig> final_app_configs;
+
+    // 1. Add all apps from the database.
+    auto all_db_configs = db_manager_->get_all_app_configs();
+    for (const auto& config : all_db_configs) {
+        final_app_configs[{config.package_name, config.user_id}] = config;
+    }
+
+    // 2. Add all currently running apps that might not be in the database yet (like new clones).
+    for (const auto& [key, app_state] : managed_apps_) {
+        if (final_app_configs.find(key) == final_app_configs.end()) {
+            // This app is running but has no DB entry, add it with its current (default) config.
+            final_app_configs[key] = app_state.config;
+        }
+    }
+
+    json response;
+    response["hard_safety_net"] = json(critical_system_apps_);
+    json policies = json::array();
+    for (const auto& [key, config] : final_app_configs) {
+        json app_policy;
+        app_policy["package_name"] = config.package_name;
+        app_policy["user_id"] = config.user_id;
+        app_policy["policy"] = static_cast<int>(config.policy);
+        app_policy["force_playback_exempt"] = config.force_playback_exempt;
+        app_policy["force_network_exempt"] = config.force_network_exempt;
+        policies.push_back(app_policy);
+    }
+    response["policies"] = policies;
+    return response;
 }
 
-void StateManager::remove_pid_from_app(int pid) { 
-    auto it = pid_to_app_map_.find(pid); 
-    if (it == pid_to_app_map_.end()) return; 
-    AppRuntimeState* app = it->second; 
-    pid_to_app_map_.erase(it); 
-    auto& pids = app->pids; 
-    pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end()); 
-    if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) { 
-        transition_state(*app, AppRuntimeState::Status::STOPPED, "all processes exited"); 
-        app->mem_usage_kb=0; app->swap_usage_kb=0; app->cpu_usage_percent=0.0f; 
-    } 
-}
-
-bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) { 
-    if (app.current_status == new_status) return false; 
-    AppInstanceKey key = {app.package_name, app.user_id}; 
-    LOGI("State transition for %s (user %d): %s -> %s. Reason: %s", app.package_name.c_str(), app.user_id, status_to_string(app.current_status).c_str(), status_to_string(new_status).c_str(), reason.c_str()); 
-    bool was_frozen = app.current_status == AppRuntimeState::Status::FROZEN; 
-    if (was_frozen && new_status != AppRuntimeState::Status::FROZEN) { 
-        action_executor_->unfreeze_and_cleanup(key); 
-    } 
-    app.current_status = new_status; 
-    app.last_state_change_time = std::chrono::steady_clock::now(); 
-    bool is_now_frozen = new_status == AppRuntimeState::Status::FROZEN; 
-    return was_frozen != is_now_frozen; 
-}
-
+// All other functions are provided for completeness, their logic is mostly unchanged but adapted to the new state machine.
+bool StateManager::on_unfreeze_request(const json& payload) { std::lock_guard<std::mutex> lock(state_mutex_); try { std::string pkg = payload.at("package_name").get<std::string>(); int user_id = payload.at("user_id").get<int>(); AppInstanceKey key = {pkg, user_id}; LOGW("[UNFREEZE] High-priority unfreeze request for %s (user %d)", pkg.c_str(), user_id); auto it = managed_apps_.find(key); if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) { transition_state(it->second, AppRuntimeState::Status::BACKGROUND_IDLE, "unfrozen by high-priority request"); } return true; } catch (const json::exception& e) { LOGE("JSON error in on_unfreeze_request: %s", e.what()); return false; } }
+AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) { if (package_name.empty()) return nullptr; AppInstanceKey key = {package_name, user_id}; auto it = managed_apps_.find(key); if (it != managed_apps_.end()) return &it->second; AppRuntimeState new_state; new_state.package_name = package_name; new_state.user_id = user_id; new_state.app_name = package_name; auto config_opt = db_manager_->get_app_config(package_name, user_id); if (is_critical_system_app(package_name)) { new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED, false, false}; } else { new_state.config = config_opt.value_or(AppConfig{package_name, user_id, AppPolicy::EXEMPTED, false, false}); } new_state.last_state_change_time = std::chrono::steady_clock::now(); new_state.last_background_time = std::chrono::steady_clock::now(); auto [map_iterator, success] = managed_apps_.emplace(key, new_state); AppRuntimeState* app_ptr = &map_iterator->second; for (const auto& [pid, app_in_map] : pid_to_app_map_) { if (app_in_map == nullptr && get_package_name_from_pid(pid, app_ptr->uid, app_ptr->user_id) == package_name && app_ptr->user_id == user_id) { app_ptr->pids.push_back(pid); pid_to_app_map_[pid] = app_ptr; } } if (!app_ptr->pids.empty()) { app_ptr->current_status = (app_ptr->config.policy == AppPolicy::EXEMPTED) ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE; } else { app_ptr->current_status = AppRuntimeState::Status::STOPPED; } return app_ptr; }
+void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) { AppRuntimeState* app = get_or_create_app_state(package_name, user_id); if (!app) return; if (app->uid == -1) app->uid = uid; if (app->app_name.empty() || app->app_name == app->package_name) { app->app_name = sys_monitor_->get_app_name_from_pid(pid); if(app->app_name.empty()) app->app_name = package_name; } if (std::find(app->pids.begin(), app->pids.end(), pid) == app->pids.end()) { app->pids.push_back(pid); pid_to_app_map_[pid] = app; if (app->current_status == AppRuntimeState::Status::STOPPED) { auto initial_status = (app->config.policy == AppPolicy::EXEMPTED) ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE; transition_state(*app, initial_status, "process started"); } else if (app->current_status == AppRuntimeState::Status::FROZEN) { LOGW("New PID %d born into frozen app %s. Freezing immediately.", pid, package_name.c_str()); action_executor_->move_pids_to_instance_cgroup({package_name, user_id}, {pid}); } } }
+bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) { std::lock_guard<std::mutex> lock(state_mutex_); if (is_critical_system_app(new_config.package_name) && new_config.policy != AppPolicy::EXEMPTED) { LOGW("Attempt to set non-exempt policy for critical system app %s was denied.", new_config.package_name.c_str()); return false; } db_manager_->set_app_config(new_config); AppRuntimeState* app_state_ptr = get_or_create_app_state(new_config.package_name, new_config.user_id); bool config_changed = false; if (app_state_ptr) { AppRuntimeState& app_state = *app_state_ptr; app_state.config = new_config; LOGI("Applied new config for %s. Policy is now %d.", app_state.package_name.c_str(), (int)app_state.config.policy); AppRuntimeState::Status old_status = app_state.current_status; if (app_state.config.policy == AppPolicy::EXEMPTED) { if (transition_state(app_state, AppRuntimeState::Status::EXEMPTED, "policy changed to exempted")) config_changed = true; } else if (old_status == AppRuntimeState::Status::EXEMPTED && !app_state.pids.empty()) { if (transition_state(app_state, app_state.is_foreground ? AppRuntimeState::Status::FOREGROUND : AppRuntimeState::Status::BACKGROUND_IDLE, "policy changed to managed")) config_changed = true; } } return config_changed; }
+void StateManager::remove_pid_from_app(int pid) { auto it = pid_to_app_map_.find(pid); if (it == pid_to_app_map_.end()) return; AppRuntimeState* app = it->second; pid_to_app_map_.erase(it); auto& pids = app->pids; pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end()); if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) { transition_state(*app, AppRuntimeState::Status::STOPPED, "all processes exited"); app->mem_usage_kb=0; app->swap_usage_kb=0; app->cpu_usage_percent=0.0f; } }
+bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) { if (app.current_status == new_status) return false; AppInstanceKey key = {app.package_name, app.user_id}; LOGI("State transition for %s (user %d): %s -> %s. Reason: %s", app.package_name.c_str(), app.user_id, status_to_string(app.current_status).c_str(), status_to_string(new_status).c_str(), reason.c_str()); bool was_frozen = app.current_status == AppRuntimeState::Status::FROZEN; if (was_frozen && new_status != AppRuntimeState::Status::FROZEN) { action_executor_->unfreeze_and_cleanup(key); } app.current_status = new_status; app.last_state_change_time = std::chrono::steady_clock::now(); bool is_now_frozen = new_status == AppRuntimeState::Status::FROZEN; return was_frozen != is_now_frozen; }
 void StateManager::on_probe_hello(int probe_fd) { std::lock_guard<std::mutex> lock(state_mutex_); probe_fd_ = probe_fd; }
 void StateManager::on_probe_disconnect() { std::lock_guard<std::mutex> lock(state_mutex_); probe_fd_ = -1; }
 bool StateManager::is_critical_system_app(const std::string& package_name) const { if (package_name.empty()) return false; return critical_system_apps_.count(package_name) > 0; }
 void StateManager::load_all_configs() { auto configs = db_manager_->get_all_app_configs(); for(const auto& db_config : configs){ get_or_create_app_state(db_config.package_name, db_config.user_id); } }
-json StateManager::get_dashboard_payload() { std::lock_guard<std::mutex> lock(state_mutex_); json payload; payload["global_stats"] = { {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent}, {"total_mem_kb", global_stats_.total_mem_kb}, {"avail_mem_kb", global_stats_.avail_mem_kb}, {"swap_total_kb", global_stats_.swap_total_kb}, {"swap_free_kb", global_stats_.swap_free_kb}, {"active_profile_name", is_screen_on_ ? "⚡️ On-Screen" : "🧊 Off-Screen"} }; json apps_state = json::array(); for (const auto& [key, app] : managed_apps_) { if (app.current_status == AppRuntimeState::Status::STOPPED) continue; json app_json; app_json["package_name"] = app.package_name; app_json["app_name"] = app.app_name; app_json["user_id"] = app.user_id; app_json["display_status"] = status_to_string(app.current_status); app_json["mem_usage_kb"] = app.mem_usage_kb; app_json["swap_usage_kb"] = app.swap_usage_kb; app_json["cpu_usage_percent"] = app.cpu_usage_percent; app_json["is_whitelisted"] = app.config.policy == AppPolicy::EXEMPTED; app_json["is_foreground"] = app.is_foreground; app_json["hasPlayback"] = false; app_json["hasNotification"] = false; app_json["hasNetworkActivity"] = false; app_json["pendingFreezeSec"] = 0; apps_state.push_back(app_json); } payload["apps_runtime_state"] = apps_state; return payload; }
-json StateManager::get_full_config_for_ui() { std::lock_guard<std::mutex> lock(state_mutex_); json response; response["hard_safety_net"] = json(critical_system_apps_); auto all_db_configs = db_manager_->get_all_app_configs(); json policies = json::array(); for (const auto& config : all_db_configs) { json app_policy; app_policy["package_name"] = config.package_name; app_policy["user_id"] = config.user_id; app_policy["policy"] = static_cast<int>(config.policy); app_policy["force_playback_exempt"] = config.force_playback_exempt; app_policy["force_network_exempt"] = config.force_network_exempt; policies.push_back(app_policy); } response["policies"] = policies; return response; }
+json StateManager::get_dashboard_payload() { std::lock_guard<std::mutex> lock(state_mutex_); json payload; payload["global_stats"] = { {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent}, {"total_mem_kb", global_stats_.total_mem_kb}, {"avail_mem_kb", global_stats_.avail_mem_kb}, {"swap_total_kb", global_stats_.swap_total_kb}, {"swap_free_kb", global_stats_.swap_free_kb}, {"active_profile_name", is_screen_on_ ? "⚡️ On-Screen" : "🧊 Off-Screen"} }; json apps_state = json::array(); for (const auto& [key, app] : managed_apps_) { if (app.current_status == AppRuntimeState::Status::STOPPED) continue; json app_json; app_json["package_name"] = app.package_name; app_json["app_name"] = app.app_name; app_json["user_id"] = app.user_id; app_json["display_status"] = status_to_string(app.current_status); app_json["mem_usage_kb"] = app.mem_usage_kb; app_json["swap_usage_kb"] = app.swap_usage_kb; app_json["cpu_usage_percent"] = app.cpu_usage_percent; app_json["is_whitelisted"] = app.config.policy == AppPolicy::EXEMPTED; app_json["is_foreground"] = app.is_foreground; int pending_sec = 0; if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) { auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - app.last_state_change_time).count(); pending_sec = std::max(0LL, 5LL - elapsed); } app_json["pendingFreezeSec"] = pending_sec; apps_state.push_back(app_json); } payload["apps_runtime_state"] = apps_state; return payload; }
 json StateManager::get_probe_config_payload() { std::lock_guard<std::mutex> lock(state_mutex_); json payload; json frozen_apps = json::array(); for(const auto& [key, app] : managed_apps_) { if (app.current_status == AppRuntimeState::Status::FROZEN) { frozen_apps.push_back({{"package_name", app.package_name}, {"user_id", app.user_id}}); } } payload["policies"] = json::array(); payload["frozen_apps"] = frozen_apps; return payload; }

@@ -35,11 +35,11 @@ class ProbeHook : IXposedHookLoadPackage {
     private val pendingThawRequests = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v11.0_Refactored"
+        private const val TAG = "CerberusProbe_v11.1_fix"
         private const val PER_USER_RANGE = 100000
         private const val THAW_TIMEOUT_MS = 1500L
 
-        // Android framework internal constants (might need adjustment for some ROMs)
+        // Android framework internal constants
         private const val PROCESS_STATE_TOP = 2
         private const val PROCESS_STATE_CACHED_ACTIVITY = 15
         private const val PROCESS_STATE_CACHED_EMPTY = 18
@@ -53,17 +53,16 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private fun initializeHooks(classLoader: ClassLoader) {
         setupUdsCommunication()
-        hookActivityStarter(classLoader) // For cold start unfreeze
-        hookActivityManagerService(classLoader) // For precise state tracking
+        hookActivityStarter(classLoader)
+        hookActivityManagerService(classLoader)
         log("All essential hooks attached. Probe is active.")
     }
 
-    // [CRITICAL REFACTOR] This hook is now the primary source of state intelligence.
     private fun hookActivityManagerService(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
-            // This method is called whenever a process's scheduling group or state changes.
-            // It's the most reliable place to know when an app becomes TOP or CACHED.
+
+            // Using updateOomAdj as the hook point because it's reliably called on state changes.
             XposedHelpers.findAndHookMethod(
                 amsClass,
                 "updateOomAdj",
@@ -84,12 +83,10 @@ class ProbeHook : IXposedHookLoadPackage {
 
                         when (procState) {
                             PROCESS_STATE_TOP -> {
-                                // This app just became the foreground app.
                                 log("StateChange: $packageName (user $userId) is now FOREGROUND (TOP).")
-                                sendAppStateChange(packageName, userId, isForeground = true, isCached = false, reason = " Became TOP")
+                                sendAppStateChange(packageName, userId, isForeground = true, isCached = false, reason = "Became TOP")
                             }
                             in PROCESS_STATE_CACHED_ACTIVITY..PROCESS_STATE_CACHED_EMPTY -> {
-                                // This app has just been demoted to a cached state. It's now a candidate for freezing.
                                 log("StateChange: $packageName (user $userId) is now CACHED.")
                                 sendAppStateChange(packageName, userId, isForeground = false, isCached = true, reason = "Became CACHED")
                             }
@@ -103,7 +100,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // [Unchanged] This hook remains essential for handling cold starts of frozen apps.
     private fun hookActivityStarter(classLoader: ClassLoader) {
         try {
             val activityStarterClass = XposedHelpers.findClass("com.android.server.wm.ActivityStarter", classLoader)
@@ -122,7 +118,8 @@ class ProbeHook : IXposedHookLoadPackage {
                         val success = requestThawAndWait(packageName, userId)
                         if (!success) {
                             logError("Thaw FAILED for $packageName. Aborting launch.")
-                            param.result = ActivityManager.START_ABORTED
+                            // [FIX] Use XposedHelpers to access the non-SDK constant at runtime.
+                            param.result = XposedHelpers.getStaticIntField(ActivityManager::class.java, "START_ABORTED")
                         } else {
                             log("Thaw successful for $packageName. Proceeding with launch.")
                         }
@@ -181,7 +178,6 @@ class ProbeHook : IXposedHookLoadPackage {
         return frozenAppsCache.value.contains(key)
     }
 
-    // [NEW] Helper function to send the detailed app state change event.
     private fun sendAppStateChange(packageName: String, userId: Int, isForeground: Boolean, isCached: Boolean, reason: String) {
         val payload = ProbeAppStateChangedPayload(
             packageName = packageName,

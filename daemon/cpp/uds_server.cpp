@@ -10,11 +10,16 @@
 #include <vector>
 #include <cstddef>
 #include <sys/select.h>
+#include <thread> // [NEW] For std::this_thread
 
-#define LOG_TAG "cerberusd_uds"
+#define LOG_TAG "cerberusd_uds_v11.1" // Version bump for fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Forward declaration
+void broadcast_dashboard_update(); 
+extern std::atomic<int> g_probe_fd;
 
 UdsServer::UdsServer(const std::string& socket_name)
     : socket_name_(socket_name), server_fd_(-1), is_running_(false) {}
@@ -35,14 +40,25 @@ bool UdsServer::has_clients() const {
 void UdsServer::add_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     client_fds_.push_back(client_fd);
-    client_buffers_[client_fd] = ""; // 初始化缓冲区
+    client_buffers_[client_fd] = "";
     LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
+
+    // [CRITICAL FIX] Trigger an immediate broadcast for new UI clients.
+    // This solves the "home page spinning until first action" problem.
+    // We start a small detached thread to do this to avoid deadlocks and race conditions
+    // with the probe identifying itself.
+    std::thread([client_fd]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (client_fd != g_probe_fd.load()) {
+            LOGI("New non-probe client (fd: %d) connected, triggering initial dashboard broadcast.", client_fd);
+            broadcast_dashboard_update();
+        }
+    }).detach();
 }
 
 void UdsServer::set_disconnect_handler(std::function<void(int)> handler) {
     on_disconnect_ = std::move(handler);
 }
-
 
 void UdsServer::remove_client(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -52,7 +68,6 @@ void UdsServer::remove_client(int client_fd) {
         client_buffers_.erase(client_fd);
         close(client_fd);
         LOGI("Client disconnected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
-        // [NEW] 调用断连回调
         if (on_disconnect_) {
             on_disconnect_(client_fd);
         }
@@ -77,6 +92,7 @@ bool UdsServer::send_message(int client_fd, const std::string& message) {
     if (bytes_sent < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
             LOGW("Send to fd %d failed (connection closed), removing client.", client_fd);
+            // This call is now safe because remove_client handles the lock
             remove_client(client_fd);
         } else {
             LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
@@ -108,7 +124,6 @@ void UdsServer::handle_client_data(int client_fd) {
     std::string received_data(buffer, bytes_read);
     std::vector<std::string> messages_to_process;
 
-    // [FIX] 在锁内处理缓冲区，提取出完整的消息
     {
         std::lock_guard<std::mutex> lock(client_mutex_);
         auto buffer_it = client_buffers_.find(client_fd);
@@ -127,14 +142,12 @@ void UdsServer::handle_client_data(int client_fd) {
         }
     }
 
-    // [FIX] 在锁外调用回调函数，避免回调函数中的锁与 client_mutex_ 形成死锁
     if (on_message_received_ && !messages_to_process.empty()) {
         for (const auto& msg : messages_to_process) {
             on_message_received_(client_fd, msg);
         }
     }
 }
-
 
 void UdsServer::stop() {
     if (!is_running_.exchange(false)) return;
