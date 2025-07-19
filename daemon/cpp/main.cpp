@@ -12,10 +12,9 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
-#include <condition_variable>
-#include <unistd.h>
+#include <mutex> // [FIX] No longer need condition_variable
 
-#define LOG_TAG "cerberusd_main_v10.1" // Version bump
+#define LOG_TAG "cerberusd_main_v11.0_refactored" // Version bump
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,11 +31,9 @@ std::atomic<bool> g_is_running = true;
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
 std::atomic<int> g_probe_fd = -1;
-std::atomic<bool> g_force_refresh_flag = false;
-std::mutex g_worker_mutex;
-std::condition_variable g_worker_cv;
+std::mutex g_broadcast_mutex; // Mutex to protect broadcast calls
 
-void trigger_state_broadcast();
+void broadcast_dashboard_update();
 void notify_probe_of_config_change();
 
 void handle_client_message(int client_fd, const std::string& message_str) {
@@ -45,53 +42,50 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // [核心修复] 新增消息处理器，用于响应Probe的预先解冻请求
+        // [REFACTORED] Centralized logic for state changes and notifications
+        bool state_changed = false;
+        bool config_changed = false;
+
         if (type == "cmd.request_immediate_unfreeze") {
             bool success = g_state_manager ? g_state_manager->on_unfreeze_request(msg.at("payload")) : false;
-            
             json response_msg = {
-                // 使用和请求一致的版本号和req_id，以便客户端匹配
                 {"v", msg.value("v", 1)},
                 {"type", success ? "resp.unfreeze_complete" : "resp.unfreeze_failed"},
                 {"req_id", msg.value("req_id", "")},
                 {"payload", {}}
             };
             g_server->send_message(client_fd, response_msg.dump());
-            
-            // 解冻成功后，通知probe和UI状态已变更
             if (success) {
-                notify_probe_of_config_change();
-                trigger_state_broadcast();
+                state_changed = true;
+                config_changed = true;
             }
-            return;
-        }
-
-        if (type == "event.probe_hello") {
+        } else if (type == "event.probe_hello") {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
             if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-            notify_probe_of_config_change(); // Probe上线后立即下发配置
-            trigger_state_broadcast();
-            return;
-        }
-
-        if (type == "cmd.set_policy") {
+            state_changed = true;
+            config_changed = true; // Send initial config
+        } else if (type == "event.app_state_changed") {
+            // [NEW] Handle detailed state changes from the Probe
+            if (g_state_manager) {
+                auto result = g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
+                if (result.state_changed) state_changed = true;
+                if (result.config_maybe_changed) config_changed = true;
+            }
+        } else if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
-            new_config.user_id = payload.value("user_id", 0); // 读取user_id
+            new_config.user_id = payload.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
+            
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(new_config)) {
-                // 如果配置变更导致解冻，通知probe更新缓存
-                notify_probe_of_config_change();
+                config_changed = true;
             }
-            trigger_state_broadcast(); // 总是刷新UI
-            return;
-        }
-
-        if (type == "query.get_all_policies") {
+            state_changed = true; // Policy change always requires a UI refresh
+        } else if (type == "query.get_all_policies") {
             if (g_state_manager) {
                 json response_payload = g_state_manager->get_full_config_for_ui();
                 json response_msg = {
@@ -102,11 +96,16 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 };
                  g_server->send_message(client_fd, response_msg.dump());
             }
-            return;
+        } else if (type == "query.refresh_dashboard") {
+            state_changed = true;
         }
-        
-        if (type == "query.refresh_dashboard") {
-            trigger_state_broadcast();
+
+        // [REFACTORED] Centralized notification logic
+        if (config_changed) {
+            notify_probe_of_config_change();
+        }
+        if (state_changed) {
+            broadcast_dashboard_update();
         }
 
     } catch (const json::exception& e) {
@@ -114,18 +113,28 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     }
 }
 
-void trigger_state_broadcast() {
-    g_force_refresh_flag = true;
-    g_worker_cv.notify_one();
+// [REFACTORED] A dedicated, thread-safe function for broadcasting updates
+void broadcast_dashboard_update() {
+    std::lock_guard<std::mutex> lock(g_broadcast_mutex);
+    if (g_server && g_server->has_clients() && g_state_manager) {
+        LOGD("Broadcasting dashboard update to UI clients...");
+        json payload = g_state_manager->get_dashboard_payload();
+        json message = {
+            {"v", 11},
+            {"type", "stream.dashboard_update"},
+            {"payload", payload}
+        };
+        g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
+    }
 }
 
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
-        LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
+        LOGD("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 10},
+            {"v", 11},
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
@@ -146,41 +155,24 @@ void handle_client_disconnect(int client_fd) {
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
-    g_worker_cv.notify_one();
     if (g_server) g_server->stop();
 }
 
+// [REFACTORED] Worker thread is now a simple, lightweight maintenance loop
 void worker_thread_func() {
-    LOGI("Worker thread started.");
+    LOGI("Worker thread started. Role: Periodic Maintenance.");
     while (g_is_running) {
-        {
-            std::unique_lock<std::mutex> lock(g_worker_mutex);
-            g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
-                return !g_is_running.load() || g_force_refresh_flag.load();
-            });
-        }
+        std::this_thread::sleep_for(std::chrono::seconds(5)); // Reduced frequency
         if (!g_is_running) break;
-
-        bool needs_ui_update = g_force_refresh_flag.load();
-        g_force_refresh_flag = false;
         
         if (g_state_manager) {
+            // tick() now only does lightweight process reconciliation and stat updates.
+            // It no longer drives the main freeze logic.
+            // If it reports a state change (e.g. process died), we update the UI.
             if (g_state_manager->tick()) {
-                LOGD("State manager tick reported a freeze state change, notifying probe.");
-                notify_probe_of_config_change();
-                needs_ui_update = true;
+                LOGD("State manager tick reported a change, broadcasting update.");
+                broadcast_dashboard_update();
             }
-        }
-        
-        if (needs_ui_update && g_server && g_server->has_clients()) {
-            LOGD("Broadcasting dashboard update to UI clients...");
-            json payload = g_state_manager->get_dashboard_payload();
-            json message = {
-                {"v", 10},
-                {"type", "stream.dashboard_update"},
-                {"payload", payload}
-            };
-            g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
         }
     }
     LOGI("Worker thread finished.");
@@ -189,7 +181,7 @@ void worker_thread_func() {
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    LOGI("Project Cerberus Daemon v10.1 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v11.0 starting... (PID: %d)", getpid());
     try {
         if (!fs::exists(DATA_DIR)) {
             fs::create_directories(DATA_DIR);
@@ -210,7 +202,6 @@ int main(int argc, char *argv[]) {
     g_server->run();
     LOGI("Server loop has finished. Cleaning up...");
     g_is_running = false;
-    g_worker_cv.notify_one();
     if (worker_thread.joinable()) worker_thread.join();
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;

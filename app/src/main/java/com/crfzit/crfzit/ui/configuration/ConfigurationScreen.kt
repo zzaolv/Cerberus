@@ -31,7 +31,7 @@ fun ConfigurationScreen(
     viewModel: ConfigurationViewModel
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    
+
     val filteredApps = remember(uiState.apps, uiState.searchQuery, uiState.showSystemApps) {
         viewModel.getFilteredAndSortedApps()
     }
@@ -49,7 +49,6 @@ fun ConfigurationScreen(
                 singleLine = true
             )
 
-            // [FIX #1] 添加显示系统应用的开关
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -64,13 +63,13 @@ fun ConfigurationScreen(
                 )
             }
 
-
             if (uiState.isLoading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
             } else {
                 LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // [核心修复] 使用包名和用户ID共同作为key，保证列表项的唯一性
                     items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { app ->
                         val isProtected = uiState.safetyNetApps.contains(app.packageName)
                         AppPolicyItem(
@@ -103,7 +102,7 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
                         .data(app.icon)
-                        .placeholder(R.drawable.ic_launcher_foreground) // 使用一个默认占位图
+                        .placeholder(R.drawable.ic_launcher_foreground)
                         .error(R.drawable.ic_launcher_foreground)
                         .crossfade(true).build()
                 ),
@@ -113,10 +112,11 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(app.appName, fontWeight = FontWeight.Bold)
+                    // [核心修复] 如果userId不为0，则显示分身图标
                     if (app.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
-                            painter = painterResource(id = R.drawable.ic_clone),
+                            painter = painterResource(id = R.drawable.ic_clone), // 引用新的drawable
                             contentDescription = "分身应用 (User ${app.userId})",
                             modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.secondary
@@ -125,7 +125,7 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
                 }
                 Text(app.packageName, style = MaterialTheme.typography.bodySmall)
             }
-            
+
             Box {
                 val (label, icon) = getPolicyLabel(if(isProtected) Policy.EXEMPTED else app.policy)
                 Text(
@@ -140,7 +140,7 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
                 ) {
                     Policy.entries.forEach { policy ->
                         DropdownMenuItem(
-                            text = { 
+                            text = {
                                 val (policyLabel, policyIcon) = getPolicyLabel(policy)
                                 Text("$policyIcon $policyLabel")
                             },

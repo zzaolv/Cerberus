@@ -59,7 +59,7 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
                         expanded = showMenu,
                         onDismissRequest = { showMenu = false }
                     ) {
-                        // [FIX #2] 移除“仅显示前台”的切换
+                        // [核心修复] 移除了“仅显示前台”的切换选项，因为它与项目目标不符
                         DropdownMenuItem(
                             text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
                             onClick = {
@@ -95,7 +95,6 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
     }
 }
 
-// ... DashboardContent and other composables remain unchanged ...
 @Composable
 fun DashboardContent(
     globalStats: GlobalStats,
@@ -123,18 +122,96 @@ fun DashboardContent(
     }
 }
 
+// ... 其他未修改的Composable保持不变 ...
+
+@Composable
+fun AppRuntimeCard(app: UiAppRuntime) {
+    val state = app.runtimeState
+    Card {
+        Row(
+            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Image(
+                painter = rememberAsyncImagePainter(
+                    ImageRequest.Builder(LocalContext.current)
+                        .data(app.icon)
+                        .placeholder(android.R.drawable.sym_def_app_icon)
+                        .error(android.R.drawable.sym_def_app_icon)
+                        .crossfade(true).build()
+                ),
+                contentDescription = app.appName,
+                modifier = Modifier.size(48.dp)
+            )
+
+            Column(
+                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = app.appName,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    // [核心修复] 如果userId不为0，显示分身图标
+                    if (app.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${app.userId})",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    AppStatusIcons(state = state)
+                }
+
+                val resourceText = buildAnnotatedString {
+                    append("MEM: ${formatMemory(state.memUsageKb)}")
+                    if (state.swapUsageKb > 1024) {
+                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
+                            append(" (+${formatMemory(state.swapUsageKb)} S)")
+                        }
+                    }
+                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
+                }
+
+                Text(
+                    text = resourceText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Text(
+                    text = "状态：${formatStatus(state)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+//...
+// 其他未修改的Composable保持不变，此处省略
+//...
+
 @Composable
 fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
         (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
     } else 0f
-    
+
     val swapUsedPercent = if (stats.swapTotalKb > 0) {
         (stats.swapTotalKb - stats.swapFreeKb).toFloat() / stats.swapTotalKb
     } else 0f
-    
+
     val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
-    
+
     val downSpeed = formatSpeed(speed.downloadSpeedBps)
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
@@ -147,7 +224,7 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                 .align(Alignment.CenterHorizontally)
                 .padding(bottom = 12.dp)
         )
-        
+
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
             modifier = Modifier.height(180.dp),
@@ -172,7 +249,7 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                 )
             }
             item {
-                 StatusGridItem(
+                StatusGridItem(
                     label = "交换 (SWAP)",
                     value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
                     progress = swapUsedPercent,
@@ -211,8 +288,8 @@ fun StatusGridItem(
             }
             Spacer(Modifier.weight(1f))
             if (subValue != null) {
-                 Text(value, style = MaterialTheme.typography.titleMedium)
-                 Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(value, style = MaterialTheme.typography.titleMedium)
+                Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
             }
@@ -226,80 +303,6 @@ fun StatusGridItem(
         }
     }
 }
-
-
-@Composable
-fun AppRuntimeCard(app: UiAppRuntime) {
-    val state = app.runtimeState
-    Card {
-        Row(
-            modifier = Modifier.padding(12.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Image(
-                painter = rememberAsyncImagePainter(
-                    ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
-                        .placeholder(android.R.drawable.sym_def_app_icon)
-                        .error(android.R.drawable.sym_def_app_icon)
-                        .crossfade(true).build()
-                ),
-                contentDescription = app.appName,
-                modifier = Modifier.size(48.dp)
-            )
-            
-            Column(
-                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = app.appName,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    if (app.userId != 0) {
-                        Spacer(Modifier.width(4.dp))
-                        Icon(
-                            painter = painterResource(id = R.drawable.ic_clone),
-                            contentDescription = "分身应用 (User ${app.userId})",
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.secondary
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    AppStatusIcons(state = state)
-                }
-                
-                val resourceText = buildAnnotatedString {
-                    append("MEM: ${formatMemory(state.memUsageKb)}")
-                    if (state.swapUsageKb > 1024) {
-                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
-                            append(" (+${formatMemory(state.swapUsageKb)} S)")
-                        }
-                    }
-                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
-                }
-
-                Text(
-                    text = resourceText,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Text(
-                    text = "状态：${formatStatus(state)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-    }
-}
-
 @Composable
 fun AppStatusIcons(state: AppRuntimeState) {
     Row {
@@ -361,26 +364,5 @@ private fun formatStatus(state: AppRuntimeState): String {
         "FROZEN" -> "已冻结"
         "EXEMPTED" -> "自由后台"
         else -> "状态未知"
-    }
-}
-
-@Preview(showBackground = true)
-@Composable
-fun DashboardPreview() {
-    CRFzitTheme {
-        DashboardContent(
-            globalStats = GlobalStats(activeProfileName = "🎮 游戏模式"),
-            networkSpeed = NetworkSpeed(),
-            apps = listOf(
-                UiAppRuntime(
-                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = true, displayStatus = "FOREGROUND", userId = 0),
-                    appName = "示例应用", icon = null, isSystem = false, userId = 0
-                ),
-                 UiAppRuntime(
-                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = false, displayStatus = "BACKGROUND_IDLE", userId = 999),
-                    appName = "示例应用 (分身)", icon = null, isSystem = false, userId = 999
-                )
-            )
-        )
     }
 }

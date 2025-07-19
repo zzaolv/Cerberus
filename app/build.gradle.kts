@@ -23,15 +23,14 @@ android {
 
     buildTypes {
         release {
-            // 【核心优化】开启代码混淆和资源压缩
+            // [核心优化] 开启代码混淆和资源压缩，减小最终APK体积
             isMinifyEnabled = true
-            isShrinkResources = true // 开启资源压缩
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
-        // debug构建类型保持原样，以便快速调试
         debug {
             isMinifyEnabled = false
             proguardFiles(
@@ -81,7 +80,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // 【核心优化】移除 extended 依赖，改为依赖 core
+    // [核心优化] 移除完整的 extended 依赖，改为依赖更小的 core 核心库
     // implementation(libs.androidx.material.icons.extended)
     implementation(libs.androidx.material.icons.core)
 
@@ -92,7 +91,7 @@ dependencies {
 
     implementation(libs.gson)
     implementation("io.coil-kt:coil-compose:2.7.0")
-    
+
     // Xposed API 依赖保持不变
     compileOnly("de.robv.android.xposed:api:82")
     compileOnly("de.robv.android.xposed:api:82:sources")

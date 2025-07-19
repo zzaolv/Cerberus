@@ -28,7 +28,7 @@ data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    // [FIX #2] 移除 showOnlyForeground 状态
+    // [核心修复] 移除了 showOnlyForeground 状态，该选项与功能目标冲突
     val showSystemApps: Boolean = false
 )
 
@@ -43,30 +43,30 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
+            // 预加载应用信息缓存
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
-                // [FIX #2] 移除 showOnlyForeground 的 flow
             ) { dashboardPayload, speed, showSystem ->
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
+                        // 对于每一个运行中的应用（包括分身），获取其元数据
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
                         UiAppRuntime(
                             runtimeState = runtimeState,
                             appName = appInfo?.appName ?: runtimeState.packageName,
                             icon = appInfo?.icon,
                             isSystem = appInfo?.isSystemApp ?: false,
-                            userId = runtimeState.userId
+                            userId = runtimeState.userId // 使用Daemon提供的准确userId
                         )
                     }
                     .filter { it.icon != null }
                     .filter { showSystem || !it.isSystem }
-                    // [FIX #2] 移除按 isForeground 过滤的逻辑
+                    // 排序：前台优先，然后按内存使用量降序
                     .sortedWith(
-                        // 排序：前台优先，然后按内存降序
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
                             .thenByDescending { it.runtimeState.memUsageKb }
                     )
@@ -98,9 +98,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
-    
-    // [FIX #2] 移除此函数
-    // fun onShowOnlyForegroundChanged(show: Boolean) { ... }
 
     override fun onCleared() {
         super.onCleared()

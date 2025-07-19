@@ -3,7 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- ================================================== -->
-    <!--        【核心修复】声明查询所有应用的权限          -->
+    <!--        [核心修复] 声明查询所有应用的权限          -->
+    <!--  这是让AppInfoRepository能正常工作的关键，否则无法获取应用列表 -->
     <!-- ================================================== -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
@@ -30,21 +31,15 @@
             </intent-filter>
         </activity>
 
-        <!-- ================================================== -->
-        <!--        LSPosed 模块元数据 (集成到主APK)          -->
-        <!-- ================================================== -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
-
         <meta-data
             android:name="xposeddescription"
             android:value="Project Cerberus - UI &amp; System Probe" />
-
         <meta-data
             android:name="xposedminversion"
-            android:value="100" /> <!-- 93 对应 LSPosed 1.x -->
-
+            android:value="100" />
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
