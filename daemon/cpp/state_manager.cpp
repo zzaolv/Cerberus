@@ -11,8 +11,7 @@
 #include <unordered_map>
 #include <set>
 
-
-#define LOG_TAG "cerberusd_state_v3.2" // 版本更新
+#define LOG_TAG "cerberusd_state_v3.3"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -22,7 +21,6 @@ using json = nlohmann::json;
 
 constexpr int PER_USER_RANGE = 100000;
 
-// ... status_to_string 函数保持不变 ...
 static std::string status_to_string(AppRuntimeState::Status status) {
     switch (status) {
         case AppRuntimeState::Status::STOPPED: return "STOPPED";
@@ -37,8 +35,7 @@ static std::string status_to_string(AppRuntimeState::Status status) {
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v3.2, Polling Model) Initializing...");
-    // 增加一些常见的、绝对不能动的系统组件
+    LOGI("StateManager (v3.3, Polling Model) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -383,27 +380,25 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     
     
     load_all_configs();
-    reconcile_process_state(); // 用轮询方法进行初始扫描
+    reconcile_process_state();
     LOGI("StateManager Initialized.");
 }
 
-void StateManager::tick() {
+bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
+    bool probe_needs_update = false;
 
-    // [FIX] 核心：每次tick都核对一次进程状态
     reconcile_process_state();
 
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
 
     for (auto& [key, app] : managed_apps_) {
-        // 总是更新应用的实时资源使用情况
         if (!app.pids.empty()) {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         }
         
-        // 豁免、前台、或已停止的应用，不需要处理超时冻结逻辑
         if (app.current_status == AppRuntimeState::Status::EXEMPTED || 
             app.current_status == AppRuntimeState::Status::FOREGROUND || 
             app.pids.empty()) {
@@ -413,12 +408,13 @@ void StateManager::tick() {
         bool has_temp_exemption = app.has_audio || app.has_notification;
         if (has_temp_exemption) {
             if(app.current_status == AppRuntimeState::Status::AWAITING_FREEZE || app.current_status == AppRuntimeState::Status::FROZEN) {
-                transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "temp exemption started");
+                if(transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "temp exemption started")) {
+                    probe_needs_update = true;
+                }
             }
             continue;
         }
 
-        // 策略驱动的状态机 (逻辑不变)
         switch (app.current_status) {
             case AppRuntimeState::Status::BACKGROUND_IDLE: {
                 long timeout_sec = -1;
@@ -431,7 +427,6 @@ void StateManager::tick() {
                 if (timeout_sec > 0) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
                     if (elapsed > timeout_sec) { 
-                        LOGI("App '%s' background timeout reached (%lld > %ld).", app.package_name.c_str(), elapsed, timeout_sec);
                         transition_state(app, AppRuntimeState::Status::AWAITING_FREEZE, "background timeout");
                     }
                 }
@@ -441,22 +436,23 @@ void StateManager::tick() {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
                 if (elapsed > 5) {
                     if (action_executor_->freeze(key, app.pids)) {
-                        transition_state(app, AppRuntimeState::Status::FROZEN, "grace period ended");
-                        // [FIX #3] 核心修复：应用被冻结后，立即通知Probe更新其缓存
-                        notify_probe_of_config_change(); 
+                        if (transition_state(app, AppRuntimeState::Status::FROZEN, "grace period ended")) {
+                           probe_needs_update = true;
+                        }
                     } else {
-                        LOGW("Failed to freeze '%s', reverting to BACKGROUND_IDLE", (app.package_name + "_" + std::to_string(app.user_id)).c_str());
                         transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "freeze failed");
                     }
                 }
                 break;
             }
+            default:
+                break;
+        }
     }
+    return probe_needs_update;
 }
 
-// [NEW] 替代 ProcessMonitor 的核心函数
 void StateManager::reconcile_process_state() {
-    // 步骤1：从/proc获取当前所有真实运行的进程PID及其包名
     std::unordered_map<int, AppInstanceKey> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
@@ -470,7 +466,6 @@ void StateManager::reconcile_process_state() {
         } catch (...) { continue; }
     }
 
-    // 步骤2：找出已死亡的进程 (在我们内部记录中，但当前已不存在)
     std::vector<int> dead_pids;
     for(const auto& [pid, app_ptr] : pid_to_app_map_) {
         if (current_pids.find(pid) == current_pids.end()) {
@@ -481,30 +476,22 @@ void StateManager::reconcile_process_state() {
         remove_pid_from_app(pid);
     }
 
-    // 步骤3：找出新生的进程 (当前存在，但我们内部没有记录)
     for(const auto& [pid, key] : current_pids) {
         if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
             int uid, user_id;
-            get_package_name_from_pid(pid, uid, user_id); // Re-get UID info
+            get_package_name_from_pid(pid, uid, user_id);
             add_pid_to_app(pid, key.first, key.second, uid);
         }
     }
 }
 
-
-// [REMOVE] on_process_event 方法被移除
-// void StateManager::on_process_event(...) { ... }
-
-// ... 其他函数的实现大部分保持不变 ...
 void StateManager::on_probe_hello(int probe_fd) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    LOGI("Probe connected with fd %d.", probe_fd);
     probe_fd_ = probe_fd;
 }
 
 void StateManager::on_probe_disconnect() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    LOGW("Probe with fd %d disconnected.", probe_fd_);
     probe_fd_ = -1;
 }
 
@@ -520,22 +507,17 @@ void StateManager::on_app_state_changed_from_probe(const json& payload) {
 
         if (app->is_foreground != is_fg) {
             app->is_foreground = is_fg;
-            // 当Probe报告应用进入后台，且我们当前认为它在前台时，切换其状态
             if (!is_fg && app->current_status == AppRuntimeState::Status::FOREGROUND) {
                 transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "probe reported background");
             }
-            // 注意：前台状态的切换由解冻逻辑或进程核对逻辑处理，避免冲突
         }
-    } catch (const json::exception& e) {
-        LOGE("Error in on_app_state_changed: %s", e.what());
-    }
+    } catch (const json::exception& e) {}
 }
 
 void StateManager::on_system_state_changed_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (payload.contains("screen_on")) {
         is_screen_on_ = payload.at("screen_on").get<bool>();
-        LOGI("System state update: Screen is now %s.", is_screen_on_ ? "ON" : "OFF");
     }
 }
 
@@ -548,20 +530,15 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
 
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) {
-            LOGI("Executing reliable thaw for '%s' (user %d).", pkg.c_str(), user_id);
             if (!action_executor_->unfreeze_and_cleanup(key)) {
-                LOGE("Reliable unfreeze failed for '%s'.", pkg.c_str());
                 return false;
             }
             transition_state(it->second, AppRuntimeState::Status::FOREGROUND, "unfrozen by user action");
             it->second.is_foreground = true;
             return true;
-        } else {
-            LOGW("Received unfreeze request for non-frozen or unknown app '%s' (user %d). Granting passage.", pkg.c_str(), user_id);
-            return true;
         }
+        return true;
     } catch (const json::exception& e) {
-        LOGE("Error handling unfreeze request: %s", e.what());
         return false;
     }
 }
@@ -569,20 +546,12 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
 void StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    if (is_critical_system_app(new_config.package_name)) {
-        LOGW("UI tried to set policy for critical app '%s'. Operation REJECTED.", new_config.package_name.c_str());
-        return;
-    }
-
-    if (!db_manager_->set_app_config(new_config)) {
-        LOGE("Failed to save app config to DB for '%s'", new_config.package_name.c_str());
-    }
+    if (is_critical_system_app(new_config.package_name)) return;
+    db_manager_->set_app_config(new_config);
     
     for(auto& [key, app_state] : managed_apps_) {
         if (app_state.package_name == new_config.package_name) {
             app_state.config = new_config;
-            LOGI("Updated config for '%s' (user %d). New policy: %d", app_state.package_name.c_str(), app_state.user_id, static_cast<int>(app_state.config.policy));
-            
             if (app_state.config.policy == AppPolicy::EXEMPTED && app_state.current_status != AppRuntimeState::Status::EXEMPTED) {
                  transition_state(app_state, AppRuntimeState::Status::EXEMPTED, "policy changed to exempted");
             } else if (app_state.config.policy != AppPolicy::EXEMPTED && app_state.current_status == AppRuntimeState::Status::EXEMPTED) {
@@ -593,7 +562,6 @@ void StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
         }
     }
 }
-
 
 json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -609,7 +577,6 @@ json StateManager::get_dashboard_payload() {
 
     json apps_state = json::array();
     for (const auto& [key, app] : managed_apps_) {
-        // [FIX] 只发送正在运行的应用到Dashboard
         if (app.current_status == AppRuntimeState::Status::STOPPED) continue;
 
         json app_json;
@@ -639,41 +606,14 @@ json StateManager::get_dashboard_payload() {
     return payload;
 }
 
-// [FIX] Add the missing implementation for get_probe_config_payload
-json StateManager::get_probe_config_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    json payload;
-    
-    json frozen_apps = json::array();
-    for(const auto& [key, app] : managed_apps_) {
-        if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            frozen_apps.push_back({
-                {"package_name", app.package_name},
-                {"user_id", app.user_id}
-            });
-        }
-    }
-    
-    // Probe只需要知道哪些应用被冻结了，不需要完整的策略信息
-    payload["policies"] = json::array(); // Keep this empty for the probe
-    payload["frozen_apps"] = frozen_apps;
-    
-    return payload;
-}
-
-// [FIX #3] 修复配置页分身应用问题
 json StateManager::get_full_config_for_ui() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     json response;
     response["hard_safety_net"] = json(critical_system_apps_);
     
-    // 我们需要返回所有已知实例的策略
-    // Set to avoid duplicates if multiple instances have same package/user (should not happen)
     std::set<AppInstanceKey> seen_instances;
-    
     json policies = json::array();
 
-    // 优先使用内存中、更实时、包含所有分身的 managed_apps_
     for (const auto& [key, app] : managed_apps_) {
         json app_policy;
         app_policy["package_name"] = app.package_name;
@@ -685,10 +625,8 @@ json StateManager::get_full_config_for_ui() {
         seen_instances.insert(key);
     }
     
-    // 再从数据库中补充那些从未运行过但有配置的应用
     auto all_db_configs = db_manager_->get_all_app_configs();
     for (const auto& config : all_db_configs) {
-        // 假设DB中只存了user 0的策略
         AppInstanceKey key = {config.package_name, 0};
         if(seen_instances.find(key) == seen_instances.end()){
              json app_policy;
@@ -705,17 +643,22 @@ json StateManager::get_full_config_for_ui() {
     return response;
 }
 
-
-void StateManager::initial_process_scan() {
-    LOGI("Performing initial process scan via reconcile...");
-    reconcile_process_state();
-    LOGI("Initial scan completed. Found %zu tracked processes in %zu app instances.", pid_to_app_map_.size(), managed_apps_.size());
+json StateManager::get_probe_config_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    json payload;
+    json frozen_apps = json::array();
+    for(const auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            frozen_apps.push_back({{"package_name", app.package_name}, {"user_id", app.user_id}});
+        }
+    }
+    payload["policies"] = json::array();
+    payload["frozen_apps"] = frozen_apps;
+    return payload;
 }
 
 void StateManager::load_all_configs() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
     auto configs = db_manager_->get_all_app_configs();
-    LOGI("Loading %zu app configs from database.", configs.size());
     for(const auto& db_config : configs){
         get_or_create_app_state(db_config.package_name, 0)->config = db_config;
     }
@@ -736,7 +679,7 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0'); 
     
-    if (cmdline.empty() || cmdline.find('/') != std::string::npos) {
+    if (cmdline.empty() || cmdline.find('/') != std::string::npos || cmdline.length() < 3) {
         return "";
     }
     
@@ -762,7 +705,6 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     if (pid_it == app->pids.end()) {
         app->pids.push_back(pid);
         pid_to_app_map_[pid] = app;
-        LOGI("Added pid %d to app '%s' (user %d)", pid, package_name.c_str(), user_id);
 
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
             if (app->config.policy == AppPolicy::EXEMPTED || is_critical_system_app(app->package_name)) {
@@ -783,8 +725,6 @@ void StateManager::remove_pid_from_app(int pid) {
 
     auto& pids = app->pids;
     pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-
-    LOGI("Removed pid %d from app '%s' (user %d). Remaining pids: %zu", pid, app->package_name.c_str(), app->user_id, pids.size());
 
     if (pids.empty() && app->current_status != AppRuntimeState::Status::STOPPED) {
         if (app->current_status == AppRuntimeState::Status::FROZEN) {
@@ -826,7 +766,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
                                 AppRuntimeState::Status::STOPPED;
     
     auto result = managed_apps_.emplace(key, new_state);
-    LOGI("Created new runtime state for '%s' (user %d) with policy %d.", package_name.c_str(), user_id, static_cast<int>(new_state.config.policy));
     return &result.first->second;
 }
 
@@ -835,23 +774,19 @@ bool StateManager::is_critical_system_app(const std::string& package_name) const
     return critical_system_apps_.count(package_name) > 0;
 }
 
-void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) {
-    if (app.current_status == new_status) return;
+bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) {
+    if (app.current_status == new_status) return false;
 
     AppInstanceKey key = {app.package_name, app.user_id};
     
-    if (app.current_status == AppRuntimeState::Status::FROZEN && new_status != AppRuntimeState::Status::FROZEN) {
-        LOGI("Transitioning from FROZEN for '%s', performing unfreeze...", app.package_name.c_str());
+    bool was_frozen = app.current_status == AppRuntimeState::Status::FROZEN;
+    if (was_frozen && new_status != AppRuntimeState::Status::FROZEN) {
         action_executor_->unfreeze_and_cleanup(key);
     }
     
-    LOGI("State Transition: '%s' (user %d) [%s] -> [%s]. Reason: %s",
-         app.package_name.c_str(), app.user_id,
-         status_to_string(app.current_status).c_str(),
-         status_to_string(new_status).c_str(),
-         reason.c_str());
-    
     app.current_status = new_status;
     app.last_state_change_time = std::chrono::steady_clock::now();
-}
 
+    // 如果应用从冻结变为非冻结，或从非冻结变到冻结，这是一个需要通知Probe的重大变化
+    return was_frozen || new_status == AppRuntimeState::Status::FROZEN;
+}

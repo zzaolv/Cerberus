@@ -28,8 +28,8 @@ data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    val showSystemApps: Boolean = false
-    val showOnlyForeground: Boolean = false // [FIX #1] 新增状态
+    val showSystemApps: Boolean = false,
+    val showOnlyForeground: Boolean = false
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -49,13 +49,15 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged(),
-                _uiState.map { it.showOnlyForeground }.distinctUntilChanged() // [FIX #1] 监听新状态
-            ) { dashboardPayload, speed, showSystem, showOnlyFg -> // [FIX #1] 接收新状态
+                _uiState.map { it.showOnlyForeground }.distinctUntilChanged()
+            ) { dashboardPayload, speed, showSystem, showOnlyFg ->
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
-                        val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName, runtimeState.userId)
+                        // [FIX] 只从仓库获取主应用(user 0)的信息
+                        val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
                         UiAppRuntime(
                             runtimeState = runtimeState,
+                            // 如果是分身应用(appInfo为null)，则使用后台传来的包名
                             appName = appInfo?.appName ?: runtimeState.packageName,
                             icon = appInfo?.icon,
                             isSystem = appInfo?.isSystemApp ?: false,
@@ -63,7 +65,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                     .filter { showSystem || !it.isSystem }
-                    // [FIX #1] 新增过滤逻辑
                     .filter { !showOnlyFg || it.runtimeState.isForeground }
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
@@ -78,7 +79,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     networkSpeed = speed,
                     apps = uiAppRuntimes,
                     showSystemApps = showSystem,
-                    showOnlyForeground = showOnlyFg // [FIX #1] 更新状态
+                    showOnlyForeground = showOnlyFg
                 )
             }
                 .onStart { _uiState.update { it.copy(isConnected = false) } }
@@ -99,9 +100,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
-    // [FIX #1] 新增方法来改变过滤状态
+    
     fun onShowOnlyForegroundChanged(show: Boolean) {
         _uiState.update { it.copy(showOnlyForeground = show) }
+    }
 
     override fun onCleared() {
         super.onCleared()

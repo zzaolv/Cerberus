@@ -178,7 +178,6 @@ void signal_handler(int signum) {
     // [REMOVE] if (g_proc_monitor) g_proc_monitor->stop();
 }
 
-// ... worker_thread_func 函数保持不变 ...
 void worker_thread_func() {
     LOGI("Worker thread started.");
     while (g_is_running) {
@@ -191,19 +190,23 @@ void worker_thread_func() {
 
         if (!g_is_running) break;
         
-        LOGI("Worker thread tick!");
+        bool needs_probe_update = false;
+        if (g_state_manager) {
+            // [FIX] 接收tick的返回值
+            needs_probe_update = g_state_manager->tick();
+        }
+
+        if (needs_probe_update) {
+            LOGI("State manager reported significant change, notifying probe.");
+            notify_probe_of_config_change();
+        }
 
         if (g_force_refresh_flag.load()) {
-            LOGI("Forced refresh triggered.");
+            LOGI("Forced refresh triggered for UI.");
+            g_force_refresh_flag = false;
         }
-        g_force_refresh_flag = false;
         
-        if (g_state_manager) {
-            g_state_manager->tick();
-        }
-
         if (g_server && g_server->has_clients()) {
-            LOGI("Broadcasting dashboard update...");
             json payload = g_state_manager->get_dashboard_payload();
             json message = {
                 {"v", 3},
@@ -215,7 +218,6 @@ void worker_thread_func() {
     }
     LOGI("Worker thread finished.");
 }
-
 
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
