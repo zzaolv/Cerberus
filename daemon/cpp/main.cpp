@@ -4,7 +4,6 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
-// [REMOVE] #include "process_monitor.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
@@ -16,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v3.2" // 版本更新
+#define LOG_TAG "cerberusd_main_v3.4" // 版本更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,7 +31,6 @@ const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 std::atomic<bool> g_is_running = true;
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
-// [REMOVE] std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::atomic<int> g_probe_fd = -1;
 
 std::atomic<bool> g_force_refresh_flag = false;
@@ -68,7 +66,6 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
-// ... handle_client_message 函数保持不变 ...
 void handle_client_message(int client_fd, const std::string& message_str) {
     LOGI("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
@@ -86,7 +83,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 g_probe_fd = client_fd;
                 if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
                 notify_probe_of_config_change();
-                trigger_state_broadcast(); // 让Probe立刻收到一次状态
+                trigger_state_broadcast(); 
             } else if (type == "event.app_state_changed") {
                 if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
                 trigger_state_broadcast();
@@ -124,14 +121,19 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 g_server->send_message(client_fd, response_msg.dump());
                 LOGI("Sent unfreeze confirmation to Probe.");
 
+                // [FIX] 立即通知Probe状态已变更，并触发一次UI刷新
                 notify_probe_of_config_change();
                 trigger_state_broadcast();
             }
         } else if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
-            LOGI("Processing set_policy for %s", payload.value("package_name", "N/A").c_str());
+            LOGI("Processing set_policy for %s (user %d)", 
+                payload.value("package_name", "N/A").c_str(), 
+                payload.value("user_id", -1));
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
+            // [FIX] 读取 user_id
+            new_config.user_id = payload.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
@@ -175,7 +177,6 @@ void signal_handler(int signum) {
     g_is_running = false;
     g_worker_cv.notify_one();
     if (g_server) g_server->stop();
-    // [REMOVE] if (g_proc_monitor) g_proc_monitor->stop();
 }
 
 void worker_thread_func() {
@@ -183,7 +184,7 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
+            g_worker_cv.wait_for(std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
         }
@@ -192,7 +193,6 @@ void worker_thread_func() {
         
         bool needs_probe_update = false;
         if (g_state_manager) {
-            // [FIX] 接收tick的返回值
             needs_probe_update = g_state_manager->tick();
         }
 
@@ -223,7 +223,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v3.2 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v3.4 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -240,15 +240,6 @@ int main(int argc, char *argv[]) {
     auto sys_monitor = std::make_shared<SystemMonitor>();
     g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor);
     
-    // [REMOVE] 移除整个 ProcessMonitor 的启动逻辑
-    // g_proc_monitor = std::make_unique<ProcessMonitor>();
-    // g_proc_monitor->start([&](ProcessEventType type, int pid, int ppid) {
-    //     if (g_state_manager) {
-    //         g_state_manager->on_process_event(type, pid, ppid);
-    //         trigger_state_broadcast();
-    //     }
-    // });
-
     std::thread worker_thread(worker_thread_func);
 
     g_server = std::make_unique<UdsServer>(SOCKET_NAME);

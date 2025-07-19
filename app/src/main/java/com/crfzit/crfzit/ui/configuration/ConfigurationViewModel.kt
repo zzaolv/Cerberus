@@ -35,45 +35,46 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // [FIX] 现在只从主用户获取应用列表
             val mainUserApps = appInfoRepository.getAllApps(forceRefresh = true)
             val policyConfig = daemonRepository.getAllPolicies()
             
-            val finalApps: MutableList<AppInfo> = mainUserApps.toMutableList()
+            val finalAppsMap = mutableMapOf<Pair<String, Int>, AppInfo>()
+
+            // 1. 先用前端获取的应用信息填充基础数据 (主要是主用户 User 0)
+            mainUserApps.forEach { appInfo ->
+                finalAppsMap[appInfo.packageName to appInfo.userId] = appInfo
+            }
+
             val finalSafetyNet: Set<String>
 
             if (policyConfig != null) {
                 finalSafetyNet = policyConfig.hardSafetyNet
-                val policyMap = policyConfig.policies.associateBy { it.packageName to it.userId }
 
-                val seenInstances = finalApps.map { it.packageName to it.userId }.toMutableSet()
-
-                // [FIX] 遍历后端返回的策略，更新或添加应用实例到UI列表
+                // 2. 用后端返回的权威策略数据，更新或添加应用实例
                 policyConfig.policies.forEach { policyPayload ->
                     val key = policyPayload.packageName to policyPayload.userId
-                    val existingAppInfo = finalApps.find { it.packageName == key.first && it.userId == key.second }
+                    val existingAppInfo = finalAppsMap[key]
                     
                     if (existingAppInfo != null) {
-                        // 更新已存在的应用
-                        val index = finalApps.indexOf(existingAppInfo)
-                        finalApps[index] = existingAppInfo.copy(
+                        // 如果应用已存在 (通常是主应用)，更新其策略
+                        finalAppsMap[key] = existingAppInfo.copy(
                             policy = Policy.fromInt(policyPayload.policy),
                             forcePlaybackExemption = policyPayload.forcePlaybackExempt,
                             forceNetworkExemption = policyPayload.forceNetworkExempt
                         )
                     } else {
-                        // 如果是分身应用，前端仓库没有，我们需要手动创建一个
+                        // 如果应用不存在 (通常是分身应用)，需要创建它
                         val mainAppInfo = appInfoRepository.getAppInfo(policyPayload.packageName)
-                        finalApps.add(AppInfo(
+                        finalAppsMap[key] = AppInfo(
                             packageName = policyPayload.packageName,
-                            appName = mainAppInfo?.appName ?: policyPayload.packageName, // 尝试用主应用的名字
-                            icon = mainAppInfo?.icon, // 尝试用主应用的图标
+                            appName = mainAppInfo?.appName ?: policyPayload.packageName,
+                            icon = mainAppInfo?.icon,
                             isSystemApp = mainAppInfo?.isSystemApp ?: false,
                             userId = policyPayload.userId,
                             policy = Policy.fromInt(policyPayload.policy),
                             forcePlaybackExemption = policyPayload.forcePlaybackExempt,
                             forceNetworkExemption = policyPayload.forceNetworkExempt
-                        ))
+                        )
                     }
                 }
             } else {
@@ -83,7 +84,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    apps = finalApps.sortedWith(
+                    apps = finalAppsMap.values.sortedWith(
                         compareBy<AppInfo> { it.appName.lowercase(java.util.Locale.getDefault()) }
                         .thenBy { it.userId }
                     ),
@@ -102,29 +103,32 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     }
     
     fun setPolicy(packageName: String, userId: Int, newPolicy: Policy) {
+        // [FIX #2] 调用重构后的 updateAndSend
         updateAndSend(packageName, userId) { it.copy(policy = newPolicy) }
     }
     
+    // [FIX #2] 重构此方法，使其逻辑清晰且正确
     private fun updateAndSend(packageName: String, userId: Int, transform: (AppInfo) -> AppInfo) {
          _uiState.update { currentState ->
             var appToSend: AppInfo? = null
+            
+            // 创建一个新的列表，只修改需要更新的那个应用
             val updatedApps = currentState.apps.map { app ->
-                // 更新所有同包名的实例的UI状态
-                if (app.packageName == packageName) {
-                    // 如果是操作的那个特定实例，应用转换
-                    if (app.userId == userId) {
-                        transform(app).also { appToSend = it }
-                    } else {
-                        // 其他分身实例，只更新policy
-                        transform(app.copy()).also {
-                             if (appToSend == null) appToSend = it
-                        }
-                    }
+                if (app.packageName == packageName && app.userId == userId) {
+                    // 找到了要更新的特定实例，应用转换并标记以便发送
+                    transform(app).also { appToSend = it }
                 } else {
+                    // 其他应用保持不变
                     app
                 }
             }
-            appToSend?.let { daemonRepository.setPolicy(it) }
+
+            // 如果找到了要更新的应用，就通过 repository 发送到后端
+            appToSend?.let { 
+                daemonRepository.setPolicy(it)
+            }
+
+            // 更新UI状态
             currentState.copy(apps = updatedApps)
         }
     }

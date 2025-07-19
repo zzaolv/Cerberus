@@ -29,7 +29,8 @@ data class DashboardUiState(
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
     val showSystemApps: Boolean = false,
-    val showOnlyForeground: Boolean = false
+    // [FIX #1] 默认只显示前台进程，提供更干净的视图
+    val showOnlyForeground: Boolean = true
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -43,6 +44,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
+            // Pre-warm the cache
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
@@ -53,23 +55,24 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             ) { dashboardPayload, speed, showSystem, showOnlyFg ->
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
-                        // [FIX] 只从仓库获取主应用(user 0)的信息
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
                         UiAppRuntime(
                             runtimeState = runtimeState,
-                            // 如果是分身应用(appInfo为null)，则使用后台传来的包名
                             appName = appInfo?.appName ?: runtimeState.packageName,
                             icon = appInfo?.icon,
                             isSystem = appInfo?.isSystemApp ?: false,
                             userId = runtimeState.userId
                         )
                     }
+                    // [FIX #1] 过滤掉没有图标的进程（通常是底层系统服务）
+                    .filter { it.icon != null } 
                     .filter { showSystem || !it.isSystem }
                     .filter { !showOnlyFg || it.runtimeState.isForeground }
+                    // [FIX #1] 调整排序：前台优先，然后按内存降序，最后按CPU降序
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
-                            .thenByDescending { it.runtimeState.cpuUsagePercent }
                             .thenByDescending { it.runtimeState.memUsageKb }
+                            .thenByDescending { it.runtimeState.cpuUsagePercent }
                     )
 
                 _uiState.value.copy(

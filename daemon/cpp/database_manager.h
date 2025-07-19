@@ -20,6 +20,7 @@ enum class AppPolicy {
 // 应用的持久化配置数据结构
 struct AppConfig {
     std::string package_name;
+    int user_id = 0; // [FIX] 增加 user_id 以支持分身应用
     AppPolicy policy = AppPolicy::EXEMPTED; // 默认值应为豁免，符合用户自选原则
     bool force_playback_exempt = false;
     bool force_network_exempt = false;
@@ -29,8 +30,8 @@ class DatabaseManager {
 public:
     explicit DatabaseManager(const std::string& db_path);
 
-    // 获取单个应用的配置
-    std::optional<AppConfig> get_app_config(const std::string& package_name);
+    // [FIX] 修改函数签名以支持分身
+    std::optional<AppConfig> get_app_config(const std::string& package_name, int user_id);
     
     // 设置/更新单个应用的配置
     bool set_app_config(const AppConfig& config);
