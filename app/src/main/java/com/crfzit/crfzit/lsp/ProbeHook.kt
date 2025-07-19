@@ -3,7 +3,6 @@ package com.crfzit.crfzit.lsp
 
 import android.app.ActivityManager
 import android.content.pm.ApplicationInfo
-// [FIX] 添加缺失的包引用，解决 myPid() 无法解析的问题
 import android.os.Process
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.CerberusMessage
@@ -23,7 +22,7 @@ import java.util.*
 import java.util.concurrent.Executors
 
 /**
- * Project Cerberus - System Probe (v6.1, Compilation Fix)
+ * Project Cerberus - System Probe (v6.2, Final Compilation Fix)
  */
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -33,7 +32,9 @@ class ProbeHook : IXposedHookLoadPackage {
     private val frozenAppsCache = MutableStateFlow<Set<AppInstanceKey>>(emptySet())
 
     companion object {
-        private const val TAG = "CerberusProbe_v6.1"
+        private const val TAG = "CerberusProbe_v6.2"
+        // [FIX] Define the constant used for calculating user ID from UID.
+        private const val PER_USER_RANGE = 100000
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -46,38 +47,23 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private fun initializeHooks(classLoader: ClassLoader) {
         setupUdsCommunication()
-
-        // [NEW] Replace blocking hook with a non-blocking, event-driven hook.
         hookTopActivityChange(classLoader)
-
-        // Keep other interception hooks, they rely on the now-fast cache.
         hookActivityManagerExtras(classLoader)
         hookPowerManager(classLoader)
         hookAlarmManager(classLoader)
-
         log("All hooks attached. Probe is active.")
     }
 
-    /**
-     * [NEW] Hooks the method responsible for setting the top resumed activity.
-     * This is a non-blocking, fire-and-forget mechanism to notify the daemon.
-     */
     private fun hookTopActivityChange(classLoader: ClassLoader) {
         try {
             val atmsClass = XposedHelpers.findClass("com.android.server.wm.ActivityTaskManagerService", classLoader)
-
-            // This method is a reliable indicator for the focused activity changing.
-            // Signature: setResumedActivityUnchecked(ActivityRecord r, String reason)
             XposedBridge.hookAllMethods(atmsClass, "setResumedActivityUnchecked", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val activityRecord = param.args[0] ?: return
-
                     val appInfo = XposedHelpers.getObjectField(activityRecord, "info") as? ApplicationInfo ?: return
                     val userId = XposedHelpers.getIntField(activityRecord, "mUserId")
                     val packageName = appInfo.packageName
 
-                    // Simply notify the daemon that a new app is on top.
-                    // The daemon will decide if an unfreeze is needed.
                     log("Top activity changed to: $packageName (user: $userId). Notifying daemon.")
                     sendToDaemon("event.top_app_changed", mapOf(
                         "package_name" to packageName,
@@ -90,7 +76,6 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("CRITICAL: Failed to hook for top activity changes: $t")
         }
     }
-
 
     private fun hookActivityManagerExtras(classLoader: ClassLoader) {
         try {
@@ -139,7 +124,7 @@ class ProbeHook : IXposedHookLoadPackage {
         udsClient.start()
         probeScope.launch(Dispatchers.IO) {
             delay(5000)
-            sendToDaemon("event.probe_hello", mapOf("version" to "6.1.0", "pid" to Process.myPid()))
+            sendToDaemon("event.probe_hello", mapOf("version" to "6.2.0", "pid" to Process.myPid()))
 
             udsClient.incomingMessages.collectLatest { jsonLine ->
                 try {
@@ -162,8 +147,9 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private fun isAppFrozen(packageName: String?, uid: Int): Boolean {
         if (packageName == null || uid < 10000) return false
-        // [FIX] 使用 ActivityManager.getUserId(uid) 解决 getUserId() 无法解析的问题
-        val userId = ActivityManager.getUserId(uid)
+        // [FIX] Use direct integer division, which is what ActivityManager.getUserId() does internally.
+        // This is 100% reliable and avoids class loader issues in the Xposed environment.
+        val userId = uid / PER_USER_RANGE
         val key = AppInstanceKey(packageName, userId)
         return frozenAppsCache.value.contains(key)
     }

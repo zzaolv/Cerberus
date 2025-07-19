@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v6.0"
+#define LOG_TAG "cerberusd_main_v6.1" // Version bump for the fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -46,11 +46,10 @@ void notify_probe_of_config_change() {
         LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 6}, // Protocol version bump
+            {"v", 6},
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
-        // Send ONLY to the probe.
         g_server->send_message(probe_fd, message.dump());
     }
 }
@@ -71,32 +70,29 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // --- Probe-originated Events (check fd to be sure) ---
-        if (client_fd == g_probe_fd.load()) {
-            if (type == "event.top_app_changed") {
-                if (g_state_manager) {
-                    bool config_changed = g_state_manager->on_top_app_changed(msg.at("payload"));
-                    if (config_changed) {
-                        LOGI("Top app change resulted in an unfreeze. Notifying probe immediately.");
-                        notify_probe_of_config_change();
-                        trigger_state_broadcast(); // Also update UI
-                    }
+        if (type == "event.top_app_changed") {
+            if (g_state_manager) {
+                bool config_changed = g_state_manager->on_top_app_changed(msg.at("payload"));
+                if (config_changed) {
+                    LOGI("Top app change resulted in an unfreeze. Notifying probe immediately.");
+                    notify_probe_of_config_change();
+                    trigger_state_broadcast();
                 }
-                return; // End of processing for this message
             }
-            if (type == "event.app_state_changed") {
-                if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
-                trigger_state_broadcast();
-                return;
-            }
+            return;
+        }
+
+        if (type == "event.app_state_changed") {
+            if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
+            trigger_state_broadcast();
+            return;
         }
         
-        // --- Generic Events / Commands from any client ---
         if (type == "event.probe_hello") {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
             if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-            notify_probe_of_config_change(); // Sync state to the new probe
+            notify_probe_of_config_change();
             trigger_state_broadcast();
             return;
         }
@@ -148,7 +144,8 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            g_worker_cv.wait_for(std::chrono::seconds(3), [&]{
+            // [COMPILATION FIX] Correctly pass the 'lock' as the first argument to wait_for.
+            g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
         }
@@ -156,7 +153,6 @@ void worker_thread_func() {
         if (!g_is_running) break;
         
         if (g_state_manager) {
-            // tick() is now mainly for freezing apps that time out.
             if (g_state_manager->tick()) {
                 LOGI("State manager tick reported a freeze event, notifying probe.");
                 notify_probe_of_config_change();
@@ -186,7 +182,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v6.0 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v6.1 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -212,7 +208,7 @@ int main(int argc, char *argv[]) {
 
     LOGI("Server loop has finished. Cleaning up...");
     g_is_running = false;
-    g_worker_cv.notify_one(); // Wake up worker thread to exit
+    g_worker_cv.notify_one();
     if (worker_thread.joinable()) worker_thread.join();
     
     LOGI("Cerberus Daemon has shut down cleanly.");
