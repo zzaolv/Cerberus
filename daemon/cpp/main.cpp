@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v3.4" 
+#define LOG_TAG "cerberusd_main_v4.0"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -23,6 +23,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+// Global variables remain the same
 const std::string SOCKET_NAME = "cerberus_socket";
 const std::string DATA_DIR = "/data/adb/cerberus";
 const std::string DB_PATH = DATA_DIR + "/cerberus.db";
@@ -31,7 +32,6 @@ std::atomic<bool> g_is_running = true;
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
 std::atomic<int> g_probe_fd = -1;
-
 std::atomic<bool> g_force_refresh_flag = false;
 std::mutex g_worker_mutex;
 std::condition_variable g_worker_cv;
@@ -47,11 +47,12 @@ void notify_probe_of_config_change() {
         LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 3},
+            {"v", 4}, // Protocol version bump
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
-        g_server->send_message(probe_fd, message.dump());
+        // Use broadcast because there might be other probes or listeners
+        g_server->broadcast_message(message.dump());
     }
 }
 
@@ -65,67 +66,45 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
+// [FIX] Reworked message handling for the new architecture
 void handle_client_message(int client_fd, const std::string& message_str) {
     LOGI("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        if (type.rfind("event.", 0) == 0) {
-            if (client_fd != g_probe_fd.load() && type != "event.probe_hello") {
-                LOGW("Ignoring event '%s' from non-probe client fd %d", type.c_str(), client_fd);
-                return;
-            }
-            if (type == "event.probe_hello") {
-                LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
-                g_probe_fd = client_fd;
-                if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-                notify_probe_of_config_change();
-                trigger_state_broadcast(); 
-            } else if (type == "event.app_state_changed") {
-                if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
-                trigger_state_broadcast();
-            } else if (type == "event.system_state_changed") {
-                if (g_state_manager) g_state_manager->on_system_state_changed_from_probe(msg.at("payload"));
-                trigger_state_broadcast();
-            }
+        if (type == "event.probe_hello") {
+            LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
+            g_probe_fd = client_fd;
+            if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
+            notify_probe_of_config_change(); // Immediately sync state to the new probe
+            trigger_state_broadcast();
             return;
         }
+
+        if (type == "event.app_state_changed") {
+            if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
+            trigger_state_broadcast();
+            return;
+        }
+
+        // --- Command Handling ---
         
-        json response_payload;
-        std::string response_type;
-
+        // This is now the critical path for unfreezing
         if (type == "cmd.request_immediate_unfreeze") {
-            if (client_fd != g_probe_fd.load()) {
-                 LOGW("Ignoring unfreeze request from non-probe client fd %d", client_fd);
-                 return;
-            }
-            json payload = msg.at("payload");
             if (g_state_manager) {
-                LOGI("Processing unfreeze request from Probe for %s", payload.dump().c_str());
-                bool success = g_state_manager->on_unfreeze_request_from_probe(payload);
-                
-                json response_msg = {
-                    {"v", 3},
-                    {"type", "resp.unfreeze_complete"},
-                    {"req_id", msg.value("req_id", "")},
-                    {"payload", {
-                        {"package_name", payload.value("package_name", "")},
-                        {"user_id", payload.value("user_id", 0)},
-                        {"success", success}
-                    }}
-                };
-                g_server->send_message(client_fd, response_msg.dump());
-                LOGI("Sent unfreeze confirmation to Probe.");
-
-                notify_probe_of_config_change();
-                trigger_state_broadcast();
+                bool state_changed = g_state_manager->on_unfreeze_request_from_probe(msg.at("payload"));
+                // If the state changed (i.e., an app was actually unfrozen),
+                // we MUST notify all probes so they can update their caches.
+                if (state_changed) {
+                    notify_probe_of_config_change();
+                }
+                // No response needed, the config update is the confirmation.
             }
         } else if (type == "cmd.set_policy") {
+            // ... (remains the same as previous version)
             const auto& payload = msg.at("payload");
-            LOGI("Processing set_policy for %s (user %d)", 
-                payload.value("package_name", "N/A").c_str(), 
-                payload.value("user_id", -1));
+            LOGI("Processing set_policy for %s (user %d)", payload.value("package_name", "N/A").c_str(), payload.value("user_id", -1));
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
             new_config.user_id = payload.value("user_id", 0);
@@ -138,35 +117,27 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 trigger_state_broadcast();
             }
         } else if (type == "query.get_all_policies") {
+            // ... (remains the same)
             if (g_state_manager) {
-                response_payload = g_state_manager->get_full_config_for_ui();
-                response_type = "resp.all_policies";
+                json response_payload = g_state_manager->get_full_config_for_ui();
+                json response_msg = {
+                    {"v", 4},
+                    {"type", "resp.all_policies"},
+                    {"req_id", msg.value("req_id", "")},
+                    {"payload", response_payload}
+                };
+                 g_server->send_message(client_fd, response_msg.dump());
             }
         } else if (type == "query.refresh_dashboard") {
             trigger_state_broadcast();
-        } else {
-            LOGW("Received unknown message type from fd %d: %s", client_fd, type.c_str());
         }
-
-        if (!response_type.empty()) {
-            std::string req_id = msg.value("req_id", "");
-            json response_msg = {
-                {"v", 3},
-                {"type", response_type},
-                {"req_id", req_id},
-                {"payload", response_payload}
-            };
-            if (g_server) g_server->send_message(client_fd, response_msg.dump());
-        }
-
     } catch (const json::exception& e) {
-        LOGE("JSON Error handling message from fd %d: %s. Message: %s", client_fd, e.what(), message_str.c_str());
-    } catch (const std::exception& e) {
-        LOGE("Generic Error handling message from fd %d: %s. Message: %s", client_fd, e.what(), message_str.c_str());
+        LOGE("JSON Error: %s. Message: %s", e.what(), message_str.c_str());
     }
 }
 
 
+// ... (signal_handler and main function structure remain the same, just ensure they call the updated functions)
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
@@ -179,7 +150,6 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            // [FIX] 将 lock 作为第一个参数传递给 wait_for
             g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
@@ -193,7 +163,7 @@ void worker_thread_func() {
         }
 
         if (needs_probe_update) {
-            LOGI("State manager reported significant change, notifying probe.");
+            LOGI("State manager reported significant change (app frozen), notifying probe.");
             notify_probe_of_config_change();
         }
 
@@ -205,7 +175,7 @@ void worker_thread_func() {
         if (g_server && g_server->has_clients()) {
             json payload = g_state_manager->get_dashboard_payload();
             json message = {
-                {"v", 3},
+                {"v", 4},
                 {"type", "stream.dashboard_update"},
                 {"payload", payload}
             };
@@ -219,7 +189,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v3.4 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v4.0 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {

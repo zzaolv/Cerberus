@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <set>
 
-#define LOG_TAG "cerberusd_state_v3.5"
+#define LOG_TAG "cerberusd_state_v4.0"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -19,23 +19,12 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-constexpr int PER_USER_RANGE = 100000;
-
-static std::string status_to_string(AppRuntimeState::Status status) {
-    switch (status) {
-        case AppRuntimeState::Status::STOPPED: return "STOPPED";
-        case AppRuntimeState::Status::FOREGROUND: return "FOREGROUND";
-        case AppRuntimeState::Status::BACKGROUND_IDLE: return "BACKGROUND_IDLE";
-        case AppRuntimeState::Status::AWAITING_FREEZE: return "AWAITING_FREEZE";
-        case AppRuntimeState::Status::FROZEN: return "FROZEN";
-        case AppRuntimeState::Status::EXEMPTED: return "EXEMPTED";
-    }
-    return "UNKNOWN";
-}
+// Function declarations need to be outside the class if they are static helpers
+static std::string status_to_string(AppRuntimeState::Status status);
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v3.5, Backend-Driven Unfreeze) Initializing...");
+    LOGI("StateManager (v4.0, Active Interception Model) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -378,23 +367,23 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
     
-    
     load_all_configs();
     reconcile_process_state();
     LOGI("StateManager Initialized.");
 }
 
+// Tick's primary job is now freezing apps, not unfreezing them.
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
     bool probe_needs_update = false;
 
     reconcile_process_state();
-
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
 
     for (auto& [key, app] : managed_apps_) {
+        // ... (The freezing logic inside the loop remains the same)
         if (!app.pids.empty()) {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         }
@@ -405,6 +394,7 @@ bool StateManager::tick() {
             continue;
         }
         
+        // ... (temp exemption logic is the same)
         bool has_temp_exemption = app.has_audio || app.has_notification;
         if (has_temp_exemption) {
             if(app.current_status == AppRuntimeState::Status::AWAITING_FREEZE || app.current_status == AppRuntimeState::Status::FROZEN) {
@@ -452,8 +442,7 @@ bool StateManager::tick() {
     return probe_needs_update;
 }
 
-// ... (reconcile_process_state, on_probe_hello, on_probe_disconnect remain unchanged) ...
-
+// [FIX] This function is now simplified. It just updates our internal 'is_foreground' flag.
 void StateManager::on_app_state_changed_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -463,40 +452,67 @@ void StateManager::on_app_state_changed_from_probe(const json& payload) {
 
         AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
         if (!app) return;
-
-        // [FIX #3] CORE UNFREEZE LOGIC
-        // If the probe reports the app is now in the foreground...
-        if (is_fg) {
-            // ... and we think it's frozen...
-            if (app->current_status == AppRuntimeState::Status::FROZEN) {
-                LOGI("Foreground promotion detected for frozen app %s (user %d). Unfreezing immediately.", pkg.c_str(), user_id);
-                // ... then we MUST unfreeze it immediately.
-                if (action_executor_->unfreeze_and_cleanup({pkg, user_id})) {
-                    transition_state(*app, AppRuntimeState::Status::FOREGROUND, "unfrozen due to foreground promotion");
-                } else {
-                    LOGE("Immediate unfreeze FAILED for %s (user %d).", pkg.c_str(), user_id);
-                    // Fallback: transition to idle to avoid being stuck in a broken state
-                    transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "unfreeze failed, fallback");
-                }
-            }
-        }
-
-        // General state update logic
+        
         if (app->is_foreground != is_fg) {
             app->is_foreground = is_fg;
-            // If the app is no longer foreground, and it was running in the foreground, move it to idle.
             if (!is_fg && app->current_status == AppRuntimeState::Status::FOREGROUND) {
                 transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "probe reported background");
             }
         }
     } catch (const json::exception& e) {
-        LOGE("JSON error in on_app_state_changed: %s. Payload: %s", e.what(), payload.dump().c_str());
+        LOGE("JSON error in on_app_state_changed: %s", e.what());
     }
 }
 
-// ... all other functions remain unchanged ...
+// [FIX] This is now the ONLY way an app gets unfrozen by user action.
+bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string pkg = payload.at("package_name").get<std::string>();
+        int user_id = payload.at("user_id").get<int>();
+        AppInstanceKey key = {pkg, user_id};
 
-// The rest of state_manager.cpp is the same as the previous version
+        LOGI("Handling IMMEDIATE unfreeze request from Probe for %s (user %d)", pkg.c_str(), user_id);
+
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) {
+            if (!action_executor_->unfreeze_and_cleanup(key)) {
+                LOGE("ActionExecutor failed to unfreeze %s (user %d)", pkg.c_str(), user_id);
+                return false; // Let Probe know it failed.
+            }
+            // Transition state and signal that the probe's cache needs an update.
+            if(transition_state(it->second, AppRuntimeState::Status::FOREGROUND, "unfrozen by probe request")) {
+                // This will return true, indicating a significant state change (frozen -> not frozen)
+                return true; 
+            }
+        }
+        // If app was not frozen, it's a success by default.
+        return true;
+    } catch (const json::exception& e) {
+        LOGE("JSON error in on_unfreeze_request_from_probe: %s", e.what());
+        return false;
+    }
+}
+
+// All other functions of StateManager (reconcile, config changes, payload generation, etc.)
+// remain largely the same as the previous version. They are included here for completeness.
+
+// ... (Paste the rest of the functions from the previous correct `state_manager.cpp` version here)
+// e.g., reconcile_process_state, on_probe_hello, on_probe_disconnect, etc.
+// The only critical change is in on_app_state_changed_from_probe and on_unfreeze_request_from_probe.
+
+static std::string status_to_string(AppRuntimeState::Status status) {
+    switch (status) {
+        case AppRuntimeState::Status::STOPPED: return "STOPPED";
+        case AppRuntimeState::Status::FOREGROUND: return "FOREGROUND";
+        case AppRuntimeState::Status::BACKGROUND_IDLE: return "BACKGROUND_IDLE";
+        case AppRuntimeState::Status::AWAITING_FREEZE: return "AWAITING_FREEZE";
+        case AppRuntimeState::Status::FROZEN: return "FROZEN";
+        case AppRuntimeState::Status::EXEMPTED: return "EXEMPTED";
+    }
+    return "UNKNOWN";
+}
+
 void StateManager::reconcile_process_state() {
     std::unordered_map<int, AppInstanceKey> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
@@ -544,39 +560,6 @@ void StateManager::on_system_state_changed_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (payload.contains("screen_on")) {
         is_screen_on_ = payload.at("screen_on").get<bool>();
-    }
-}
-
-bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    try {
-        std::string pkg = payload.at("package_name").get<std::string>();
-        int user_id = payload.at("user_id").get<int>();
-        AppInstanceKey key = {pkg, user_id};
-
-        LOGI("Handling unfreeze request for %s (user %d)", pkg.c_str(), user_id);
-
-        auto it = managed_apps_.find(key);
-        if (it != managed_apps_.end() && it->second.current_status == AppRuntimeState::Status::FROZEN) {
-             LOGI("App is indeed frozen. Proceeding with unfreeze.");
-            if (!action_executor_->unfreeze_and_cleanup(key)) {
-                LOGE("ActionExecutor failed to unfreeze %s (user %d)", pkg.c_str(), user_id);
-                return false;
-            }
-            transition_state(it->second, AppRuntimeState::Status::FOREGROUND, "unfrozen by user action");
-            it->second.is_foreground = true;
-            LOGI("Successfully unfroze and transitioned state for %s (user %d)", pkg.c_str(), user_id);
-            return true;
-        }
-        if (it != managed_apps_.end()) {
-            LOGW("Unfreeze request for %s (user %d), but it was not in a frozen state (current: %s). Allowing start.", pkg.c_str(), user_id, status_to_string(it->second.current_status).c_str());
-        } else {
-             LOGW("Unfreeze request for unknown app %s (user %d). Allowing start.", pkg.c_str(), user_id);
-        }
-        return true;
-    } catch (const json::exception& e) {
-        LOGE("JSON error in on_unfreeze_request_from_probe: %s", e.what());
-        return false;
     }
 }
 
@@ -710,6 +693,7 @@ void StateManager::load_all_configs() {
 }
 
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
+    constexpr int PER_USER_RANGE = 100000;
     uid = -1; user_id = -1;
     struct stat st;
     std::string proc_path = "/proc/" + std::to_string(pid);

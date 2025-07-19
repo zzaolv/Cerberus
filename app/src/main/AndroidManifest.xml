@@ -43,7 +43,7 @@
 
         <meta-data
             android:name="xposedminversion"
-            android:value="93" /> <!-- 93 对应 LSPosed 1.x -->
+            android:value="100" /> <!-- 93 对应 LSPosed 1.x -->
 
         <meta-data
             android:name="xposedscope"

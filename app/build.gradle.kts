@@ -91,7 +91,7 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
 
     implementation(libs.gson)
-    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("io.coil-kt:coil-compose:2.7.0")
     
     // Xposed API 依赖保持不变
     compileOnly("de.robv.android.xposed:api:82")
