@@ -9,7 +9,6 @@ import com.crfzit.crfzit.data.model.CerberusMessage
 import com.crfzit.crfzit.data.model.ProbeConfigUpdatePayload
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
-import com.google.gson.JsonSyntaxException
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -26,9 +25,6 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/**
- * Project Cerberus - System Probe (v10.0, Pre-emptive Unfreeze Architecture)
- */
 class ProbeHook : IXposedHookLoadPackage {
 
     private val probeScope = CoroutineScope(SupervisorJob() + Executors.newCachedThreadPool().asCoroutineDispatcher())
@@ -38,7 +34,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private val pendingThawRequests = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v10.0"
+        private const val TAG = "CerberusProbe_Final_Fix"
         private const val PER_USER_RANGE = 100000
         private const val THAW_TIMEOUT_MS = 1500L
     }
@@ -66,61 +62,54 @@ class ProbeHook : IXposedHookLoadPackage {
                     val request = XposedHelpers.getObjectField(param.thisObject, "mRequest") ?: return
                     val intent = XposedHelpers.getObjectField(request, "intent") as? android.content.Intent ?: return
                     val callingUid = XposedHelpers.getIntField(request, "callingUid")
-                    
+
+                    if (callingUid < Process.FIRST_APPLICATION_UID) return
+
                     val component = intent.component ?: return
                     val packageName = component.packageName
-                    
-                    // Correct way to get user ID from UID in system_server context
-                    val userHandle = XposedHelpers.callStaticMethod(
-                        UserHandle::class.java, "getUserHandleForUid", callingUid
-                    ) as android.os.UserHandle
-                    val userManager = XposedHelpers.callStaticMethod(
-                        XposedHelpers.findClass("com.android.server.pm.UserManagerService", classLoader), "getInstance"
-                    )
-                    val userId = XposedHelpers.callMethod(userManager, "getUserHandle", userHandle.hashCode()) as Int
+
+                    // [THE FIX] Use the simple, direct, and 100% reliable mathematical calculation.
+                    val userId = callingUid / PER_USER_RANGE
 
                     if (isAppFrozen(packageName, callingUid)) {
                         log("Intercepted launch of frozen app: $packageName (user: $userId). Requesting pre-emptive thaw...")
                         val success = requestThawAndWait(packageName, userId)
                         if (!success) {
                             logError("Thaw FAILED for $packageName. Aborting launch.")
-                            val startAbortedConst = XposedHelpers.getStaticIntField(ActivityManager::class.java, "START_ABORTED")
-                            param.result = startAbortedConst
+                            param.result = XposedHelpers.getStaticIntField(ActivityManager::class.java, "START_ABORTED")
                         } else {
                             log("Thaw successful for $packageName. Proceeding with launch.")
                         }
                     }
                 }
             })
-            log("Hooked ActivityStarter#execute successfully for pre-emptive thaw.")
+            log("Hooked ActivityStarter#execute for pre-emptive thaw.")
         } catch (t: Throwable) {
-            logError("CRITICAL: Failed to hook ActivityStarter: $t \n ${t.stackTraceToString()}")
+            logError("CRITICAL: Failed to hook ActivityStarter: $t")
         }
     }
-    
-    private fun requestThawAndWait(packageName: String, userId: Int): Boolean {
-        return try {
-            val reqId = UUID.randomUUID().toString()
-            val future = CompletableFuture<Boolean>()
-            pendingThawRequests[reqId] = future
 
+    private fun requestThawAndWait(packageName: String, userId: Int): Boolean {
+        val reqId = UUID.randomUUID().toString()
+        val future = CompletableFuture<Boolean>()
+        try {
+            pendingThawRequests[reqId] = future
             val payload = AppInstanceKey(packageName, userId)
             sendToDaemon("cmd.request_immediate_unfreeze", payload, reqId)
-
-            // Block for the result with a timeout
-            future.get(THAW_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            return future.get(THAW_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
             logError("Exception in requestThawAndWait for $packageName: ${e.message}")
-            false
+            return false
+        } finally {
+            pendingThawRequests.remove(reqId)
         }
     }
 
     private fun setupUdsCommunication() {
         udsClient.start()
         probeScope.launch(Dispatchers.IO) {
-            delay(5000) 
-            sendToDaemon("event.probe_hello", mapOf("version" to "10.0.0", "pid" to Process.myPid()))
-
+            delay(5000)
+            sendToDaemon("event.probe_hello", mapOf("version" to "10.final", "pid" to Process.myPid()))
             udsClient.incomingMessages.collectLatest { jsonLine ->
                 try {
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
@@ -130,14 +119,11 @@ class ProbeHook : IXposedHookLoadPackage {
                         val type = object : TypeToken<CerberusMessage<ProbeConfigUpdatePayload>>() {}.type
                         val msg = gson.fromJson<CerberusMessage<ProbeConfigUpdatePayload>>(jsonLine, type)
                         val newCache = msg.payload.frozenApps.toSet()
-                        if(frozenAppsCache.value != newCache){
-                             frozenAppsCache.value = newCache
-                             log("Frozen app cache updated. Size: ${newCache.size}")
+                        if (frozenAppsCache.value != newCache) {
+                            frozenAppsCache.value = newCache
                         }
                     }
-                } catch (e: Exception) {
-                    logError("Daemon msg processing error: $e")
-                }
+                } catch (e: Exception) { /* Ignore */ }
             }
         }
     }
@@ -152,9 +138,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun sendToDaemon(type: String, payload: Any, reqId: String? = null) {
         probeScope.launch {
             try {
-                val message = CerberusMessage(10, type, reqId, payload)
-                val jsonString = gson.toJson(message)
-                udsClient.sendMessage(jsonString)
+                udsClient.sendMessage(gson.toJson(CerberusMessage(10, type, reqId, payload)))
             } catch (e: Exception) {
                 logError("Daemon send error: $e")
             }
@@ -162,8 +146,8 @@ class ProbeHook : IXposedHookLoadPackage {
     }
 
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
-
-    // --- All hooks below are auxiliary and unchanged ---
+    private fun log(message: String) = XposedBridge.log("$TAG: $message")
+    private fun logError(message: String) = XposedBridge.log("$TAG: [ERROR] $message")
 
     private fun hookActivityManagerExtras(classLoader: ClassLoader) {
         try {
@@ -191,7 +175,6 @@ class ProbeHook : IXposedHookLoadPackage {
         } catch (t: Throwable) {
             logError("Failed to hook BroadcastQueue: $t")
         }
-
         try {
             val appErrorsClass = XposedHelpers.findClass("com.android.server.am.AppErrors", classLoader)
             XposedBridge.hookAllMethods(appErrorsClass, "handleShowAnrUi", object : XC_MethodHook() {
@@ -254,7 +237,4 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Failed to attach AlarmManager hooks: $t")
         }
     }
-
-    private fun log(message: String) = XposedBridge.log("$TAG: $message")
-    private fun logError(message: String) = XposedBridge.log("$TAG: [ERROR] $message")
 }

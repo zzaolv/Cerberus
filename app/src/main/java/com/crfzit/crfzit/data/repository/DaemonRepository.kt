@@ -33,8 +33,8 @@ class DaemonRepository(
                     // 只处理响应消息，流消息由各自的收集器处理
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
                     if (baseMsg.type.startsWith("resp.") && baseMsg.requestId != null) {
-                        pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
-                    }
+                            pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
+                        }
                 } catch (e: JsonSyntaxException) {
                     Log.e("DaemonRepository", "JSON parse error in response collector: ${e.message} for line: $jsonLine")
                 }
@@ -90,7 +90,7 @@ class DaemonRepository(
         return try {
             // 设置5秒超时
             val responseJson = withTimeout(5000) { deferred.await() }
-            val type = object : TypeToken<CerberusMessage<PolicyConfigPayload>>() {}.type
+                val type = object : TypeToken<CerberusMessage<PolicyConfigPayload>>() {}.type
             val message = gson.fromJson<CerberusMessage<PolicyConfigPayload>>(responseJson, type)
             // 确保响应类型匹配
             if (message.type == "resp.all_policies") message.payload else null

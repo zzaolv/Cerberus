@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap
 class AppInfoRepository private constructor(private val context: Context) {
 
     private val packageManager: PackageManager = context.packageManager
-    // 缓存只关心包名，因为我们只获取当前用户的应用信息（图标、名称）
+    // [FIX] 缓存Key只包含包名，因为这个仓库只处理当前用户(user 0)
     private val appInfoCache: ConcurrentHashMap<String, AppInfo> = ConcurrentHashMap()
     private val cacheMutex = Mutex()
 
@@ -28,18 +28,23 @@ class AppInfoRepository private constructor(private val context: Context) {
         }
     }
 
-    // [修正] getAppInfo 不再需要 userId，它只为ViewModel提供主应用的视觉信息
+    // [FIX] getAppInfo 不再需要 userId，它只查找当前用户的应用
     suspend fun getAppInfo(packageName: String): AppInfo? {
         appInfoCache[packageName]?.let { return it }
 
         return cacheMutex.withLock {
-            appInfoCache[packageName] ?: loadSingleApp(packageName)?.also { appInfoCache[packageName] = it }
+            appInfoCache[packageName]?.let { return@withLock it }
+
+            val app = loadSingleApp(packageName)
+            app?.let { appInfoCache[packageName] = it }
+            app
         }
     }
 
     private suspend fun loadAllInstalledApps() {
         withContext(Dispatchers.IO) {
             appInfoCache.clear()
+            // [FIX] 只获取当前用户(user 0)的应用列表
             val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filterNotNull()
                 .mapNotNull { appInfo ->

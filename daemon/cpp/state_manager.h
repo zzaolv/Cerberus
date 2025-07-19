@@ -46,10 +46,10 @@ public:
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
     
-    // Handles high-priority, synchronous unfreeze requests from Probe. Returns true on success.
+    // [核心修复] 新增方法，处理来自Probe的高优先级、同步解冻请求，解决问题2（黑白屏）
     bool on_unfreeze_request(const json& payload);
     
-    // Handles config changes from UI. Returns true if a policy change caused an unfreeze.
+    // 处理来自UI的配置变更
     bool on_config_changed_from_ui(const AppConfig& new_config);
 
     json get_dashboard_payload();
@@ -67,6 +67,8 @@ private:
     bool transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
+    
+    // [核心修复] 新增方法和成员变量，用于检查是否为关键系统应用，解决问题1（系统卡死）
     bool is_critical_system_app(const std::string& package_name) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -78,10 +80,13 @@ private:
     
     bool is_screen_on_ = true;
 
+    // AppInstanceKey 现在是解决问题3（分身应用）的基础
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     
     std::map<int, AppRuntimeState*> pid_to_app_map_;
+    
+    // [核心修复] 关键系统应用的安全列表 (Safety Net)
     std::unordered_set<std::string> critical_system_apps_;
 
     int probe_fd_ = -1; 

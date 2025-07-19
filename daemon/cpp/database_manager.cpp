@@ -15,16 +15,16 @@ DatabaseManager::DatabaseManager(const std::string& db_path)
 
 void DatabaseManager::initialize_database() {
     try {
-        // [FIX] 数据库表结构升级，支持分身应用独立配置
-        // 如果旧表存在，需要迁移数据（此处为简化，直接创建新结构）
-        // 实际升级场景可能需要更复杂的迁移逻辑
+        // [核心修复] 数据库表结构升级，支持分身应用独立配置
+        // 使用新表名 app_policies_v2，并使用 (package_name, user_id)作为复合主键
         if (!db_.tableExists("app_policies_v2")) {
             LOGI("Table 'app_policies_v2' does not exist. Creating it.");
+            // 如果旧表存在，可以考虑数据迁移，这里为简化直接删除
             if (db_.tableExists("app_policies")) {
                  LOGI("Old 'app_policies' table found. Dropping it.");
                  db_.exec("DROP TABLE app_policies;");
             }
-            // 表结构与 AppConfig 结构体完全对应
+            // 新表结构与 AppConfig 结构体完全对应
             db_.exec(R"(
                 CREATE TABLE app_policies_v2 (
                     package_name TEXT NOT NULL,
@@ -41,7 +41,7 @@ void DatabaseManager::initialize_database() {
     }
 }
 
-// [FIX] 修改函数实现以支持分身
+// [核心修复] 修改函数实现以支持分身，查询时同时匹配 package_name 和 user_id
 std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& package_name, int user_id) {
     try {
         SQLite::Statement query(db_, "SELECT policy, force_playback_exempt, force_network_exempt FROM app_policies_v2 WHERE package_name = ? AND user_id = ?");
@@ -63,7 +63,7 @@ std::optional<AppConfig> DatabaseManager::get_app_config(const std::string& pack
     return std::nullopt; // 未找到或发生错误
 }
 
-// [FIX] 修改函数实现以支持分身
+// [核心修复] 修改函数实现以支持分身，插入或更新时使用 user_id
 bool DatabaseManager::set_app_config(const AppConfig& config) {
     try {
         SQLite::Statement query(db_, R"(
@@ -87,7 +87,7 @@ bool DatabaseManager::set_app_config(const AppConfig& config) {
     }
 }
 
-// [FIX] 修改函数实现以支持分身
+// [核心修复] 修改函数实现以支持分身，查询所有配置时，需要把 user_id 也一并查出
 std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
     std::vector<AppConfig> configs;
     try {

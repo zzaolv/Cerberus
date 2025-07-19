@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v10.0"
+#define LOG_TAG "cerberusd_main_v10.1" // Version bump
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -45,17 +45,20 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
+        // [核心修复] 新增消息处理器，用于响应Probe的预先解冻请求
         if (type == "cmd.request_immediate_unfreeze") {
             bool success = g_state_manager ? g_state_manager->on_unfreeze_request(msg.at("payload")) : false;
             
             json response_msg = {
-                {"v", 10},
+                // 使用和请求一致的版本号和req_id，以便客户端匹配
+                {"v", msg.value("v", 1)},
                 {"type", success ? "resp.unfreeze_complete" : "resp.unfreeze_failed"},
                 {"req_id", msg.value("req_id", "")},
                 {"payload", {}}
             };
             g_server->send_message(client_fd, response_msg.dump());
             
+            // 解冻成功后，通知probe和UI状态已变更
             if (success) {
                 notify_probe_of_config_change();
                 trigger_state_broadcast();
@@ -67,7 +70,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
             if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-            notify_probe_of_config_change();
+            notify_probe_of_config_change(); // Probe上线后立即下发配置
             trigger_state_broadcast();
             return;
         }
@@ -76,14 +79,15 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             const auto& payload = msg.at("payload");
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
-            new_config.user_id = payload.value("user_id", 0);
+            new_config.user_id = payload.value("user_id", 0); // 读取user_id
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(new_config)) {
+                // 如果配置变更导致解冻，通知probe更新缓存
                 notify_probe_of_config_change();
             }
-            trigger_state_broadcast();
+            trigger_state_broadcast(); // 总是刷新UI
             return;
         }
 
@@ -91,7 +95,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager) {
                 json response_payload = g_state_manager->get_full_config_for_ui();
                 json response_msg = {
-                    {"v", 10},
+                    {"v", msg.value("v", 1)},
                     {"type", "resp.all_policies"},
                     {"req_id", msg.value("req_id", "")},
                     {"payload", response_payload}
@@ -162,7 +166,7 @@ void worker_thread_func() {
         
         if (g_state_manager) {
             if (g_state_manager->tick()) {
-                LOGI("State manager tick reported a freeze event, notifying probe.");
+                LOGD("State manager tick reported a freeze state change, notifying probe.");
                 notify_probe_of_config_change();
                 needs_ui_update = true;
             }
@@ -185,7 +189,7 @@ void worker_thread_func() {
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    LOGI("Project Cerberus Daemon v10.0 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v10.1 starting... (PID: %d)", getpid());
     try {
         if (!fs::exists(DATA_DIR)) {
             fs::create_directories(DATA_DIR);
