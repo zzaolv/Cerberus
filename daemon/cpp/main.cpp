@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v3.4" // 版本更新
+#define LOG_TAG "cerberusd_main_v3.4" 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -23,7 +23,6 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// --- 全局变量与常量 ---
 const std::string SOCKET_NAME = "cerberus_socket";
 const std::string DATA_DIR = "/data/adb/cerberus";
 const std::string DB_PATH = DATA_DIR + "/cerberus.db";
@@ -72,7 +71,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // --- 事件处理 (主要来自Probe) ---
         if (type.rfind("event.", 0) == 0) {
             if (client_fd != g_probe_fd.load() && type != "event.probe_hello") {
                 LOGW("Ignoring event '%s' from non-probe client fd %d", type.c_str(), client_fd);
@@ -94,7 +92,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
         
-        // --- 命令与查询处理 (主要来自UI和Probe) ---
         json response_payload;
         std::string response_type;
 
@@ -121,7 +118,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 g_server->send_message(client_fd, response_msg.dump());
                 LOGI("Sent unfreeze confirmation to Probe.");
 
-                // [FIX] 立即通知Probe状态已变更，并触发一次UI刷新
                 notify_probe_of_config_change();
                 trigger_state_broadcast();
             }
@@ -132,7 +128,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 payload.value("user_id", -1));
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
-            // [FIX] 读取 user_id
             new_config.user_id = payload.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
@@ -184,7 +179,8 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            g_worker_cv.wait_for(std::chrono::seconds(3), [&]{
+            // [FIX] 将 lock 作为第一个参数传递给 wait_for
+            g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
         }
