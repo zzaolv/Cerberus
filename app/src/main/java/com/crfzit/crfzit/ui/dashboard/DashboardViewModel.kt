@@ -42,7 +42,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            // 启动时强制刷新一次应用列表，确保基础数据是最新的
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
@@ -50,16 +49,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, showSystem ->
-                // [FIX #2] 增强数据合并逻辑的鲁棒性
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
-                        // [FIX #2] 如果 appInfo 为 null (刚安装的应用，仓库来不及更新)
-                        // 仍然创建一个临时的 UiAppRuntime 对象进行显示，避免新应用消失
                         UiAppRuntime(
                             runtimeState = runtimeState,
-                            appName = appInfo?.appName ?: runtimeState.packageName, // 找不到名字就用包名
-                            icon = appInfo?.icon, // 找不到图标就为空
+                            appName = appInfo?.appName ?: runtimeState.packageName,
+                            icon = appInfo?.icon,
                             isSystem = appInfo?.isSystemApp ?: false,
                             userId = runtimeState.userId
                         )
@@ -67,13 +63,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     .filter { showSystem || !it.isSystem }
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
-                            .thenByDescending { it.runtimeState.cpu_usage_percent }
-                            .thenByDescending { it.runtimeState.mem_usage_kb }
+                            // [FIX] 使用Kotlin的驼峰式(camelCase)属性名进行访问
+                            .thenByDescending { it.runtimeState.cpuUsagePercent }
+                            .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
                 _uiState.value.copy(
                     isConnected = true,
-                    isRefreshing = false, // 收到新数据流，刷新状态自动结束
+                    isRefreshing = false,
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = uiAppRuntimes,
@@ -92,15 +89,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             _uiState.update { it.copy(isRefreshing = true) }
             daemonRepository.requestDashboardRefresh()
-            // 移除手动延迟，让数据流驱动UI
         }
     }
 
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
-
-
 
     override fun onCleared() {
         super.onCleared()

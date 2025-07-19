@@ -12,11 +12,12 @@
 #include <unordered_set>
 #include "system_monitor.h"
 #include "database_manager.h"
-#include "process_monitor.h"
+// [REMOVE] #include "process_monitor.h"
 
 class ActionExecutor;
 using json = nlohmann::json;
 
+// ... AppRuntimeState 结构体保持不变 ...
 struct AppRuntimeState {
     std::string package_name;
     std::string app_name;
@@ -46,6 +47,7 @@ struct AppRuntimeState {
     bool has_notification = false;
 };
 
+
 class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager> db, 
@@ -57,14 +59,12 @@ public:
     // --- 事件处理入口 ---
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
-    void on_process_event(ProcessEventType type, int pid, int ppid);
+    // [REMOVE] void on_process_event(ProcessEventType type, int pid, int ppid);
     void on_app_state_changed_from_probe(const json& payload);
     void on_system_state_changed_from_probe(const json& payload);
-    // [FIX #4] 返回操作是否成功
     bool on_unfreeze_request_from_probe(const json& payload);
 
     // --- UI 指令与数据 ---
-    // [FIX #1] 策略是包名全局的，不再需要user_id
     void on_config_changed_from_ui(const AppConfig& new_config);
     json get_dashboard_payload();
     json get_full_config_for_ui();
@@ -75,6 +75,9 @@ private:
     void initial_process_scan();
     void load_all_configs();
     
+    // [NEW] 核心的进程状态核对方法
+    void reconcile_process_state();
+
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
     void add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid);
     void remove_pid_from_app(int pid);

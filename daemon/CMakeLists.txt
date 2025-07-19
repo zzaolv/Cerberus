@@ -46,7 +46,7 @@ add_executable(cerberusd
     cpp/database_manager.cpp
     cpp/state_manager.cpp
     cpp/action_executor.cpp
-    cpp/process_monitor.cpp
+   # cpp/process_monitor.cpp
 )
 
 # --- 5. 为 'cerberusd' 添加头文件搜索路径 ---

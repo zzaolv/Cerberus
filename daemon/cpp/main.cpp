@@ -4,7 +4,7 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
-#include "process_monitor.h"
+// [REMOVE] #include "process_monitor.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
@@ -16,7 +16,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v3.1"
+#define LOG_TAG "cerberusd_main_v3.2" // 版本更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,7 +32,7 @@ const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 std::atomic<bool> g_is_running = true;
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
-std::unique_ptr<ProcessMonitor> g_proc_monitor;
+// [REMOVE] std::unique_ptr<ProcessMonitor> g_proc_monitor;
 std::atomic<int> g_probe_fd = -1;
 
 std::atomic<bool> g_force_refresh_flag = false;
@@ -68,6 +68,7 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
+// ... handle_client_message 函数保持不变 ...
 void handle_client_message(int client_fd, const std::string& message_str) {
     LOGI("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
@@ -84,7 +85,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
                 g_probe_fd = client_fd;
                 if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-                notify_probe_of_config_change(); // Probe连接后立即下发一次配置
+                notify_probe_of_config_change();
+                trigger_state_broadcast(); // 让Probe立刻收到一次状态
             } else if (type == "event.app_state_changed") {
                 if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
                 trigger_state_broadcast();
@@ -109,11 +111,10 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 LOGI("Processing unfreeze request from Probe for %s", payload.dump().c_str());
                 bool success = g_state_manager->on_unfreeze_request_from_probe(payload);
                 
-                // [FIX #4] 无论成功与否，立即响应Probe，解除其阻塞
                 json response_msg = {
                     {"v", 3},
                     {"type", "resp.unfreeze_complete"},
-                    {"req_id", msg.value("req_id", "")}, // 捎带上req_id
+                    {"req_id", msg.value("req_id", "")},
                     {"payload", {
                         {"package_name", payload.value("package_name", "")},
                         {"user_id", payload.value("user_id", 0)},
@@ -123,7 +124,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 g_server->send_message(client_fd, response_msg.dump());
                 LOGI("Sent unfreeze confirmation to Probe.");
 
-                // 解冻后状态发生变化，立即通知Probe和UI
                 notify_probe_of_config_change();
                 trigger_state_broadcast();
             }
@@ -132,8 +132,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             LOGI("Processing set_policy for %s", payload.value("package_name", "N/A").c_str());
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
-            // [FIX] 从v2协议中，我们不再通过UI传递user_id，因为策略是针对包名全局的
-            // user_id 只在运行时状态中有意义
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
@@ -171,20 +169,21 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     }
 }
 
+
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
     g_worker_cv.notify_one();
     if (g_server) g_server->stop();
-    if (g_proc_monitor) g_proc_monitor->stop();
+    // [REMOVE] if (g_proc_monitor) g_proc_monitor->stop();
 }
 
+// ... worker_thread_func 函数保持不变 ...
 void worker_thread_func() {
     LOGI("Worker thread started.");
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            // [FIX] 确保即使没有通知，每3秒也会醒来一次
             g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
@@ -192,13 +191,12 @@ void worker_thread_func() {
 
         if (!g_is_running) break;
         
-        // [LOGGING] 确认工作线程在活动
         LOGI("Worker thread tick!");
 
         if (g_force_refresh_flag.load()) {
             LOGI("Forced refresh triggered.");
         }
-        g_force_refresh_flag = false; // 重置标志位
+        g_force_refresh_flag = false;
         
         if (g_state_manager) {
             g_state_manager->tick();
@@ -212,18 +210,18 @@ void worker_thread_func() {
                 {"type", "stream.dashboard_update"},
                 {"payload", payload}
             };
-            // 广播给所有非Probe客户端（即UI客户端）
             g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
         }
     }
     LOGI("Worker thread finished.");
 }
 
+
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v3.1 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v3.2 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -240,13 +238,14 @@ int main(int argc, char *argv[]) {
     auto sys_monitor = std::make_shared<SystemMonitor>();
     g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor);
     
-    g_proc_monitor = std::make_unique<ProcessMonitor>();
-    g_proc_monitor->start([&](ProcessEventType type, int pid, int ppid) {
-        if (g_state_manager) {
-            g_state_manager->on_process_event(type, pid, ppid);
-            trigger_state_broadcast();
-        }
-    });
+    // [REMOVE] 移除整个 ProcessMonitor 的启动逻辑
+    // g_proc_monitor = std::make_unique<ProcessMonitor>();
+    // g_proc_monitor->start([&](ProcessEventType type, int pid, int ppid) {
+    //     if (g_state_manager) {
+    //         g_state_manager->on_process_event(type, pid, ppid);
+    //         trigger_state_broadcast();
+    //     }
+    // });
 
     std::thread worker_thread(worker_thread_func);
 
