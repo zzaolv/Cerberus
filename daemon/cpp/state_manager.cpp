@@ -640,6 +640,28 @@ json StateManager::get_dashboard_payload() {
     return payload;
 }
 
+// [FIX] Add the missing implementation for get_probe_config_payload
+json StateManager::get_probe_config_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    json payload;
+    
+    json frozen_apps = json::array();
+    for(const auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            frozen_apps.push_back({
+                {"package_name", app.package_name},
+                {"user_id", app.user_id}
+            });
+        }
+    }
+    
+    // Probe只需要知道哪些应用被冻结了，不需要完整的策略信息
+    payload["policies"] = json::array(); // Keep this empty for the probe
+    payload["frozen_apps"] = frozen_apps;
+    
+    return payload;
+}
+
 // [FIX #3] 修复配置页分身应用问题
 json StateManager::get_full_config_for_ui() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -833,3 +855,4 @@ void StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
     app.current_status = new_status;
     app.last_state_change_time = std::chrono::steady_clock::now();
 }
+
