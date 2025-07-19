@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <set>
 
-#define LOG_TAG "cerberusd_state_v3.4"
+#define LOG_TAG "cerberusd_state_v3.5"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,7 +35,7 @@ static std::string status_to_string(AppRuntimeState::Status status) {
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v3.4, Polling & Per-User-Config) Initializing...");
+    LOGI("StateManager (v3.5, Backend-Driven Unfreeze) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -452,6 +452,51 @@ bool StateManager::tick() {
     return probe_needs_update;
 }
 
+// ... (reconcile_process_state, on_probe_hello, on_probe_disconnect remain unchanged) ...
+
+void StateManager::on_app_state_changed_from_probe(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string pkg = payload.at("package_name").get<std::string>();
+        int user_id = payload.at("user_id").get<int>();
+        bool is_fg = payload.at("is_foreground").get<bool>();
+
+        AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
+        if (!app) return;
+
+        // [FIX #3] CORE UNFREEZE LOGIC
+        // If the probe reports the app is now in the foreground...
+        if (is_fg) {
+            // ... and we think it's frozen...
+            if (app->current_status == AppRuntimeState::Status::FROZEN) {
+                LOGI("Foreground promotion detected for frozen app %s (user %d). Unfreezing immediately.", pkg.c_str(), user_id);
+                // ... then we MUST unfreeze it immediately.
+                if (action_executor_->unfreeze_and_cleanup({pkg, user_id})) {
+                    transition_state(*app, AppRuntimeState::Status::FOREGROUND, "unfrozen due to foreground promotion");
+                } else {
+                    LOGE("Immediate unfreeze FAILED for %s (user %d).", pkg.c_str(), user_id);
+                    // Fallback: transition to idle to avoid being stuck in a broken state
+                    transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "unfreeze failed, fallback");
+                }
+            }
+        }
+
+        // General state update logic
+        if (app->is_foreground != is_fg) {
+            app->is_foreground = is_fg;
+            // If the app is no longer foreground, and it was running in the foreground, move it to idle.
+            if (!is_fg && app->current_status == AppRuntimeState::Status::FOREGROUND) {
+                transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "probe reported background");
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("JSON error in on_app_state_changed: %s. Payload: %s", e.what(), payload.dump().c_str());
+    }
+}
+
+// ... all other functions remain unchanged ...
+
+// The rest of state_manager.cpp is the same as the previous version
 void StateManager::reconcile_process_state() {
     std::unordered_map<int, AppInstanceKey> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
@@ -495,25 +540,6 @@ void StateManager::on_probe_disconnect() {
     probe_fd_ = -1;
 }
 
-void StateManager::on_app_state_changed_from_probe(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    try {
-        std::string pkg = payload.at("package_name").get<std::string>();
-        int user_id = payload.at("user_id").get<int>();
-        bool is_fg = payload.at("is_foreground").get<bool>();
-
-        AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
-        if (!app) return;
-
-        if (app->is_foreground != is_fg) {
-            app->is_foreground = is_fg;
-            if (!is_fg && app->current_status == AppRuntimeState::Status::FOREGROUND) {
-                transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "probe reported background");
-            }
-        }
-    } catch (const json::exception& e) {}
-}
-
 void StateManager::on_system_state_changed_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (payload.contains("screen_on")) {
@@ -542,7 +568,11 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
             LOGI("Successfully unfroze and transitioned state for %s (user %d)", pkg.c_str(), user_id);
             return true;
         }
-        LOGW("Unfreeze request for %s (user %d), but it was not in a frozen state (current: %s). Allowing start.", pkg.c_str(), user_id, status_to_string(it->second.current_status).c_str());
+        if (it != managed_apps_.end()) {
+            LOGW("Unfreeze request for %s (user %d), but it was not in a frozen state (current: %s). Allowing start.", pkg.c_str(), user_id, status_to_string(it->second.current_status).c_str());
+        } else {
+             LOGW("Unfreeze request for unknown app %s (user %d). Allowing start.", pkg.c_str(), user_id);
+        }
         return true;
     } catch (const json::exception& e) {
         LOGE("JSON error in on_unfreeze_request_from_probe: %s", e.what());
@@ -550,7 +580,6 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
     }
 }
 
-// [FIX] Correctly handle per-user config change
 void StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
@@ -561,14 +590,12 @@ void StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
     
     db_manager_->set_app_config(new_config);
     
-    // Find the specific instance and update its config
     AppInstanceKey key_to_update = {new_config.package_name, new_config.user_id};
     auto it = managed_apps_.find(key_to_update);
     if (it != managed_apps_.end()) {
         AppRuntimeState& app_state = it->second;
         app_state.config = new_config;
 
-        // Re-evaluate state based on new policy
         if (app_state.config.policy == AppPolicy::EXEMPTED && app_state.current_status != AppRuntimeState::Status::EXEMPTED) {
              transition_state(app_state, AppRuntimeState::Status::EXEMPTED, "policy changed to exempted");
         } else if (app_state.config.policy != AppPolicy::EXEMPTED && app_state.current_status == AppRuntimeState::Status::EXEMPTED) {
@@ -577,7 +604,6 @@ void StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
             }
         }
     } else {
-        // If the app is not currently running, the config is in the DB and will be picked up when it starts.
         LOGI("Config set for non-running app %s (user %d).", new_config.package_name.c_str(), new_config.user_id);
     }
 }
@@ -633,7 +659,6 @@ json StateManager::get_full_config_for_ui() {
     std::set<AppInstanceKey> seen_instances;
     json policies = json::array();
 
-    // Prioritize currently running apps for freshest data
     for (const auto& [key, app] : managed_apps_) {
         json app_policy;
         app_policy["package_name"] = app.package_name;
@@ -645,7 +670,6 @@ json StateManager::get_full_config_for_ui() {
         seen_instances.insert(key);
     }
     
-    // Add configs from DB for apps that are not currently running
     auto all_db_configs = db_manager_->get_all_app_configs();
     for (const auto& config : all_db_configs) {
         AppInstanceKey key = {config.package_name, config.user_id};
@@ -673,7 +697,7 @@ json StateManager::get_probe_config_payload() {
             frozen_apps.push_back({{"package_name", app.package_name}, {"user_id", app.user_id}});
         }
     }
-    payload["policies"] = json::array(); // Policies are not needed by probe currently
+    payload["policies"] = json::array(); 
     payload["frozen_apps"] = frozen_apps;
     return payload;
 }
@@ -681,7 +705,6 @@ json StateManager::get_probe_config_payload() {
 void StateManager::load_all_configs() {
     auto configs = db_manager_->get_all_app_configs();
     for(const auto& db_config : configs){
-        // This will create a state object with the loaded config if it doesn't exist.
         get_or_create_app_state(db_config.package_name, db_config.user_id);
     }
 }
@@ -701,7 +724,6 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0'); 
     
-    // [FIX] Filter out invalid/system process names
     if (cmdline.empty() || cmdline.find('/') != std::string::npos || cmdline.find('.') == std::string::npos || cmdline.length() < 3) {
         return "";
     }
@@ -765,7 +787,6 @@ AppRuntimeState* StateManager::find_app_by_pid(int pid) {
     return it != pid_to_app_map_.end() ? it->second : nullptr;
 }
 
-// [FIX] Correctly load per-user config
 AppRuntimeState* StateManager::get_or_create_app_state(const std::string& package_name, int user_id) {
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
@@ -774,14 +795,12 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name; // Default to package name
+    new_state.app_name = package_name;
     
-    // Try to load the specific config for this user instance
     auto specific_config_opt = db_manager_->get_app_config(package_name, user_id);
     if(specific_config_opt) {
         new_state.config = *specific_config_opt;
     } else {
-        // If no specific config, create a default one (which might be updated if user 0 has one)
         new_state.config.package_name = package_name;
         new_state.config.user_id = user_id;
     }
@@ -822,6 +841,5 @@ bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
     app.current_status = new_status;
     app.last_state_change_time = std::chrono::steady_clock::now();
 
-    // 如果应用从冻结变为非冻结，或从非冻结变到冻结，这是一个需要通知Probe的重大变化
     return was_frozen || new_status == AppRuntimeState::Status::FROZEN;
 }

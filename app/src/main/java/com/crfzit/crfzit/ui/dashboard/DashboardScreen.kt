@@ -31,7 +31,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
-// [FIX] Import the correct, stable SwipeRefresh components from Accompanist
 import com.google.accompanist.swiperefresh.SwipeRefresh
 import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
 import com.crfzit.crfzit.R
@@ -56,26 +55,19 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
                     IconButton(onClick = { showMenu = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = "更多")
                     }
-                DropdownMenu(
-                    expanded = showMenu,
-                    onDismissRequest = { showMenu = false }
-                ) {
-                    DropdownMenuItem(
-                        text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
-                        onClick = {
-                            viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
-                            showMenu = false
-                        }
-                    )
-                    // [FIX #1] 新增菜单项
-                    DropdownMenuItem(
-                        text = { Text(if (uiState.showOnlyForeground) "显示所有进程" else "仅显示前台") },
-                        onClick = {
-                            viewModel.onShowOnlyForegroundChanged(!uiState.showOnlyForeground)
-                            showMenu = false
-                        }
-                    )
-                }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        // [FIX #2] 移除“仅显示前台”的切换
+                        DropdownMenuItem(
+                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
+                            onClick = {
+                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
+                                showMenu = false
+                            }
+                        )
+                    }
                 }
             )
         }
@@ -86,7 +78,6 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
             label = "ConnectionState"
         ) { isConnected ->
             if (isConnected) {
-                // [FIX] Use the stable Accompanist SwipeRefresh component
                 SwipeRefresh(
                     state = rememberSwipeRefreshState(isRefreshing = uiState.isRefreshing),
                     onRefresh = { viewModel.refresh() }
@@ -104,6 +95,7 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
     }
 }
 
+// ... DashboardContent and other composables remain unchanged ...
 @Composable
 fun DashboardContent(
     globalStats: GlobalStats,

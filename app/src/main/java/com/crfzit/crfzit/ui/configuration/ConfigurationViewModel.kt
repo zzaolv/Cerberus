@@ -30,6 +30,23 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     init {
         loadConfiguration()
     }
+    
+    // [FIX #1] 将过滤和排序逻辑封装成一个可重用的函数
+    fun getFilteredAndSortedApps(): List<AppInfo> {
+        val state = _uiState.value
+        return state.apps
+            .filter { it.icon != null } // 过滤掉没有图标的应用
+            .filter { state.showSystemApps || !it.isSystemApp } // 根据开关决定是否显示系统应用
+            .filter { // 根据搜索词过滤
+                it.appName.contains(state.searchQuery, ignoreCase = true) ||
+                it.packageName.contains(state.searchQuery, ignoreCase = true)
+            }
+            .sortedWith( // 按策略等级降序，再按应用名和用户ID排序
+                compareByDescending<AppInfo> { it.policy.value }
+                    .thenBy { it.appName.lowercase(java.util.Locale.getDefault()) }
+                    .thenBy { it.userId }
+            )
+    }
 
     fun loadConfiguration() {
         viewModelScope.launch {
@@ -40,7 +57,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             
             val finalAppsMap = mutableMapOf<Pair<String, Int>, AppInfo>()
 
-            // 1. 先用前端获取的应用信息填充基础数据 (主要是主用户 User 0)
             mainUserApps.forEach { appInfo ->
                 finalAppsMap[appInfo.packageName to appInfo.userId] = appInfo
             }
@@ -50,20 +66,17 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             if (policyConfig != null) {
                 finalSafetyNet = policyConfig.hardSafetyNet
 
-                // 2. 用后端返回的权威策略数据，更新或添加应用实例
                 policyConfig.policies.forEach { policyPayload ->
                     val key = policyPayload.packageName to policyPayload.userId
                     val existingAppInfo = finalAppsMap[key]
                     
                     if (existingAppInfo != null) {
-                        // 如果应用已存在 (通常是主应用)，更新其策略
                         finalAppsMap[key] = existingAppInfo.copy(
                             policy = Policy.fromInt(policyPayload.policy),
                             forcePlaybackExemption = policyPayload.forcePlaybackExempt,
                             forceNetworkExemption = policyPayload.forceNetworkExempt
                         )
                     } else {
-                        // 如果应用不存在 (通常是分身应用)，需要创建它
                         val mainAppInfo = appInfoRepository.getAppInfo(policyPayload.packageName)
                         finalAppsMap[key] = AppInfo(
                             packageName = policyPayload.packageName,
@@ -84,10 +97,8 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    apps = finalAppsMap.values.sortedWith(
-                        compareBy<AppInfo> { it.appName.lowercase(java.util.Locale.getDefault()) }
-                        .thenBy { it.userId }
-                    ),
+                    // 不再在这里排序，交给 getFilteredAndSortedApps
+                    apps = finalAppsMap.values.toList(),
                     safetyNetApps = finalSafetyNet
                 )
             }
@@ -103,32 +114,25 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     }
     
     fun setPolicy(packageName: String, userId: Int, newPolicy: Policy) {
-        // [FIX #2] 调用重构后的 updateAndSend
         updateAndSend(packageName, userId) { it.copy(policy = newPolicy) }
     }
     
-    // [FIX #2] 重构此方法，使其逻辑清晰且正确
     private fun updateAndSend(packageName: String, userId: Int, transform: (AppInfo) -> AppInfo) {
          _uiState.update { currentState ->
             var appToSend: AppInfo? = null
             
-            // 创建一个新的列表，只修改需要更新的那个应用
             val updatedApps = currentState.apps.map { app ->
                 if (app.packageName == packageName && app.userId == userId) {
-                    // 找到了要更新的特定实例，应用转换并标记以便发送
                     transform(app).also { appToSend = it }
                 } else {
-                    // 其他应用保持不变
                     app
                 }
             }
 
-            // 如果找到了要更新的应用，就通过 repository 发送到后端
             appToSend?.let { 
                 daemonRepository.setPolicy(it)
             }
 
-            // 更新UI状态
             currentState.copy(apps = updatedApps)
         }
     }

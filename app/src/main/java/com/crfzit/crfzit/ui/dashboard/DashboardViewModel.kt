@@ -28,9 +28,8 @@ data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    val showSystemApps: Boolean = false,
-    // [FIX #1] 默认只显示前台进程，提供更干净的视图
-    val showOnlyForeground: Boolean = true
+    // [FIX #2] 移除 showOnlyForeground 状态
+    val showSystemApps: Boolean = false
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -44,15 +43,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            // Pre-warm the cache
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
-                _uiState.map { it.showSystemApps }.distinctUntilChanged(),
-                _uiState.map { it.showOnlyForeground }.distinctUntilChanged()
-            ) { dashboardPayload, speed, showSystem, showOnlyFg ->
+                _uiState.map { it.showSystemApps }.distinctUntilChanged()
+                // [FIX #2] 移除 showOnlyForeground 的 flow
+            ) { dashboardPayload, speed, showSystem ->
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .map { runtimeState ->
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
@@ -64,15 +62,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             userId = runtimeState.userId
                         )
                     }
-                    // [FIX #1] 过滤掉没有图标的进程（通常是底层系统服务）
-                    .filter { it.icon != null } 
+                    .filter { it.icon != null }
                     .filter { showSystem || !it.isSystem }
-                    .filter { !showOnlyFg || it.runtimeState.isForeground }
-                    // [FIX #1] 调整排序：前台优先，然后按内存降序，最后按CPU降序
+                    // [FIX #2] 移除按 isForeground 过滤的逻辑
                     .sortedWith(
+                        // 排序：前台优先，然后按内存降序
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
                             .thenByDescending { it.runtimeState.memUsageKb }
-                            .thenByDescending { it.runtimeState.cpuUsagePercent }
                     )
 
                 _uiState.value.copy(
@@ -81,8 +77,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     globalStats = dashboardPayload.globalStats,
                     networkSpeed = speed,
                     apps = uiAppRuntimes,
-                    showSystemApps = showSystem,
-                    showOnlyForeground = showOnlyFg
+                    showSystemApps = showSystem
                 )
             }
                 .onStart { _uiState.update { it.copy(isConnected = false) } }
@@ -104,9 +99,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(showSystemApps = show) }
     }
     
-    fun onShowOnlyForegroundChanged(show: Boolean) {
-        _uiState.update { it.copy(showOnlyForeground = show) }
-    }
+    // [FIX #2] 移除此函数
+    // fun onShowOnlyForegroundChanged(show: Boolean) { ... }
 
     override fun onCleared() {
         super.onCleared()

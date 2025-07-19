@@ -33,11 +33,7 @@ fun ConfigurationScreen(
     val uiState by viewModel.uiState.collectAsState()
     
     val filteredApps = remember(uiState.apps, uiState.searchQuery, uiState.showSystemApps) {
-        uiState.apps.filter { app ->
-            (uiState.showSystemApps || !app.isSystemApp) &&
-            (app.appName.contains(uiState.searchQuery, ignoreCase = true) ||
-             app.packageName.contains(uiState.searchQuery, ignoreCase = true))
-        }
+        viewModel.getFilteredAndSortedApps()
     }
 
     Scaffold(
@@ -52,6 +48,23 @@ fun ConfigurationScreen(
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 singleLine = true
             )
+
+            // [FIX #1] 添加显示系统应用的开关
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .clickable { viewModel.onShowSystemAppsChanged(!uiState.showSystemApps) },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("显示系统应用", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = uiState.showSystemApps,
+                    onCheckedChange = viewModel::onShowSystemAppsChanged
+                )
+            }
+
+
             if (uiState.isLoading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
@@ -87,7 +100,13 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
-                painter = rememberAsyncImagePainter(ImageRequest.Builder(LocalContext.current).data(app.icon).crossfade(true).build()),
+                painter = rememberAsyncImagePainter(
+                    ImageRequest.Builder(LocalContext.current)
+                        .data(app.icon)
+                        .placeholder(R.drawable.ic_launcher_foreground) // 使用一个默认占位图
+                        .error(R.drawable.ic_launcher_foreground)
+                        .crossfade(true).build()
+                ),
                 contentDescription = app.appName,
                 modifier = Modifier.size(40.dp)
             )
