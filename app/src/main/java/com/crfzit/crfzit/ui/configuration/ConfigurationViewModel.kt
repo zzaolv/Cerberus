@@ -31,17 +31,16 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         loadConfiguration()
     }
     
-    // [FIX #1] 将过滤和排序逻辑封装成一个可重用的函数
     fun getFilteredAndSortedApps(): List<AppInfo> {
         val state = _uiState.value
         return state.apps
-            .filter { it.icon != null } // 过滤掉没有图标的应用
-            .filter { state.showSystemApps || !it.isSystemApp } // 根据开关决定是否显示系统应用
-            .filter { // 根据搜索词过滤
+            .filter { it.icon != null }
+            .filter { state.showSystemApps || !it.isSystemApp }
+            .filter {
                 it.appName.contains(state.searchQuery, ignoreCase = true) ||
                 it.packageName.contains(state.searchQuery, ignoreCase = true)
             }
-            .sortedWith( // 按策略等级降序，再按应用名和用户ID排序
+            .sortedWith(
                 compareByDescending<AppInfo> { it.policy.value }
                     .thenBy { it.appName.lowercase(java.util.Locale.getDefault()) }
                     .thenBy { it.userId }
@@ -52,87 +51,56 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            val mainUserApps = appInfoRepository.getAllApps(forceRefresh = true)
+            // 1. 从守护进程获取权威的全用户策略列表
             val policyConfig = daemonRepository.getAllPolicies()
             
-            val finalAppsMap = mutableMapOf<Pair<String, Int>, AppInfo>()
-
-            mainUserApps.forEach { appInfo ->
-                finalAppsMap[appInfo.packageName to appInfo.userId] = appInfo
-            }
-
-            val finalSafetyNet: Set<String>
-
-            if (policyConfig != null) {
-                finalSafetyNet = policyConfig.hardSafetyNet
-
-                policyConfig.policies.forEach { policyPayload ->
-                    val key = policyPayload.packageName to policyPayload.userId
-                    val existingAppInfo = finalAppsMap[key]
+            // 2. 将策略列表转换成UI所需的 AppInfo 列表
+            val finalApps = if (policyConfig != null) {
+                policyConfig.policies.map { policyPayload ->
+                    // 3. 对每个应用实例，向 AppInfoRepository 请求其主应用的视觉信息
+                    val baseAppInfo = appInfoRepository.getAppInfo(policyPayload.packageName)
                     
-                    if (existingAppInfo != null) {
-                        finalAppsMap[key] = existingAppInfo.copy(
-                            policy = Policy.fromInt(policyPayload.policy),
-                            forcePlaybackExemption = policyPayload.forcePlaybackExempt,
-                            forceNetworkExemption = policyPayload.forceNetworkExempt
-                        )
-                    } else {
-                        val mainAppInfo = appInfoRepository.getAppInfo(policyPayload.packageName)
-                        finalAppsMap[key] = AppInfo(
-                            packageName = policyPayload.packageName,
-                            appName = mainAppInfo?.appName ?: policyPayload.packageName,
-                            icon = mainAppInfo?.icon,
-                            isSystemApp = mainAppInfo?.isSystemApp ?: false,
-                            userId = policyPayload.userId,
-                            policy = Policy.fromInt(policyPayload.policy),
-                            forcePlaybackExemption = policyPayload.forcePlaybackExempt,
-                            forceNetworkExemption = policyPayload.forceNetworkExempt
-                        )
-                    }
+                    // 4. 融合数据：使用后端的策略和用户ID，使用前端的图标和名称
+                    AppInfo(
+                        packageName = policyPayload.packageName,
+                        userId = policyPayload.userId,
+                        policy = Policy.fromInt(policyPayload.policy),
+                        forcePlaybackExemption = policyPayload.forcePlaybackExempt,
+                        forceNetworkExempt = policyPayload.forceNetworkExempt,
+                        
+                        // 从 baseAppInfo 获取视觉信息，如果获取不到则提供默认值
+                        appName = baseAppInfo?.appName ?: policyPayload.packageName,
+                        icon = baseAppInfo?.icon,
+                        isSystemApp = baseAppInfo?.isSystemApp ?: false
+                    )
                 }
             } else {
-                finalSafetyNet = emptySet()
+                emptyList()
             }
             
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    // 不再在这里排序，交给 getFilteredAndSortedApps
-                    apps = finalAppsMap.values.toList(),
-                    safetyNetApps = finalSafetyNet
+                    apps = finalApps,
+                    safetyNetApps = policyConfig?.hardSafetyNet ?: emptySet()
                 )
             }
         }
     }
 
-    fun onSearchQueryChanged(query: String) {
-        _uiState.update { it.copy(searchQuery = query) }
-    }
-
-    fun onShowSystemAppsChanged(show: Boolean) {
-        _uiState.update { it.copy(showSystemApps = show) }
-    }
-    
-    fun setPolicy(packageName: String, userId: Int, newPolicy: Policy) {
-        updateAndSend(packageName, userId) { it.copy(policy = newPolicy) }
-    }
+    fun onSearchQueryChanged(query: String) { _uiState.update { it.copy(searchQuery = query) } }
+    fun onShowSystemAppsChanged(show: Boolean) { _uiState.update { it.copy(showSystemApps = show) } }
+    fun setPolicy(packageName: String, userId: Int, newPolicy: Policy) { updateAndSend(packageName, userId) { it.copy(policy = newPolicy) } }
     
     private fun updateAndSend(packageName: String, userId: Int, transform: (AppInfo) -> AppInfo) {
          _uiState.update { currentState ->
             var appToSend: AppInfo? = null
-            
             val updatedApps = currentState.apps.map { app ->
                 if (app.packageName == packageName && app.userId == userId) {
                     transform(app).also { appToSend = it }
-                } else {
-                    app
-                }
+                } else { app }
             }
-
-            appToSend?.let { 
-                daemonRepository.setPolicy(it)
-            }
-
+            appToSend?.let { daemonRepository.setPolicy(it) }
             currentState.copy(apps = updatedApps)
         }
     }

@@ -41,18 +41,15 @@ public:
                  std::shared_ptr<SystemMonitor> sys, 
                  std::shared_ptr<ActionExecutor> act);
 
-    // Returns true if a significant (frozen/unfrozen) state change occurred
-    bool tick(); 
+    bool tick();
     
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
-    void on_app_state_changed_from_probe(const json& payload);
-    void on_system_state_changed_from_probe(const json& payload);
-
-    // [NEW] Handles the event when a new app becomes top activity. Returns true if an unfreeze happened.
-    bool on_top_app_changed(const json& payload);
     
-    // [MODIFIED] Returns true if a policy change caused an unfreeze.
+    // Handles high-priority, synchronous unfreeze requests from Probe. Returns true on success.
+    bool on_unfreeze_request(const json& payload);
+    
+    // Handles config changes from UI. Returns true if a policy change caused an unfreeze.
     bool on_config_changed_from_ui(const AppConfig& new_config);
 
     json get_dashboard_payload();
@@ -67,10 +64,8 @@ private:
     void add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid);
     void remove_pid_from_app(int pid);
     
-    // Returns true if the app's frozen status changed.
     bool transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     
-    AppRuntimeState* find_app_by_pid(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
     bool is_critical_system_app(const std::string& package_name) const;
 

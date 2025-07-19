@@ -9,6 +9,8 @@ import com.crfzit.crfzit.data.model.CerberusMessage
 import com.crfzit.crfzit.data.model.ProbeConfigUpdatePayload
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
+import com.google.gson.JsonSyntaxException
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -19,78 +21,149 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import java.util.*
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
- * Project Cerberus - System Probe (v8.1, Coroutine Fix)
+ * Project Cerberus - System Probe (v10.0, Pre-emptive Unfreeze Architecture)
  */
 class ProbeHook : IXposedHookLoadPackage {
 
-    // [编译修复] 修正 CoroutineScope 的创建方式以适配新版API
     private val probeScope = CoroutineScope(SupervisorJob() + Executors.newCachedThreadPool().asCoroutineDispatcher())
-
     private val udsClient = UdsClient(probeScope)
     private val gson = Gson()
     private val frozenAppsCache = MutableStateFlow<Set<AppInstanceKey>>(emptySet())
-    private var lastReportedPackage: String? = null
+    private val pendingThawRequests = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v8.1"
+        private const val TAG = "CerberusProbe_v10.0"
         private const val PER_USER_RANGE = 100000
+        private const val THAW_TIMEOUT_MS = 1500L
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (lpparam.packageName != "android") {
-            return
-        }
+        if (lpparam.packageName != "android") return
         log("Loading into android package (system_server), PID: ${Process.myPid()}. Attaching hooks...")
         initializeHooks(lpparam.classLoader)
     }
 
     private fun initializeHooks(classLoader: ClassLoader) {
         setupUdsCommunication()
-        hookActivityStateChange(classLoader)
+        hookActivityStarter(classLoader)
         hookActivityManagerExtras(classLoader)
         hookPowerManager(classLoader)
         hookAlarmManager(classLoader)
         log("All hooks attached. Probe is active.")
     }
 
-    private fun hookActivityStateChange(classLoader: ClassLoader) {
+    private fun hookActivityStarter(classLoader: ClassLoader) {
         try {
-            val activityRecordClass = XposedHelpers.findClass("com.android.server.wm.ActivityRecord", classLoader)
-
-            XposedBridge.hookAllMethods(activityRecordClass, "setState", object : XC_MethodHook() {
+            val activityStarterClass = XposedHelpers.findClass("com.android.server.wm.ActivityStarter", classLoader)
+            XposedBridge.hookAllMethods(activityStarterClass, "execute", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    val newState = param.args[0] as Enum<*>
+                    val request = XposedHelpers.getObjectField(param.thisObject, "mRequest") ?: return
+                    val intent = XposedHelpers.getObjectField(request, "intent") as? android.content.Intent ?: return
+                    val callingUid = XposedHelpers.getIntField(request, "callingUid")
+                    
+                    val component = intent.component ?: return
+                    val packageName = component.packageName
+                    
+                    // Correct way to get user ID from UID in system_server context
+                    val userHandle = XposedHelpers.callStaticMethod(
+                        UserHandle::class.java, "getUserHandleForUid", callingUid
+                    ) as android.os.UserHandle
+                    val userManager = XposedHelpers.callStaticMethod(
+                        XposedHelpers.findClass("com.android.server.pm.UserManagerService", classLoader), "getInstance"
+                    )
+                    val userId = XposedHelpers.callMethod(userManager, "getUserHandle", userHandle.hashCode()) as Int
 
-                    if (newState.name != "RESUMED") {
-                        return
+                    if (isAppFrozen(packageName, callingUid)) {
+                        log("Intercepted launch of frozen app: $packageName (user: $userId). Requesting pre-emptive thaw...")
+                        val success = requestThawAndWait(packageName, userId)
+                        if (!success) {
+                            logError("Thaw FAILED for $packageName. Aborting launch.")
+                            val startAbortedConst = XposedHelpers.getStaticIntField(ActivityManager::class.java, "START_ABORTED")
+                            param.result = startAbortedConst
+                        } else {
+                            log("Thaw successful for $packageName. Proceeding with launch.")
+                        }
                     }
-
-                    val activityRecord = param.thisObject
-                    val appInfo = XposedHelpers.getObjectField(activityRecord, "info") as? ApplicationInfo ?: return
-                    val userId = XposedHelpers.getIntField(activityRecord, "mUserId")
-                    val packageName = appInfo.packageName
-
-                    if (packageName == lastReportedPackage) {
-                        return
-                    }
-                    lastReportedPackage = packageName
-
-                    log("Activity RESUMED: $packageName (user: $userId). Notifying daemon.")
-                    sendToDaemon("event.top_app_changed", mapOf(
-                        "package_name" to packageName,
-                        "user_id" to userId
-                    ))
                 }
             })
-            log("Hooked ActivityRecord#setState successfully. Now monitoring for RESUMED state.")
+            log("Hooked ActivityStarter#execute successfully for pre-emptive thaw.")
         } catch (t: Throwable) {
-            logError("CRITICAL: Failed to hook ActivityRecord#setState: $t")
+            logError("CRITICAL: Failed to hook ActivityStarter: $t \n ${t.stackTraceToString()}")
+        }
+    }
+    
+    private fun requestThawAndWait(packageName: String, userId: Int): Boolean {
+        return try {
+            val reqId = UUID.randomUUID().toString()
+            val future = CompletableFuture<Boolean>()
+            pendingThawRequests[reqId] = future
+
+            val payload = AppInstanceKey(packageName, userId)
+            sendToDaemon("cmd.request_immediate_unfreeze", payload, reqId)
+
+            // Block for the result with a timeout
+            future.get(THAW_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            logError("Exception in requestThawAndWait for $packageName: ${e.message}")
+            false
         }
     }
 
+    private fun setupUdsCommunication() {
+        udsClient.start()
+        probeScope.launch(Dispatchers.IO) {
+            delay(5000) 
+            sendToDaemon("event.probe_hello", mapOf("version" to "10.0.0", "pid" to Process.myPid()))
+
+            udsClient.incomingMessages.collectLatest { jsonLine ->
+                try {
+                    val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
+                    if (baseMsg.type.startsWith("resp.")) {
+                        pendingThawRequests.remove(baseMsg.requestId)?.complete(baseMsg.type == "resp.unfreeze_complete")
+                    } else if (baseMsg.type == "stream.probe_config_update") {
+                        val type = object : TypeToken<CerberusMessage<ProbeConfigUpdatePayload>>() {}.type
+                        val msg = gson.fromJson<CerberusMessage<ProbeConfigUpdatePayload>>(jsonLine, type)
+                        val newCache = msg.payload.frozenApps.toSet()
+                        if(frozenAppsCache.value != newCache){
+                             frozenAppsCache.value = newCache
+                             log("Frozen app cache updated. Size: ${newCache.size}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    logError("Daemon msg processing error: $e")
+                }
+            }
+        }
+    }
+
+    private fun isAppFrozen(packageName: String?, uid: Int): Boolean {
+        if (packageName == null || uid < Process.FIRST_APPLICATION_UID) return false
+        val userId = uid / PER_USER_RANGE
+        val key = AppInstanceKey(packageName, userId)
+        return frozenAppsCache.value.contains(key)
+    }
+
+    private fun sendToDaemon(type: String, payload: Any, reqId: String? = null) {
+        probeScope.launch {
+            try {
+                val message = CerberusMessage(10, type, reqId, payload)
+                val jsonString = gson.toJson(message)
+                udsClient.sendMessage(jsonString)
+            } catch (e: Exception) {
+                logError("Daemon send error: $e")
+            }
+        }
+    }
+
+    private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
+
+    // --- All hooks below are auxiliary and unchanged ---
 
     private fun hookActivityManagerExtras(classLoader: ClassLoader) {
         try {
@@ -101,12 +174,10 @@ class ProbeHook : IXposedHookLoadPackage {
                     val broadcastsField = XposedHelpers.getObjectField(queue, "mBroadcasts") as? ArrayList<*> ?: return
                     if (broadcastsField.isEmpty()) return
                     val br = broadcastsField[0] ?: return
-
                     val receivers = XposedHelpers.getObjectField(br, "receivers") as? List<*> ?: return
                     val firstReceiver = receivers.firstOrNull() ?: return
                     val targetApp = XposedHelpers.getObjectField(firstReceiver, "app")
                     val appInfo = targetApp?.let { XposedHelpers.getObjectField(it, "info") as? ApplicationInfo } ?: return
-
                     if (isAppFrozen(appInfo.packageName, appInfo.uid)) {
                         log("Broadcast Interception: Skipping for frozen app ${appInfo.packageName}")
                         val broadcastSuccessCode = XposedHelpers.getStaticIntField(ActivityManager::class.java, "BROADCAST_SUCCESS")
@@ -117,7 +188,7 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             })
             log("Hooked BroadcastQueue.")
-        } catch(t: Throwable) {
+        } catch (t: Throwable) {
             logError("Failed to hook BroadcastQueue: $t")
         }
 
@@ -134,41 +205,9 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             })
             log("Hooked AppErrors.")
-        } catch(t: Throwable) {
+        } catch (t: Throwable) {
             logError("Failed to hook AppErrors: $t")
         }
-    }
-
-    private fun setupUdsCommunication() {
-        udsClient.start()
-        probeScope.launch(Dispatchers.IO) {
-            delay(5000)
-            sendToDaemon("event.probe_hello", mapOf("version" to "8.1.0", "pid" to Process.myPid()))
-
-            udsClient.incomingMessages.collectLatest { jsonLine ->
-                try {
-                    val baseMsg = gson.fromJson(jsonLine, CerberusMessage::class.java)
-                    if (baseMsg.type == "stream.probe_config_update") {
-                        val type = object : TypeToken<CerberusMessage<ProbeConfigUpdatePayload>>() {}.type
-                        val msg = gson.fromJson<CerberusMessage<ProbeConfigUpdatePayload>>(jsonLine, type)
-                        val newCache = msg.payload.frozenApps.toSet()
-                        if (frozenAppsCache.value != newCache) {
-                            frozenAppsCache.value = newCache
-                            log("Frozen app cache updated. Size: ${newCache.size}")
-                        }
-                    }
-                } catch (e: Exception) {
-                    logError("Daemon msg processing error: $e")
-                }
-            }
-        }
-    }
-
-    private fun isAppFrozen(packageName: String?, uid: Int): Boolean {
-        if (packageName == null || uid < Process.FIRST_APPLICATION_UID) return false
-        val userId = uid / PER_USER_RANGE
-        val key = AppInstanceKey(packageName, userId)
-        return frozenAppsCache.value.contains(key)
     }
 
     private fun hookPowerManager(classLoader: ClassLoader) {
@@ -198,7 +237,6 @@ class ProbeHook : IXposedHookLoadPackage {
             } catch (e: XposedHelpers.ClassNotFoundError) {
                 "com.android.server.AlarmManagerService"
             }
-
             val amsClass = XposedHelpers.findClass(alarmManagerClassName, classLoader)
             XposedBridge.hookAllMethods(amsClass, "set", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
@@ -214,19 +252,6 @@ class ProbeHook : IXposedHookLoadPackage {
             log("AlarmManager hooks attached successfully.")
         } catch (t: Throwable) {
             logError("Failed to attach AlarmManager hooks: $t")
-        }
-    }
-
-    private fun sendToDaemon(type: String, payload: Any) {
-        probeScope.launch {
-            try {
-                // [FIX] Updated protocol version to match daemon
-                val message = CerberusMessage(8, type, null, payload)
-                val jsonString = gson.toJson(message)
-                udsClient.sendMessage(jsonString)
-            } catch (e: Exception) {
-                logError("Daemon send error: $e")
-            }
         }
     }
 
