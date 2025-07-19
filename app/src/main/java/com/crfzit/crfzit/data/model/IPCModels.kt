@@ -3,7 +3,9 @@ package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
 
-// 通用消息结构
+// =======================================================================================
+// 通用消息结构 (无变化)
+// =======================================================================================
 data class CerberusMessage<T>(
     @SerializedName("v")
     val version: Int,
@@ -13,7 +15,9 @@ data class CerberusMessage<T>(
     val payload: T
 )
 
-// 'stream.dashboard_update' 消息的核心负载模型
+// =======================================================================================
+// UI <-> Daemon 核心模型 (无变化)
+// =======================================================================================
 data class DashboardPayload(
     @SerializedName("global_stats")
     val globalStats: GlobalStats,
@@ -21,7 +25,6 @@ data class DashboardPayload(
     val appsRuntimeState: List<AppRuntimeState>
 )
 
-// 全局系统状态模型
 data class GlobalStats(
     @SerializedName("total_cpu_usage_percent")
     val totalCpuUsagePercent: Float = 0f,
@@ -37,10 +40,6 @@ data class GlobalStats(
     val activeProfileName: String = "等待连接..."
 )
 
-/**
- * 单个应用实例的实时运行状态模型，对应守护进程中的 AppRuntimeState。
- * [核心修复] 补充所有缺失的字段以匹配ViewModel的引用和后端JSON，解决编译错误。
- */
 data class AppRuntimeState(
     @SerializedName("package_name")
     val packageName: String,
@@ -67,14 +66,12 @@ data class AppRuntimeState(
     val pendingFreezeSec: Int = 0
 )
 
-// UI向Daemon查询所有策略配置 (`query.get_all_policies`) 的响应负载
 data class PolicyConfigPayload(
     @SerializedName("hard_safety_net")
     val hardSafetyNet: Set<String>,
     val policies: List<AppPolicyPayload>
 )
 
-// 单个应用的持久化策略模型
 data class AppPolicyPayload(
     @SerializedName("package_name")
     val packageName: String,
@@ -87,8 +84,14 @@ data class AppPolicyPayload(
     val forceNetworkExempt: Boolean
 )
 
-// Probe <-> Daemon 新增的专用模型
-// Probe向Daemon发送的 `event.app_state_changed` 事件负载
+// =======================================================================================
+// Probe <-> Daemon 模型 (已重构)
+// =======================================================================================
+
+/**
+ * [REFACTORED] Probe向Daemon发送的 `event.app_state_changed` 事件负载。
+ * 现在包含更精确的状态信息，使Daemon可以做出更准确的反应。
+ */
 data class ProbeAppStateChangedPayload(
     @SerializedName("package_name")
     val packageName: String,
@@ -96,25 +99,31 @@ data class ProbeAppStateChangedPayload(
     val userId: Int,
     @SerializedName("is_foreground")
     val isForeground: Boolean,
-    @SerializedName("oom_adj")
-    val oomAdj: Int,
+    @SerializedName("is_cached") // [NEW] 明确告知Daemon该进程是否已进入缓存状态
+    val isCached: Boolean,
     val reason: String
 )
 
-// Probe向Daemon发送的 `event.system_state_changed` 事件负载
+/**
+ * Probe向Daemon发送的 `event.system_state_changed` 事件负载 (无变化)。
+ */
 data class ProbeSystemStateChangedPayload(
     @SerializedName("screen_on")
     val screenOn: Boolean? = null,
 )
 
-// Daemon向Probe下发的配置更新 `stream.probe_config_update` 的负载
+/**
+ * Daemon向Probe下发的配置更新 `stream.probe_config_update` 的负载 (无变化)。
+ */
 data class ProbeConfigUpdatePayload(
     val policies: List<AppPolicyPayload>,
     @SerializedName("frozen_apps")
     val frozenApps: List<AppInstanceKey>
 )
 
-// 应用实例的唯一标识
+/**
+ * 应用实例的唯一标识 (无变化)
+ */
 data class AppInstanceKey(
     @SerializedName("package_name")
     val packageName: String,

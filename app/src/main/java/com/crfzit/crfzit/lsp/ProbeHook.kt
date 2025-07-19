@@ -6,6 +6,7 @@ import android.content.pm.ApplicationInfo
 import android.os.Process
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.CerberusMessage
+import com.crfzit.crfzit.data.model.ProbeAppStateChangedPayload
 import com.crfzit.crfzit.data.model.ProbeConfigUpdatePayload
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
@@ -34,9 +35,14 @@ class ProbeHook : IXposedHookLoadPackage {
     private val pendingThawRequests = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v1.1_Fixed"
-        private const val PER_USER_RANGE = 100000 // Android多用户的UID范围
-        private const val THAW_TIMEOUT_MS = 1500L // 解冻请求超时时间
+        private const val TAG = "CerberusProbe_v11.0_Refactored"
+        private const val PER_USER_RANGE = 100000
+        private const val THAW_TIMEOUT_MS = 1500L
+
+        // Android framework internal constants (might need adjustment for some ROMs)
+        private const val PROCESS_STATE_TOP = 2
+        private const val PROCESS_STATE_CACHED_ACTIVITY = 15
+        private const val PROCESS_STATE_CACHED_EMPTY = 18
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -47,14 +53,57 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private fun initializeHooks(classLoader: ClassLoader) {
         setupUdsCommunication()
-        hookActivityStarter(classLoader) // 关键的预先解冻Hook
-        hookActivityManagerExtras(classLoader)
-        hookPowerManager(classLoader)
-        hookAlarmManager(classLoader)
-        log("All hooks attached. Probe is active.")
+        hookActivityStarter(classLoader) // For cold start unfreeze
+        hookActivityManagerService(classLoader) // For precise state tracking
+        log("All essential hooks attached. Probe is active.")
     }
 
-    // [核心修复] 这是解决黑白屏问题的关键所在
+    // [CRITICAL REFACTOR] This hook is now the primary source of state intelligence.
+    private fun hookActivityManagerService(classLoader: ClassLoader) {
+        try {
+            val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
+            // This method is called whenever a process's scheduling group or state changes.
+            // It's the most reliable place to know when an app becomes TOP or CACHED.
+            XposedHelpers.findAndHookMethod(
+                amsClass,
+                "updateOomAdj",
+                "com.android.server.am.ProcessRecord",
+                Boolean::class.javaPrimitiveType,
+                "com.android.server.am.OomAdjuster",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val processRecord = param.args[0] ?: return
+                        val appInfo = XposedHelpers.getObjectField(processRecord, "info") as? ApplicationInfo ?: return
+                        val packageName = appInfo.packageName
+                        val uid = appInfo.uid
+
+                        if (uid < Process.FIRST_APPLICATION_UID) return
+
+                        val userId = uid / PER_USER_RANGE
+                        val procState = XposedHelpers.getIntField(processRecord, "mState.mCurProcState")
+
+                        when (procState) {
+                            PROCESS_STATE_TOP -> {
+                                // This app just became the foreground app.
+                                log("StateChange: $packageName (user $userId) is now FOREGROUND (TOP).")
+                                sendAppStateChange(packageName, userId, isForeground = true, isCached = false, reason = " Became TOP")
+                            }
+                            in PROCESS_STATE_CACHED_ACTIVITY..PROCESS_STATE_CACHED_EMPTY -> {
+                                // This app has just been demoted to a cached state. It's now a candidate for freezing.
+                                log("StateChange: $packageName (user $userId) is now CACHED.")
+                                sendAppStateChange(packageName, userId, isForeground = false, isCached = true, reason = "Became CACHED")
+                            }
+                        }
+                    }
+                }
+            )
+            log("Hooked ActivityManagerService#updateOomAdj for precise state tracking.")
+        } catch (t: Throwable) {
+            logError("CRITICAL: Failed to hook ActivityManagerService: $t")
+        }
+    }
+
+    // [Unchanged] This hook remains essential for handling cold starts of frozen apps.
     private fun hookActivityStarter(classLoader: ClassLoader) {
         try {
             val activityStarterClass = XposedHelpers.findClass("com.android.server.wm.ActivityStarter", classLoader)
@@ -63,30 +112,19 @@ class ProbeHook : IXposedHookLoadPackage {
                     val request = XposedHelpers.getObjectField(param.thisObject, "mRequest") ?: return
                     val intent = XposedHelpers.getObjectField(request, "intent") as? android.content.Intent ?: return
                     val callingUid = XposedHelpers.getIntField(request, "callingUid")
-
-                    // 忽略系统UID的启动请求
                     if (callingUid < Process.FIRST_APPLICATION_UID) return
-
                     val component = intent.component ?: return
                     val packageName = component.packageName
-
-                    // [核心修复] 使用UID和常量进行数学运算，100%可靠地获取userId
                     val userId = callingUid / PER_USER_RANGE
 
-                    // 检查应用是否在我们的冻结缓存中
                     if (isAppFrozen(packageName, userId)) {
-                        log("Intercepted launch of frozen app: $packageName (user: $userId). Requesting pre-emptive thaw...")
-
-                        // [核心修复] 同步请求解冻并等待结果
+                        log("Intercepted cold launch of frozen app: $packageName (user: $userId). Requesting pre-emptive thaw...")
                         val success = requestThawAndWait(packageName, userId)
-
                         if (!success) {
-                            logError("Thaw FAILED for $packageName. Aborting launch to prevent black screen.")
-                            // 中止Activity启动，防止黑屏/白屏
-                            param.result = XposedHelpers.getStaticIntField(ActivityManager::class.java, "START_ABORTED")
+                            logError("Thaw FAILED for $packageName. Aborting launch.")
+                            param.result = ActivityManager.START_ABORTED
                         } else {
                             log("Thaw successful for $packageName. Proceeding with launch.")
-                            // 解冻成功，继续正常启动流程
                         }
                     }
                 }
@@ -97,16 +135,13 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // [核心修复] 实现同步请求解冻的逻辑
     private fun requestThawAndWait(packageName: String, userId: Int): Boolean {
         val reqId = UUID.randomUUID().toString()
         val future = CompletableFuture<Boolean>()
         try {
             pendingThawRequests[reqId] = future
             val payload = AppInstanceKey(packageName, userId)
-            // 发送高优先级解冻请求到守护进程
             sendToDaemon("cmd.request_immediate_unfreeze", payload, reqId)
-            // 阻塞并等待守护进程的响应，有超时保护
             return future.get(THAW_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
             logError("Exception in requestThawAndWait for $packageName: ${e.message}")
@@ -119,18 +154,14 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun setupUdsCommunication() {
         udsClient.start()
         probeScope.launch(Dispatchers.IO) {
-            delay(5000) // 等待daemon启动
-            sendToDaemon("event.probe_hello", mapOf("version" to "10.1", "pid" to Process.myPid()))
-
+            delay(5000)
+            sendToDaemon("event.probe_hello", mapOf("version" to "11.0", "pid" to Process.myPid()))
             udsClient.incomingMessages.collectLatest { jsonLine ->
                 try {
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
-                    // 处理来自daemon的响应
                     if (baseMsg.type.startsWith("resp.")) {
                         pendingThawRequests.remove(baseMsg.requestId)?.complete(baseMsg.type == "resp.unfreeze_complete")
-                    }
-                    // 处理来自daemon的冻结列表更新
-                    else if (baseMsg.type == "stream.probe_config_update") {
+                    } else if (baseMsg.type == "stream.probe_config_update") {
                         val type = object : TypeToken<CerberusMessage<ProbeConfigUpdatePayload>>() {}.type
                         val msg = gson.fromJson<CerberusMessage<ProbeConfigUpdatePayload>>(jsonLine, type)
                         val newCache = msg.payload.frozenApps.toSet()
@@ -150,10 +181,22 @@ class ProbeHook : IXposedHookLoadPackage {
         return frozenAppsCache.value.contains(key)
     }
 
+    // [NEW] Helper function to send the detailed app state change event.
+    private fun sendAppStateChange(packageName: String, userId: Int, isForeground: Boolean, isCached: Boolean, reason: String) {
+        val payload = ProbeAppStateChangedPayload(
+            packageName = packageName,
+            userId = userId,
+            isForeground = isForeground,
+            isCached = isCached,
+            reason = reason
+        )
+        sendToDaemon("event.app_state_changed", payload)
+    }
+
     private fun sendToDaemon(type: String, payload: Any, reqId: String? = null) {
         probeScope.launch {
             try {
-                udsClient.sendMessage(gson.toJson(CerberusMessage(10, type, reqId, payload)))
+                udsClient.sendMessage(gson.toJson(CerberusMessage(11, type, reqId, payload)))
             } catch (e: Exception) {
                 logError("Daemon send error: $e")
             }
@@ -163,95 +206,4 @@ class ProbeHook : IXposedHookLoadPackage {
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private fun log(message: String) = XposedBridge.log("$TAG: $message")
     private fun logError(message: String) = XposedBridge.log("$TAG: [ERROR] $message")
-
-    // ... 其他辅助性Hook保持不变 ...
-    private fun hookActivityManagerExtras(classLoader: ClassLoader) {
-        // (此部分代码与您提供的版本一致，此处省略以保持简洁)
-        try {
-            val broadcastQueueClass = XposedHelpers.findClass("com.android.server.am.BroadcastQueue", classLoader)
-            XposedBridge.hookAllMethods(broadcastQueueClass, "processNextBroadcast", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val queue = param.thisObject
-                    val broadcastsField = XposedHelpers.getObjectField(queue, "mBroadcasts") as? ArrayList<*> ?: return
-                    if (broadcastsField.isEmpty()) return
-                    val br = broadcastsField[0] ?: return
-                    val receivers = XposedHelpers.getObjectField(br, "receivers") as? List<*> ?: return
-                    val firstReceiver = receivers.firstOrNull() ?: return
-                    val targetApp = XposedHelpers.getObjectField(firstReceiver, "app")
-                    val appInfo = targetApp?.let { XposedHelpers.getObjectField(it, "info") as? ApplicationInfo } ?: return
-                    if (isAppFrozen(appInfo.packageName, appInfo.uid / PER_USER_RANGE)) {
-                        log("Broadcast Interception: Skipping for frozen app ${appInfo.packageName}")
-                        val broadcastSuccessCode = XposedHelpers.getStaticIntField(ActivityManager::class.java, "BROADCAST_SUCCESS")
-                        XposedHelpers.callMethod(queue, "finishReceiverLocked", br, broadcastSuccessCode, null, null, false, true)
-                        XposedHelpers.callMethod(queue, "scheduleBroadcastsLocked")
-                        param.result = null
-                    }
-                }
-            })
-            log("Hooked BroadcastQueue.")
-        } catch (t: Throwable) {
-            logError("Failed to hook BroadcastQueue: $t")
-        }
-        try {
-            val appErrorsClass = XposedHelpers.findClass("com.android.server.am.AppErrors", classLoader)
-            XposedBridge.hookAllMethods(appErrorsClass, "handleShowAnrUi", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val processRecord = param.args.firstOrNull { it?.javaClass?.name?.contains("ProcessRecord") == true } ?: return
-                    val appInfo = XposedHelpers.getObjectField(processRecord, "info") as? ApplicationInfo ?: return
-                    if (isAppFrozen(appInfo.packageName, appInfo.uid / PER_USER_RANGE)) {
-                        log("ANR Intervention: Suppressing for frozen app ${appInfo.packageName}")
-                        param.result = null
-                    }
-                }
-            })
-            log("Hooked AppErrors.")
-        } catch (t: Throwable) {
-            logError("Failed to hook AppErrors: $t")
-        }
-    }
-    private fun hookPowerManager(classLoader: ClassLoader) {
-        // (此部分代码与您提供的版本一致，此处省略以保持简洁)
-        try {
-            val pmsClass = XposedHelpers.findClass("com.android.server.power.PowerManagerService", classLoader)
-            XposedBridge.hookAllMethods(pmsClass, "acquireWakeLock", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val callingUid = XposedHelpers.callStaticMethod(XposedHelpers.findClass("android.os.Binder", null), "getCallingUid") as Int
-                    val pkg = param.args.firstOrNull { it is String && it.contains('.') } as? String
-                    if (isAppFrozen(pkg, callingUid / PER_USER_RANGE)) {
-                        log("WakeLock Interception: Denying for frozen app $pkg")
-                        param.result = null
-                    }
-                }
-            })
-            log("PowerManager hooks attached successfully.")
-        } catch (t: Throwable) {
-            logError("Failed to attach PowerManager hooks: $t")
-        }
-    }
-    private fun hookAlarmManager(classLoader: ClassLoader) {
-        // (此部分代码与您提供的版本一致，此处省略以保持简洁)
-        try {
-            val alarmManagerClassName = try {
-                XposedHelpers.findClass("com.android.server.alarm.AlarmManagerService", classLoader)
-                "com.android.server.alarm.AlarmManagerService"
-            } catch (e: XposedHelpers.ClassNotFoundError) {
-                "com.android.server.AlarmManagerService"
-            }
-            val amsClass = XposedHelpers.findClass(alarmManagerClassName, classLoader)
-            XposedBridge.hookAllMethods(amsClass, "set", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val pendingIntent = param.args.firstOrNull { it is android.app.PendingIntent } as? android.app.PendingIntent ?: return
-                    val pkg = pendingIntent.creatorPackage
-                    val uid = pendingIntent.creatorUid
-                    if (isAppFrozen(pkg, uid / PER_USER_RANGE)) {
-                        log("Alarm Interception: Denying for frozen app $pkg")
-                        param.result = null
-                    }
-                }
-            })
-            log("AlarmManager hooks attached successfully.")
-        } catch (t: Throwable) {
-            logError("Failed to attach AlarmManager hooks: $t")
-        }
-    }
 }

@@ -12,9 +12,10 @@
 #include <memory>
 #include <atomic>
 #include <filesystem>
-#include <mutex> // [FIX] No longer need condition_variable
+#include <mutex>
+#include <unistd.h> // [FIX] 添加 <unistd.h> 头文件以声明 getpid()
 
-#define LOG_TAG "cerberusd_main_v11.0_refactored" // Version bump
+#define LOG_TAG "cerberusd_main_v11.0_refactored"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -31,7 +32,7 @@ std::atomic<bool> g_is_running = true;
 std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<StateManager> g_state_manager;
 std::atomic<int> g_probe_fd = -1;
-std::mutex g_broadcast_mutex; // Mutex to protect broadcast calls
+std::mutex g_broadcast_mutex;
 
 void broadcast_dashboard_update();
 void notify_probe_of_config_change();
@@ -42,7 +43,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // [REFACTORED] Centralized logic for state changes and notifications
         bool state_changed = false;
         bool config_changed = false;
 
@@ -64,9 +64,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             g_probe_fd = client_fd;
             if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
             state_changed = true;
-            config_changed = true; // Send initial config
+            config_changed = true;
         } else if (type == "event.app_state_changed") {
-            // [NEW] Handle detailed state changes from the Probe
             if (g_state_manager) {
                 auto result = g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
                 if (result.state_changed) state_changed = true;
@@ -84,7 +83,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(new_config)) {
                 config_changed = true;
             }
-            state_changed = true; // Policy change always requires a UI refresh
+            state_changed = true;
         } else if (type == "query.get_all_policies") {
             if (g_state_manager) {
                 json response_payload = g_state_manager->get_full_config_for_ui();
@@ -100,7 +99,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             state_changed = true;
         }
 
-        // [REFACTORED] Centralized notification logic
         if (config_changed) {
             notify_probe_of_config_change();
         }
@@ -113,7 +111,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     }
 }
 
-// [REFACTORED] A dedicated, thread-safe function for broadcasting updates
 void broadcast_dashboard_update() {
     std::lock_guard<std::mutex> lock(g_broadcast_mutex);
     if (g_server && g_server->has_clients() && g_state_manager) {
@@ -158,17 +155,13 @@ void signal_handler(int signum) {
     if (g_server) g_server->stop();
 }
 
-// [REFACTORED] Worker thread is now a simple, lightweight maintenance loop
 void worker_thread_func() {
     LOGI("Worker thread started. Role: Periodic Maintenance.");
     while (g_is_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(5)); // Reduced frequency
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         if (!g_is_running) break;
         
         if (g_state_manager) {
-            // tick() now only does lightweight process reconciliation and stat updates.
-            // It no longer drives the main freeze logic.
-            // If it reports a state change (e.g. process died), we update the UI.
             if (g_state_manager->tick()) {
                 LOGD("State manager tick reported a change, broadcasting update.");
                 broadcast_dashboard_update();
