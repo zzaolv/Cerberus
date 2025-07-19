@@ -15,7 +15,7 @@
 #include <condition_variable>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v4.0"
+#define LOG_TAG "cerberusd_main_v6.0"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -23,7 +23,6 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// Global variables remain the same
 const std::string SOCKET_NAME = "cerberus_socket";
 const std::string DATA_DIR = "/data/adb/cerberus";
 const std::string DB_PATH = DATA_DIR + "/cerberus.db";
@@ -47,12 +46,12 @@ void notify_probe_of_config_change() {
         LOGI("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         json message = {
-            {"v", 4}, // Protocol version bump
+            {"v", 6}, // Protocol version bump
             {"type", "stream.probe_config_update"},
             {"payload", payload}
         };
-        // Use broadcast because there might be other probes or listeners
-        g_server->broadcast_message(message.dump());
+        // Send ONLY to the probe.
+        g_server->send_message(probe_fd, message.dump());
     }
 }
 
@@ -66,62 +65,62 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
-// [FIX] Reworked message handling for the new architecture
 void handle_client_message(int client_fd, const std::string& message_str) {
     LOGI("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
+        // --- Probe-originated Events (check fd to be sure) ---
+        if (client_fd == g_probe_fd.load()) {
+            if (type == "event.top_app_changed") {
+                if (g_state_manager) {
+                    bool config_changed = g_state_manager->on_top_app_changed(msg.at("payload"));
+                    if (config_changed) {
+                        LOGI("Top app change resulted in an unfreeze. Notifying probe immediately.");
+                        notify_probe_of_config_change();
+                        trigger_state_broadcast(); // Also update UI
+                    }
+                }
+                return; // End of processing for this message
+            }
+            if (type == "event.app_state_changed") {
+                if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
+                trigger_state_broadcast();
+                return;
+            }
+        }
+        
+        // --- Generic Events / Commands from any client ---
         if (type == "event.probe_hello") {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
             if (g_state_manager) g_state_manager->on_probe_hello(client_fd);
-            notify_probe_of_config_change(); // Immediately sync state to the new probe
+            notify_probe_of_config_change(); // Sync state to the new probe
             trigger_state_broadcast();
             return;
         }
 
-        if (type == "event.app_state_changed") {
-            if (g_state_manager) g_state_manager->on_app_state_changed_from_probe(msg.at("payload"));
-            trigger_state_broadcast();
-            return;
-        }
-
-        // --- Command Handling ---
-        
-        // This is now the critical path for unfreezing
-        if (type == "cmd.request_immediate_unfreeze") {
-            if (g_state_manager) {
-                bool state_changed = g_state_manager->on_unfreeze_request_from_probe(msg.at("payload"));
-                // If the state changed (i.e., an app was actually unfrozen),
-                // we MUST notify all probes so they can update their caches.
-                if (state_changed) {
-                    notify_probe_of_config_change();
-                }
-                // No response needed, the config update is the confirmation.
-            }
-        } else if (type == "cmd.set_policy") {
-            // ... (remains the same as previous version)
+        if (type == "cmd.set_policy") {
             const auto& payload = msg.at("payload");
-            LOGI("Processing set_policy for %s (user %d)", payload.value("package_name", "N/A").c_str(), payload.value("user_id", -1));
             AppConfig new_config;
             new_config.package_name = payload.value("package_name", "");
             new_config.user_id = payload.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(payload.value("policy", 2));
             new_config.force_playback_exempt = payload.value("force_playback_exempt", false);
             new_config.force_network_exempt = payload.value("force_network_exempt", false);
+
             if (g_state_manager) {
-                g_state_manager->on_config_changed_from_ui(new_config);
-                notify_probe_of_config_change();
+                if (g_state_manager->on_config_changed_from_ui(new_config)) {
+                    notify_probe_of_config_change();
+                }
                 trigger_state_broadcast();
             }
         } else if (type == "query.get_all_policies") {
-            // ... (remains the same)
             if (g_state_manager) {
                 json response_payload = g_state_manager->get_full_config_for_ui();
                 json response_msg = {
-                    {"v", 4},
+                    {"v", 6},
                     {"type", "resp.all_policies"},
                     {"req_id", msg.value("req_id", "")},
                     {"payload", response_payload}
@@ -137,7 +136,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 }
 
 
-// ... (signal_handler and main function structure remain the same, just ensure they call the updated functions)
 void signal_handler(int signum) {
     LOGI("Caught signal %d, initiating shutdown...", signum);
     g_is_running = false;
@@ -150,36 +148,35 @@ void worker_thread_func() {
     while (g_is_running) {
         {
             std::unique_lock<std::mutex> lock(g_worker_mutex);
-            g_worker_cv.wait_for(lock, std::chrono::seconds(3), [&]{
+            g_worker_cv.wait_for(std::chrono::seconds(3), [&]{
                 return !g_is_running.load() || g_force_refresh_flag.load();
             });
         }
 
         if (!g_is_running) break;
         
-        bool needs_probe_update = false;
         if (g_state_manager) {
-            needs_probe_update = g_state_manager->tick();
-        }
-
-        if (needs_probe_update) {
-            LOGI("State manager reported significant change (app frozen), notifying probe.");
-            notify_probe_of_config_change();
-        }
-
-        if (g_force_refresh_flag.load()) {
-            LOGI("Forced refresh triggered for UI.");
-            g_force_refresh_flag = false;
+            // tick() is now mainly for freezing apps that time out.
+            if (g_state_manager->tick()) {
+                LOGI("State manager tick reported a freeze event, notifying probe.");
+                notify_probe_of_config_change();
+            }
         }
         
-        if (g_server && g_server->has_clients()) {
-            json payload = g_state_manager->get_dashboard_payload();
-            json message = {
-                {"v", 4},
-                {"type", "stream.dashboard_update"},
-                {"payload", payload}
-            };
-            g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
+        if (g_force_refresh_flag.load() || (g_server && g_server->has_clients())) {
+             if(g_force_refresh_flag.load()) {
+                LOGI("Forced refresh triggered for UI.");
+                g_force_refresh_flag = false;
+             }
+             if (g_server && g_server->has_clients()) {
+                json payload = g_state_manager->get_dashboard_payload();
+                json message = {
+                    {"v", 6},
+                    {"type", "stream.dashboard_update"},
+                    {"payload", payload}
+                };
+                g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
+             }
         }
     }
     LOGI("Worker thread finished.");
@@ -189,7 +186,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    LOGI("Project Cerberus Daemon v4.0 starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v6.0 starting... (PID: %d)", getpid());
 
     try {
         if (!fs::exists(DATA_DIR)) {
@@ -215,7 +212,7 @@ int main(int argc, char *argv[]) {
 
     LOGI("Server loop has finished. Cleaning up...");
     g_is_running = false;
-    g_probe_fd = -1;
+    g_worker_cv.notify_one(); // Wake up worker thread to exit
     if (worker_thread.joinable()) worker_thread.join();
     
     LOGI("Cerberus Daemon has shut down cleanly.");

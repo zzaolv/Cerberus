@@ -41,16 +41,20 @@ public:
                  std::shared_ptr<SystemMonitor> sys, 
                  std::shared_ptr<ActionExecutor> act);
 
-    // [FIX] tick函数现在返回一个布尔值，指示是否有需要通知Probe的重大变化
+    // Returns true if a significant (frozen/unfrozen) state change occurred
     bool tick(); 
     
     void on_probe_hello(int probe_fd);
     void on_probe_disconnect();
     void on_app_state_changed_from_probe(const json& payload);
     void on_system_state_changed_from_probe(const json& payload);
-    bool on_unfreeze_request_from_probe(const json& payload);
 
-    void on_config_changed_from_ui(const AppConfig& new_config);
+    // [NEW] Handles the event when a new app becomes top activity. Returns true if an unfreeze happened.
+    bool on_top_app_changed(const json& payload);
+    
+    // [MODIFIED] Returns true if a policy change caused an unfreeze.
+    bool on_config_changed_from_ui(const AppConfig& new_config);
+
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
@@ -63,7 +67,7 @@ private:
     void add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid);
     void remove_pid_from_app(int pid);
     
-    // [FIX] transition_state也返回一个布尔值
+    // Returns true if the app's frozen status changed.
     bool transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
     
     AppRuntimeState* find_app_by_pid(int pid);
