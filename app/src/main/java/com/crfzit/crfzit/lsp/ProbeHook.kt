@@ -22,7 +22,7 @@ import java.util.*
 import java.util.concurrent.Executors
 
 /**
- * Project Cerberus - System Probe (v6.2, Final Compilation Fix)
+ * Project Cerberus - System Probe (v7.0, Stable Focus Hook)
  */
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -32,8 +32,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private val frozenAppsCache = MutableStateFlow<Set<AppInstanceKey>>(emptySet())
 
     companion object {
-        private const val TAG = "CerberusProbe_v6.2"
-        // [FIX] Define the constant used for calculating user ID from UID.
+        private const val TAG = "CerberusProbe_v7.0"
         private const val PER_USER_RANGE = 100000
     }
 
@@ -47,35 +46,56 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private fun initializeHooks(classLoader: ClassLoader) {
         setupUdsCommunication()
-        hookTopActivityChange(classLoader)
+
+        // [根本性修复] 替换为行业标准、绝对可靠的 setFocusedActivity Hook
+        hookFocusedActivityChange(classLoader)
+
         hookActivityManagerExtras(classLoader)
         hookPowerManager(classLoader)
         hookAlarmManager(classLoader)
         log("All hooks attached. Probe is active.")
     }
 
-    private fun hookTopActivityChange(classLoader: ClassLoader) {
+    /**
+     * [根本性修复] 这是新的、可靠的前台应用变化监听器。
+     * 当一个应用即将接收用户输入时，系统必须调用此方法，这是一个非常强烈的用户意图信号。
+     */
+    private fun hookFocusedActivityChange(classLoader: ClassLoader) {
         try {
             val atmsClass = XposedHelpers.findClass("com.android.server.wm.ActivityTaskManagerService", classLoader)
-            XposedBridge.hookAllMethods(atmsClass, "setResumedActivityUnchecked", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val activityRecord = param.args[0] ?: return
+            // Hook setFocusedActivity(IBinder, String)
+            XposedBridge.hookAllMethods(atmsClass, "setFocusedActivity", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    // The first argument is ActivityRecord's appToken, an IBinder.
+                    // The second argument is a String reason.
+                    val activityRecordToken = param.args[0] ?: return
+
+                    // We need to get the ActivityRecord object from the token.
+                    // ATMS has a method for this.
+                    val activityRecord = XposedHelpers.callMethod(param.thisObject, "isInHistory", activityRecordToken)
+
+                    if (activityRecord == null) {
+                        // log("Could not find ActivityRecord for token.")
+                        return
+                    }
+
                     val appInfo = XposedHelpers.getObjectField(activityRecord, "info") as? ApplicationInfo ?: return
                     val userId = XposedHelpers.getIntField(activityRecord, "mUserId")
                     val packageName = appInfo.packageName
 
-                    log("Top activity changed to: $packageName (user: $userId). Notifying daemon.")
+                    log("Focused activity changing to: $packageName (user: $userId). Notifying daemon.")
                     sendToDaemon("event.top_app_changed", mapOf(
                         "package_name" to packageName,
                         "user_id" to userId
                     ))
                 }
             })
-            log("Hooked ActivityTaskManagerService#setResumedActivityUnchecked successfully.")
+            log("Hooked ActivityTaskManagerService#setFocusedActivity successfully.")
         } catch (t: Throwable) {
-            logError("CRITICAL: Failed to hook for top activity changes: $t")
+            logError("CRITICAL: Failed to hook for focused activity changes: $t")
         }
     }
+
 
     private fun hookActivityManagerExtras(classLoader: ClassLoader) {
         try {
@@ -86,6 +106,8 @@ class ProbeHook : IXposedHookLoadPackage {
                     val broadcastsField = XposedHelpers.getObjectField(queue, "mBroadcasts") as? ArrayList<*> ?: return
                     if (broadcastsField.isEmpty()) return
                     val br = broadcastsField[0] ?: return
+
+                    // Logic to find the target ApplicationInfo
                     val receivers = XposedHelpers.getObjectField(br, "receivers") as? List<*> ?: return
                     val firstReceiver = receivers.firstOrNull() ?: return
                     val targetApp = XposedHelpers.getObjectField(firstReceiver, "app")
@@ -93,7 +115,10 @@ class ProbeHook : IXposedHookLoadPackage {
 
                     if (isAppFrozen(appInfo.packageName, appInfo.uid)) {
                         log("Broadcast Interception: Skipping for frozen app ${appInfo.packageName}")
-                        param.result = null
+                        param.result = ActivityManager.BROADCAST_SUCCESS
+                        XposedHelpers.callMethod(queue, "finishReceiverLocked", br, ActivityManager.BROADCAST_SUCCESS, null, null, false, true)
+                        XposedHelpers.callMethod(queue, "scheduleBroadcastsLocked")
+                        param.result = null // Prevent original method from running
                     }
                 }
             })
@@ -124,7 +149,7 @@ class ProbeHook : IXposedHookLoadPackage {
         udsClient.start()
         probeScope.launch(Dispatchers.IO) {
             delay(5000)
-            sendToDaemon("event.probe_hello", mapOf("version" to "6.2.0", "pid" to Process.myPid()))
+            sendToDaemon("event.probe_hello", mapOf("version" to "7.0.0", "pid" to Process.myPid()))
 
             udsClient.incomingMessages.collectLatest { jsonLine ->
                 try {
@@ -146,9 +171,7 @@ class ProbeHook : IXposedHookLoadPackage {
     }
 
     private fun isAppFrozen(packageName: String?, uid: Int): Boolean {
-        if (packageName == null || uid < 10000) return false
-        // [FIX] Use direct integer division, which is what ActivityManager.getUserId() does internally.
-        // This is 100% reliable and avoids class loader issues in the Xposed environment.
+        if (packageName == null || uid < Process.FIRST_APPLICATION_UID) return false
         val userId = uid / PER_USER_RANGE
         val key = AppInstanceKey(packageName, userId)
         return frozenAppsCache.value.contains(key)
@@ -203,7 +226,8 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun sendToDaemon(type: String, payload: Any) {
         probeScope.launch {
             try {
-                val message = CerberusMessage(6, type, null, payload)
+                // [FIX] Updated protocol version to match daemon
+                val message = CerberusMessage(7, type, null, payload)
                 val jsonString = gson.toJson(message)
                 udsClient.sendMessage(jsonString)
             } catch (e: Exception) {
