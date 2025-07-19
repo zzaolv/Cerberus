@@ -12,11 +12,11 @@
 #include <set>
 #include <tuple>
 
-#define LOG_TAG "cerberusd_state_v8.0" // Version bump for the fix
+#define LOG_TAG "cerberusd_state_v8.1" // Version bump for the fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__) // For diagnostics
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -35,7 +35,7 @@ static std::string status_to_string(AppRuntimeState::Status status) {
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v8.0, Ultimate Unfreeze Model) Initializing...");
+    LOGI("StateManager (v8.1, Ultimate Unfreeze Model) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -385,6 +385,31 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
+// [链接器修复] 恢复 on_app_state_changed_from_probe 函数的完整定义
+void StateManager::on_app_state_changed_from_probe(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string pkg = payload.at("package_name").get<std::string>();
+        int user_id = payload.at("user_id").get<int>();
+        bool is_fg = payload.at("is_foreground").get<bool>();
+
+        AppRuntimeState* app = get_or_create_app_state(pkg, user_id);
+        if (!app) return;
+        
+        if (app->is_foreground != is_fg) {
+            app->is_foreground = is_fg;
+            // This is a passive update, the main logic is handled by on_top_app_changed
+            LOGD("Probe reported is_foreground for %s is now %d", pkg.c_str(), is_fg);
+            if (!is_fg && app->current_status == AppRuntimeState::Status::FOREGROUND) {
+                transition_state(*app, AppRuntimeState::Status::BACKGROUND_IDLE, "probe reported background");
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("JSON error in on_app_state_changed: %s", e.what());
+    }
+}
+
+
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto now = std::chrono::steady_clock::now();
@@ -399,7 +424,6 @@ bool StateManager::tick() {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         }
         
-        // [安全保护] 只要应用是前台，就绝对不能冻结它。
         if (app.is_foreground) {
             if (app.current_status != AppRuntimeState::Status::FOREGROUND && app.config.policy != AppPolicy::EXEMPTED) {
                  transition_state(app, AppRuntimeState::Status::FOREGROUND, "detected foreground flag");
@@ -469,7 +493,6 @@ bool StateManager::on_top_app_changed(const json& payload) {
 
         LOGI("Probe reported top app is now: %s (user %d)", pkg.c_str(), user_id);
 
-        // Clear foreground flag for all other apps
         for (auto& [other_key, other_app] : managed_apps_) {
             if (other_key != key && other_app.is_foreground) {
                 LOGD("Clearing foreground flag for %s", other_key.first.c_str());
@@ -482,10 +505,8 @@ bool StateManager::on_top_app_changed(const json& payload) {
 
         AppRuntimeState* app_ptr = get_or_create_app_state(pkg, user_id);
         if (!app_ptr) return false;
-
         AppRuntimeState& app = *app_ptr;
 
-        // [安全保护] Set foreground flag immediately. This is our primary safety net.
         if (!app.is_foreground) {
             app.is_foreground = true;
         }
@@ -502,7 +523,6 @@ bool StateManager::on_top_app_changed(const json& payload) {
             LOGI("Focused app %s (user %d) was AWAITING_FREEZE. Cancelling freeze.", pkg.c_str(), user_id);
             return transition_state(app, AppRuntimeState::Status::FOREGROUND, "became top while pending");
         }
-
     } catch (const json::exception& e) {
         LOGE("JSON error in on_top_app_changed: %s", e.what());
     }
@@ -556,10 +576,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         
     return &map_iterator->second;
 }
-
-// ===================================================================================
-// =================== ALL FUNCTIONS BELOW THIS ARE COMPLETE AND CORRECT =============
-// ===================================================================================
 
 bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -622,7 +638,6 @@ void StateManager::reconcile_process_state() {
 void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) {
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
-
     if (app->uid == -1) app->uid = uid;
     
     if (app->app_name.empty() || app->app_name == app->package_name) {
@@ -654,7 +669,6 @@ void StateManager::remove_pid_from_app(int pid) {
 
     AppRuntimeState* app = it->second;
     pid_to_app_map_.erase(it);
-
     auto& pids = app->pids;
     pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
 
