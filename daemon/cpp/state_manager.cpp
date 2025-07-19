@@ -10,8 +10,9 @@
 #include <sys/stat.h>
 #include <unordered_map>
 #include <set>
+#include <tuple> // Required for std::tuple
 
-#define LOG_TAG "cerberusd_state_v6.0"
+#define LOG_TAG "cerberusd_state_v6.1" // Version bump for the fix
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -33,7 +34,7 @@ static std::string status_to_string(AppRuntimeState::Status status) {
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), probe_fd_(-1) {
-    LOGI("StateManager (v6.0, Proactive Unfreeze Model) Initializing...");
+    LOGI("StateManager (v6.1, Proactive Unfreeze Model) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -376,6 +377,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
     
+    
     load_all_configs();
     reconcile_process_state();
     LOGI("StateManager Initialized.");
@@ -395,10 +397,9 @@ bool StateManager::tick() {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         }
         
-        // No action needed for these states in the tick loop
         if (app.current_status == AppRuntimeState::Status::EXEMPTED || 
             app.current_status == AppRuntimeState::Status::FOREGROUND || 
-            app.current_status == AppRuntimeState::Status::FROZEN || // Freeze action is done, just wait for unfreeze event
+            app.current_status == AppRuntimeState::Status::FROZEN ||
             app.pids.empty()) {
             continue;
         }
@@ -406,7 +407,6 @@ bool StateManager::tick() {
         bool has_temp_exemption = app.has_audio || app.has_notification;
         if (has_temp_exemption) {
             if(app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
-                // Was about to be frozen, but got an exemption. Revert to idle.
                 transition_state(app, AppRuntimeState::Status::BACKGROUND_IDLE, "temp exemption started");
             }
             continue;
@@ -418,7 +418,7 @@ bool StateManager::tick() {
                 switch (app.config.policy) {
                     case AppPolicy::STRICT: timeout_sec = 10; break;
                     case AppPolicy::STANDARD: timeout_sec = is_screen_on_ ? 60 : 30; break;
-                    default: break; // IMPORTANT and EXEMPTED don't time out
+                    default: break;
                 }
 
                 if (timeout_sec > 0) {
@@ -431,9 +431,8 @@ bool StateManager::tick() {
             }
             case AppRuntimeState::Status::AWAITING_FREEZE: {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - app.last_state_change_time).count();
-                if (elapsed >= 5) { // 5 second grace period
+                if (elapsed >= 5) {
                     if (action_executor_->freeze(key, app.pids)) {
-                        // This transition returns true, signaling a significant state change.
                         if (transition_state(app, AppRuntimeState::Status::FROZEN, "grace period ended")) {
                            probe_needs_update = true;
                         }
@@ -472,7 +471,6 @@ void StateManager::on_app_state_changed_from_probe(const json& payload) {
     }
 }
 
-// [NEW] Handles the event from the probe when a new app is focused.
 bool StateManager::on_top_app_changed(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -482,22 +480,19 @@ bool StateManager::on_top_app_changed(const json& payload) {
 
         auto it = managed_apps_.find(key);
         if (it == managed_apps_.end()) {
-            return false; // Not an app we are managing.
+            return false;
         }
 
         AppRuntimeState& app = it->second;
 
-        // The most critical case: unfreeze the app immediately.
         if (app.current_status == AppRuntimeState::Status::FROZEN) {
             LOGW("Top app %s (user %d) was FROZEN. Unfreezing immediately!", pkg.c_str(), user_id);
             if (!action_executor_->unfreeze_and_cleanup(key)) {
                 LOGE("ActionExecutor failed to unfreeze %s (user %d)", pkg.c_str(), user_id);
             }
-            // This transition is significant and requires a probe update.
             return transition_state(app, AppRuntimeState::Status::FOREGROUND, "became top activity");
         }
         
-        // If app was about to be frozen, cancel it.
         if (app.current_status == AppRuntimeState::Status::AWAITING_FREEZE) {
             LOGI("Top app %s (user %d) was AWAITING_FREEZE. Cancelling freeze.", pkg.c_str(), user_id);
             return transition_state(app, AppRuntimeState::Status::FOREGROUND, "became top activity while pending");
@@ -506,13 +501,9 @@ bool StateManager::on_top_app_changed(const json& payload) {
     } catch (const json::exception& e) {
         LOGE("JSON error in on_top_app_changed: %s", e.what());
     }
-    return false; // No significant (frozen -> unfrozen) state change occurred.
+    return false;
 }
 
-
-// [REMOVED] on_unfreeze_request_from_probe is now obsolete.
-
-// [MODIFIED] to return a bool
 bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
@@ -529,11 +520,9 @@ bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
         AppRuntimeState& app_state = it->second;
         app_state.config = new_config;
 
-        // If policy is changed to EXEMPTED, and it was frozen, we need to unfreeze and notify probe.
         if (app_state.config.policy == AppPolicy::EXEMPTED) {
             return transition_state(app_state, AppRuntimeState::Status::EXEMPTED, "policy changed to exempted");
         } else {
-            // If policy changed FROM exempted to something else
             if (app_state.current_status == AppRuntimeState::Status::EXEMPTED) {
                  if (!app_state.pids.empty()) {
                     transition_state(app_state, app_state.is_foreground ? AppRuntimeState::Status::FOREGROUND : AppRuntimeState::Status::BACKGROUND_IDLE, "policy changed to managed");
@@ -541,8 +530,79 @@ bool StateManager::on_config_changed_from_ui(const AppConfig& new_config) {
             }
         }
     }
-    return false; // No immediate freeze/unfreeze action, no probe update needed from this.
+    return false;
 }
+
+// [COMPILATION FIX 1/2] The implementation of reconcile_process_state is updated to correctly call add_pid_to_app.
+void StateManager::reconcile_process_state() {
+    // Store package name, user_id, and uid for each process
+    std::unordered_map<int, std::tuple<std::string, int, int>> process_info;
+
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        try {
+            int pid = std::stoi(entry.path().filename().string());
+            int uid = -1, user_id = -1;
+            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+            
+            if (uid >= 10000 && !pkg_name.empty()) { // Only track user apps with a valid package name
+                process_info[pid] = {pkg_name, user_id, uid};
+            }
+        } catch (...) { continue; }
+    }
+
+    std::vector<int> dead_pids;
+    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
+        if (process_info.find(pid) == process_info.end()) {
+            dead_pids.push_back(pid);
+        }
+    }
+    for (int pid : dead_pids) {
+        remove_pid_from_app(pid);
+    }
+
+    for(const auto& [pid, info_tuple] : process_info) {
+        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
+            // Unpack the tuple and call the function with the correct number of arguments
+            const auto& [pkg_name, user_id, uid] = info_tuple;
+            add_pid_to_app(pid, pkg_name, user_id, uid);
+        }
+    }
+}
+
+// [COMPILATION FIX 2/2] The definition of add_pid_to_app now matches the header declaration.
+void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) {
+    AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
+    if (!app) return;
+
+    // Use the passed-in uid
+    if (app->uid == -1) {
+        app->uid = uid;
+    }
+    
+    if (app->app_name.empty() || app->app_name == app->package_name) {
+        app->app_name = sys_monitor_->get_app_name_from_pid(pid);
+        if (app->app_name.empty()) app->app_name = app->package_name;
+    }
+
+    auto pid_it = std::find(app->pids.begin(), app->pids.end(), pid);
+    if (pid_it == app->pids.end()) {
+        app->pids.push_back(pid);
+        pid_to_app_map_[pid] = app;
+
+        if (app->current_status == AppRuntimeState::Status::STOPPED) {
+            transition_state(*app, 
+                             app->config.policy == AppPolicy::EXEMPTED ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE, 
+                             "process started");
+        } else if (app->current_status == AppRuntimeState::Status::FROZEN) {
+            LOGW("New PID %d born into frozen app %s. Freezing immediately.", pid, app->package_name.c_str());
+            action_executor_->move_pids_to_instance_cgroup({app->package_name, user_id}, {pid});
+        }
+    }
+}
+
+
+// ===== UNCHANGED CODE BELOW THIS LINE =====
 
 bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason) {
     if (app.current_status == new_status) return false;
@@ -557,7 +617,6 @@ bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
 
     bool was_frozen = app.current_status == AppRuntimeState::Status::FROZEN;
     
-    // If the app was frozen, and we are moving to ANY other state, it must be unfrozen first.
     if (was_frozen && new_status != AppRuntimeState::Status::FROZEN) {
         action_executor_->unfreeze_and_cleanup(key);
     }
@@ -567,41 +626,7 @@ bool StateManager::transition_state(AppRuntimeState& app, AppRuntimeState::Statu
 
     bool is_now_frozen = new_status == AppRuntimeState::Status::FROZEN;
 
-    // Return true only if the frozen status has changed.
     return was_frozen != is_now_frozen;
-}
-
-// ... the rest of state_manager.cpp remains the same (reconcile_process_state, payload generation, etc.) ...
-// Below is the unchanged remainder of the file for completeness.
-void StateManager::reconcile_process_state() {
-    std::unordered_map<int, AppInstanceKey> current_pids;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        try {
-            int pid = std::stoi(entry.path().filename().string());
-            int uid = -1, user_id = -1;
-            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
-            if (uid >= 10000) { // Only track user apps
-                current_pids[pid] = {pkg_name, user_id};
-            }
-        } catch (...) { continue; }
-    }
-
-    std::vector<int> dead_pids;
-    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (current_pids.find(pid) == current_pids.end()) {
-            dead_pids.push_back(pid);
-        }
-    }
-    for (int pid : dead_pids) {
-        remove_pid_from_app(pid);
-    }
-
-    for(const auto& [pid, key] : current_pids) {
-        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
-            add_pid_to_app(pid, key.first, key.second);
-        }
-    }
 }
 
 void StateManager::on_probe_hello(int probe_fd) {
@@ -669,10 +694,8 @@ json StateManager::get_full_config_for_ui() {
     json response;
     response["hard_safety_net"] = json(critical_system_apps_);
     
-    std::set<AppInstanceKey> seen_instances;
-    json policies = json::array();
-
     auto all_db_configs = db_manager_->get_all_app_configs();
+    json policies = json::array();
     for (const auto& config : all_db_configs) {
         json app_policy;
         app_policy["package_name"] = config.package_name;
@@ -696,7 +719,7 @@ json StateManager::get_probe_config_payload() {
             frozen_apps.push_back({{"package_name", app.package_name}, {"user_id", app.user_id}});
         }
     }
-    payload["policies"] = json::array(); // Policies not needed by probe in this model
+    payload["policies"] = json::array();
     payload["frozen_apps"] = frozen_apps;
     return payload;
 }
@@ -724,9 +747,8 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0'); 
     
-    // Simple heuristic to filter out system processes and get package name
     if (cmdline.find('.') == std::string::npos || cmdline.length() < 3) {
-        return cmdline; // Could be a native process name
+        return cmdline;
     }
     
     auto pos = cmdline.find(':');
@@ -735,32 +757,6 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     }
     
     return cmdline;
-}
-
-void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id) {
-    AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
-    if (!app) return;
-    
-    if (app->app_name.empty() || app->app_name == app->package_name) {
-        app->app_name = sys_monitor_->get_app_name_from_pid(pid);
-        if (app->app_name.empty()) app->app_name = app->package_name;
-    }
-
-    auto pid_it = std::find(app->pids.begin(), app->pids.end(), pid);
-    if (pid_it == app->pids.end()) {
-        app->pids.push_back(pid);
-        pid_to_app_map_[pid] = app;
-
-        if (app->current_status == AppRuntimeState::Status::STOPPED) {
-            transition_state(*app, 
-                             app->config.policy == AppPolicy::EXEMPTED ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::BACKGROUND_IDLE, 
-                             "process started");
-        } else if (app->current_status == AppRuntimeState::Status::FROZEN) {
-            // A new process was born into a frozen app family. Freeze it too.
-            LOGW("New PID %d born into frozen app %s. Freezing immediately.", pid, app->package_name.c_str());
-            action_executor_->move_pids_to_instance_cgroup({app->package_name, user_id}, {pid});
-        }
-    }
 }
 
 void StateManager::remove_pid_from_app(int pid) {
@@ -790,16 +786,15 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name; // Default to package name
+    new_state.app_name = package_name;
     
     auto specific_config_opt = db_manager_->get_app_config(package_name, user_id);
     if(specific_config_opt) {
         new_state.config = *specific_config_opt;
     } else {
-        // Create a default config if not in DB
         new_state.config.package_name = package_name;
         new_state.config.user_id = user_id;
-        new_state.config.policy = AppPolicy::STANDARD; // A sensible default
+        new_state.config.policy = AppPolicy::STANDARD;
     }
     
     if (is_critical_system_app(package_name)) {
