@@ -48,8 +48,11 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         if (type == "event.probe_hello") {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
-            state_changed = true;
-            config_changed = true; // Send initial config
+            
+            // [关键修复] 当Probe连接时，立即发送一次配置
+            notify_probe_of_config_change(); 
+            // 并且也广播一次UI更新，因为Probe的连接是一个重要的状态变化
+            broadcast_dashboard_update(); 
         } 
         // [NEW] Handle explicit commands from the now-intelligent Probe
         else if (type == "cmd.freeze_process") {
