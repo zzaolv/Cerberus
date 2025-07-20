@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
-#define LOG_TAG "cerberusd_state_v12.2_configfix"
+#define LOG_TAG "cerberusd_state_v12.3_finalfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,7 +32,7 @@ static std::string status_to_string(AppRuntimeState::Status status, bool is_fore
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
-    LOGI("StateManager (v12.2, Config Fix) Initializing...");
+    LOGI("StateManager (v12.3, Final Fix) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -412,7 +412,8 @@ void StateManager::reconcile_process_state() {
     for(const auto& [pid, info_tuple] : current_pids) {
         if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
             const auto& [pkg_name, user_id, uid] = info_tuple;
-            add_pid_to_app(pkg_name, user_id, uid);
+            // [FIX] Pass the 'pid' as the first argument
+            add_pid_to_app(pid, pkg_name, user_id, uid);
         }
     }
 }
