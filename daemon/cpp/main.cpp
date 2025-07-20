@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v12.0_final" // Version bump
+#define LOG_TAG "cerberusd_main_v12.1_fix" // Version bump
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,33 +42,28 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        bool state_changed = false;
-        bool config_changed = false;
-
         if (type == "event.probe_hello") {
             LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
             g_probe_fd = client_fd;
-            
-            // [关键修复] 当Probe连接时，立即发送一次配置
-            notify_probe_of_config_change(); 
-            // 并且也广播一次UI更新，因为Probe的连接是一个重要的状态变化
-            broadcast_dashboard_update(); 
-        } 
-        // [NEW] Handle explicit commands from the now-intelligent Probe
-        else if (type == "cmd.freeze_process") {
+            // [关键修复] 直接调用，不等后续逻辑，确保第一时间发送配置
+            notify_probe_of_config_change();
+            return; // 处理完毕，直接返回
+        }
+
+        bool state_changed = false;
+        bool config_changed = false;
+
+        if (type == "cmd.freeze_process") {
             if (g_state_manager) {
                 state_changed = g_state_manager->on_freeze_request_from_probe(msg.at("payload"));
-                if (state_changed) config_changed = true; // Frozen list changed
             }
         }
         else if (type == "cmd.unfreeze_process") {
             if (g_state_manager) {
                 state_changed = g_state_manager->on_unfreeze_request_from_probe(msg.at("payload"));
-                if (state_changed) config_changed = true; // Frozen list changed
             }
         }
         else if (type == "cmd.set_policy") {
-            // This is now the ONLY way a user config changes state
             if (g_state_manager) {
                 if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                     config_changed = true;
@@ -87,7 +82,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             state_changed = true;
         }
 
-        // Centralized notification logic
         if (config_changed) {
             notify_probe_of_config_change();
         }
@@ -107,6 +101,7 @@ void broadcast_dashboard_update() {
         LOGD("Broadcasting dashboard update...");
         json payload = g_state_manager->get_dashboard_payload();
         json message = {{"type", "stream.dashboard_update"}, {"payload", payload}};
+        // [关键修复] 确保有Probe时，绝对不会向Probe发送dashboard消息
         g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
     }
 }
@@ -122,19 +117,33 @@ void notify_probe_of_config_change() {
 }
 
 // --- Server Lifecycle & Worker Thread ---
-void handle_client_disconnect(int client_fd) { /* ... (no changes) ... */ }
-void signal_handler(int signum) { /* ... (no changes) ... */ }
+void handle_client_disconnect(int client_fd) {
+    LOGI("Client fd %d has disconnected.", client_fd);
+    if (client_fd == g_probe_fd.load()) {
+        LOGW("Probe has disconnected! fd: %d", client_fd);
+        g_probe_fd = -1;
+    }
+}
+
+// [关键修复] 实现信号处理函数，解决无法Ctrl+C退出的问题
+void signal_handler(int signum) {
+    LOGW("Signal %d received, initiating shutdown...", signum);
+    g_is_running = false;
+    if (g_server) {
+        g_server->stop();
+    }
+}
 
 void worker_thread_func() {
-    LOGI("Worker thread started. Role: Periodic Reconciliation & Stats.");
+    LOGI("Worker thread started.");
     while (g_is_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(15)); // Can be less frequent now
+        // [关键修复] 缩短轮询周期，提高UI响应性
+        std::this_thread::sleep_for(std::chrono::seconds(3)); 
         if (!g_is_running) break;
         
         if (g_state_manager) {
-            // tick() is now a super lightweight maintenance function.
             if (g_state_manager->tick()) {
-                LOGD("StateManager tick reported a process list change, broadcasting update.");
+                LOGD("StateManager tick reported a change, broadcasting update.");
                 broadcast_dashboard_update();
             }
         }
@@ -145,13 +154,17 @@ void worker_thread_func() {
 
 // --- Main Entry Point ---
 int main(int argc, char *argv[]) {
+    // [关键修复] 注册所有必要的信号
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
+    signal(SIGPIPE, SIG_IGN); // 忽略此信号，防止写入断开的socket导致崩溃
+
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 
-    LOGI("Project Cerberus Daemon v12.0 (Final Architecture) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v12.1 (Fix) starting... (PID: %d)", getpid());
     
+    // ... (rest of main is fine)
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
     } catch (const fs::filesystem_error& e) {

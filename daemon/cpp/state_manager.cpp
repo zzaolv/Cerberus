@@ -546,28 +546,64 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
     return false;
 }
 
+// [关键修复] tick函数需要完整地同步进程列表
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    bool list_changed = false;
-    std::vector<int> dead_pids;
-    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (!fs::exists("/proc/" + std::to_string(pid))) {
-            dead_pids.push_back(pid);
-            list_changed = true;
-        }
-    }
-    for (int pid : dead_pids) remove_pid_from_app(pid);
+    // 这个函数会检查新生和死亡的进程，并返回列表是否有变化
+    bool list_changed = reconcile_process_state_full();
 
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
     for (auto& [key, app] : managed_apps_) {
         if (!app.pids.empty()) {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
+        } else {
+            app.mem_usage_kb = 0;
+            app.swap_usage_kb = 0;
+            app.cpu_usage_percent = 0.0f;
         }
     }
     
     return list_changed;
+}
+
+// [新增] 一个完整的对账函数
+bool StateManager::reconcile_process_state_full() {
+    bool changed = false;
+    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        try {
+            int pid = std::stoi(entry.path().filename().string());
+            int uid = -1, user_id = -1;
+            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+            if (!pkg_name.empty()) {
+                current_pids[pid] = {pkg_name, user_id, uid};
+            }
+        } catch (...) { continue; }
+    }
+
+    std::vector<int> dead_pids;
+    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
+        if (current_pids.find(pid) == current_pids.end()) {
+            dead_pids.push_back(pid);
+        }
+    }
+    if (!dead_pids.empty()) {
+        changed = true;
+        for (int pid : dead_pids) remove_pid_from_app(pid);
+    }
+    
+
+    for(const auto& [pid, info_tuple] : current_pids) {
+        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
+            changed = true;
+            const auto& [pkg_name, user_id, uid] = info_tuple;
+            add_pid_to_app(pid, pkg_name, user_id, uid);
+        }
+    }
+    return changed;
 }
 
 bool StateManager::on_config_changed_from_ui(const json& payload) { 
