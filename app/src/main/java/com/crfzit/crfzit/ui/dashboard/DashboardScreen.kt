@@ -16,19 +16,15 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.google.accompanist.swiperefresh.SwipeRefresh
@@ -38,7 +34,6 @@ import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.icons.AppIcons
-import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -351,13 +346,16 @@ private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
 
 // [REFACTORED] Updated status formatting to reflect the new, simpler state machine.
 private fun formatStatus(state: AppRuntimeState): String {
+    // The isForeground flag now takes precedence
+    if (state.isForeground) {
+        return "前台运行"
+    }
     return when (state.displayStatus.uppercase()) {
         "STOPPED" -> "未运行"
-        "FOREGROUND" -> "前台运行"
-        "BACKGROUND_IDLE" -> "后台运行" // Simplified for clarity
+        "RUNNING" -> "后台运行" // Simplified status
         "FROZEN" -> "已冻结"
-        "EXEMPTED" -> "已豁免 (自由后台)"
-        else -> "状态未知"
+        "EXEMPTED" -> "已豁免"
+        else -> state.displayStatus // Fallback
     }
 }
 

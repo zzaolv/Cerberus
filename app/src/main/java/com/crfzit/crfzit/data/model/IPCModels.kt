@@ -3,21 +3,17 @@ package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
 
-// =======================================================================================
-// 通用消息结构 (无变化)
-// =======================================================================================
+// --- 通用消息结构 ---
 data class CerberusMessage<T>(
     @SerializedName("v")
-    val version: Int,
+    val version: Int = 12,
     val type: String,
     @SerializedName("req_id")
     val requestId: String? = null,
     val payload: T
 )
 
-// =======================================================================================
-// UI <-> Daemon 核心模型 (无变化)
-// =======================================================================================
+// --- UI <-> Daemon 模型 ---
 data class DashboardPayload(
     @SerializedName("global_stats")
     val globalStats: GlobalStats,
@@ -35,9 +31,7 @@ data class GlobalStats(
     @SerializedName("swap_total_kb")
     val swapTotalKb: Long = 0L,
     @SerializedName("swap_free_kb")
-    val swapFreeKb: Long = 0L,
-    @SerializedName("active_profile_name")
-    val activeProfileName: String = "等待连接..."
+    val swapFreeKb: Long = 0L
 )
 
 data class AppRuntimeState(
@@ -58,18 +52,55 @@ data class AppRuntimeState(
     @SerializedName("is_whitelisted")
     val isWhitelisted: Boolean = false,
     @SerializedName("is_foreground")
-    val isForeground: Boolean = false,
-    val hasPlayback: Boolean = false,
-    val hasNotification: Boolean = false,
-    val hasNetworkActivity: Boolean = false,
-    @SerializedName("pendingFreezeSec")
-    val pendingFreezeSec: Int = 0
+    val isForeground: Boolean = false
 )
 
-data class PolicyConfigPayload(
-    @SerializedName("hard_safety_net")
-    val hardSafetyNet: Set<String>,
+// --- Probe <-> Daemon 新指令模型 ---
+data class ProbeFreezePayload(
+    @SerializedName("package_name")
+    val packageName: String,
+    @SerializedName("user_id")
+    val userId: Int,
+    val pid: Int,
+    val uid: Int
+)
+
+data class ProbeUnfreezePayload(
+    @SerializedName("package_name")
+    val packageName: String,
+    @SerializedName("user_id")
+    val userId: Int,
+    val pid: Int,
+    val uid: Int
+)
+
+
+// --- 配置模型 (UI -> Daemon -> Probe) ---
+data class FullConfigPayload(
+    @SerializedName("master_config")
+    val masterConfig: MasterConfig,
+    @SerializedName("exempt_config")
+    val exemptConfig: ExemptConfig,
+    @SerializedName("policies")
     val policies: List<AppPolicyPayload>
+)
+
+data class MasterConfig(
+    @SerializedName("is_enabled")
+    val isEnabled: Boolean = true,
+    @SerializedName("freeze_on_screen_off")
+    val freezeOnScreenOff: Boolean = true
+)
+
+data class ExemptConfig(
+    @SerializedName("exempt_foreground_services")
+    val exemptForegroundServices: Boolean = true,
+    @SerializedName("exempt_audio_playback")
+    val exemptAudioPlayback: Boolean = true,
+    @SerializedName("exempt_camera_microphone")
+    val exemptCameraMicrophone: Boolean = true,
+    @SerializedName("exempt_overlay_windows")
+    val exemptOverlayWindows: Boolean = true
 )
 
 data class AppPolicyPayload(
@@ -77,53 +108,10 @@ data class AppPolicyPayload(
     val packageName: String,
     @SerializedName("user_id")
     val userId: Int,
-    val policy: Int,
-    @SerializedName("force_playback_exempt")
-    val forcePlaybackExempt: Boolean,
-    @SerializedName("force_network_exempt")
-    val forceNetworkExempt: Boolean
+    val policy: Int // Corresponds to AppPolicy enum
 )
 
-// =======================================================================================
-// Probe <-> Daemon 模型 (已重构)
-// =======================================================================================
-
-/**
- * [REFACTORED] Probe向Daemon发送的 `event.app_state_changed` 事件负载。
- * 现在包含更精确的状态信息，使Daemon可以做出更准确的反应。
- */
-data class ProbeAppStateChangedPayload(
-    @SerializedName("package_name")
-    val packageName: String,
-    @SerializedName("user_id")
-    val userId: Int,
-    @SerializedName("is_foreground")
-    val isForeground: Boolean,
-    @SerializedName("is_cached") // [NEW] 明确告知Daemon该进程是否已进入缓存状态
-    val isCached: Boolean,
-    val reason: String
-)
-
-/**
- * Probe向Daemon发送的 `event.system_state_changed` 事件负载 (无变化)。
- */
-data class ProbeSystemStateChangedPayload(
-    @SerializedName("screen_on")
-    val screenOn: Boolean? = null,
-)
-
-/**
- * Daemon向Probe下发的配置更新 `stream.probe_config_update` 的负载 (无变化)。
- */
-data class ProbeConfigUpdatePayload(
-    val policies: List<AppPolicyPayload>,
-    @SerializedName("frozen_apps")
-    val frozenApps: List<AppInstanceKey>
-)
-
-/**
- * 应用实例的唯一标识 (无变化)
- */
+// --- 通用键 ---
 data class AppInstanceKey(
     @SerializedName("package_name")
     val packageName: String,

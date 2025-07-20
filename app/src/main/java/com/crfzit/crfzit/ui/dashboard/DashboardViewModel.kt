@@ -28,7 +28,6 @@ data class DashboardUiState(
     val globalStats: GlobalStats = GlobalStats(),
     val networkSpeed: NetworkSpeed = NetworkSpeed(),
     val apps: List<UiAppRuntime> = emptyList(),
-    // [核心修复] 移除了 showOnlyForeground 状态，该选项与功能目标冲突
     val showSystemApps: Boolean = false
 )
 
@@ -43,34 +42,39 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            // 预加载应用信息缓存
+            // Pre-warm the app info cache
             appInfoRepository.getAllApps(forceRefresh = true)
 
+            // Combine the three streams: daemon data, network speed, and UI settings
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, showSystem ->
+                
+                // Map daemon data to UI data
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
-                    .map { runtimeState ->
-                        // 对于每一个运行中的应用（包括分身），获取其元数据
+                    .mapNotNull { runtimeState ->
+                        // Use the repository to get app metadata (icon, name)
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
-                        UiAppRuntime(
-                            runtimeState = runtimeState,
-                            appName = appInfo?.appName ?: runtimeState.packageName,
-                            icon = appInfo?.icon,
-                            isSystem = appInfo?.isSystemApp ?: false,
-                            userId = runtimeState.userId // 使用Daemon提供的准确userId
-                        )
+                        // Only display if we can get metadata for it
+                        appInfo?.let {
+                            UiAppRuntime(
+                                runtimeState = runtimeState,
+                                appName = it.appName,
+                                icon = it.icon,
+                                isSystem = it.isSystemApp,
+                                userId = runtimeState.userId
+                            )
+                        }
                     }
-                    .filter { it.icon != null }
                     .filter { showSystem || !it.isSystem }
-                    // 排序：前台优先，然后按内存使用量降序
                     .sortedWith(
                         compareBy<UiAppRuntime> { !it.runtimeState.isForeground }
                             .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
+                // Update the single UI state object
                 _uiState.value.copy(
                     isConnected = true,
                     isRefreshing = false,

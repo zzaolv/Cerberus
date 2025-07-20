@@ -18,7 +18,6 @@ class DaemonRepository(
 ) {
     private val udsClient = UdsClient(scope)
     private val gson = Gson()
-
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     init {
@@ -31,7 +30,7 @@ class DaemonRepository(
                         pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
                     }
                 } catch (e: JsonSyntaxException) {
-                    Log.e("DaemonRepository", "JSON parse error in response collector: ${e.message} for line: $jsonLine")
+                    // Ignore, not a response message
                 }
             }
         }
@@ -48,32 +47,26 @@ class DaemonRepository(
             }
         }
 
-    // [核心修复] 发送策略时，确保userId也被包含在内
-    fun setPolicy(config: AppInfo) {
-        val payload = mapOf(
-            "package_name" to config.packageName,
-            "user_id" to config.userId, // 发送userId
-            "policy" to config.policy.value,
-            "force_playback_exempt" to config.forcePlaybackExemption,
-            "force_network_exempt" to config.forceNetworkExemption
-        )
-        val message = CerberusMessage(10, "cmd.set_policy", null, payload)
+    // [REFACTORED] setPolicy now sends the entire config bundle.
+    // A more advanced implementation would send individual config changes.
+    fun setPolicy(config: FullConfigPayload) {
+        val message = CerberusMessage(type = "cmd.set_policy", payload = config)
         udsClient.sendMessage(gson.toJson(message))
     }
 
-    // [核心修复] 请求所有策略，并使用正确的PolicyConfigPayload模型解析响应
-    suspend fun getAllPolicies(): PolicyConfigPayload? {
+    // [REFACTORED] getAllPolicies now expects the new FullConfigPayload
+    suspend fun getAllPolicies(): FullConfigPayload? {
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
 
-        val requestMsg = CerberusMessage(10, "query.get_all_policies", reqId, EmptyPayload)
+        val requestMsg = CerberusMessage(type = "query.get_all_policies", requestId = reqId, payload = EmptyPayload)
         udsClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
-            val type = object : TypeToken<CerberusMessage<PolicyConfigPayload>>() {}.type
-            val message = gson.fromJson<CerberusMessage<PolicyConfigPayload>>(responseJson, type)
+            val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
+            val message = gson.fromJson<CerberusMessage<FullConfigPayload>>(responseJson, type)
             if (message.type == "resp.all_policies") message.payload else null
         } catch (e: Exception) {
             Log.e("DaemonRepository", "Failed to get all policies: ${e.message}")
@@ -83,7 +76,7 @@ class DaemonRepository(
     }
 
     fun requestDashboardRefresh() {
-        val message = CerberusMessage(10, "query.refresh_dashboard", null, EmptyPayload)
+        val message = CerberusMessage(type = "query.refresh_dashboard", payload = EmptyPayload)
         udsClient.sendMessage(gson.toJson(message))
     }
 

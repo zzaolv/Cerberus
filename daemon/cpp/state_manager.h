@@ -8,10 +8,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <chrono>
-#include <unordered_set>
-#include "system_monitor.h"
 #include "database_manager.h"
+#include "system_monitor.h"
 
 class ActionExecutor;
 using json = nlohmann::json;
@@ -23,43 +21,29 @@ struct AppRuntimeState {
     int user_id = 0;
     std::vector<int> pids; 
     AppConfig config;
-    enum class Status {
-        STOPPED, FOREGROUND, BACKGROUND_IDLE, 
-        AWAITING_FREEZE, // [FIX] Re-added for timeout-based freezing
-        FROZEN, EXEMPTED
-    } current_status = Status::STOPPED;
-    std::chrono::steady_clock::time_point last_state_change_time;
-    // [NEW] Timestamp for when the app went to background, used for freeze timeout.
-    std::chrono::steady_clock::time_point last_background_time;
+    enum class Status { STOPPED, RUNNING, FROZEN, EXEMPTED } current_status = Status::STOPPED;
+    bool is_foreground = false; // Kept for UI display
+    // Resource usage stats
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
-    bool is_foreground = false;
-};
-
-struct ProbeEventResult {
-    bool state_changed = false;
-    bool config_maybe_changed = false;
 };
 
 class StateManager {
 public:
-    StateManager(std::shared_ptr<DatabaseManager> db, 
-                 std::shared_ptr<SystemMonitor> sys, 
-                 std::shared_ptr<ActionExecutor> act);
+    StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>);
 
+    // Lightweight maintenance task (finds dead pids, updates stats)
     bool tick();
     
-    void on_probe_hello(int probe_fd);
-    void on_probe_disconnect();
-    
-    bool on_unfreeze_request(const json& payload);
-    
-    // [REFACTORED] Now primarily updates foreground state and background timestamp
-    ProbeEventResult on_app_state_changed_from_probe(const json& payload);
-    
-    bool on_config_changed_from_ui(const AppConfig& new_config);
+    // Handles config changes from UI. Returns true if a probe config update is needed.
+    bool on_config_changed_from_ui(const json& payload);
 
+    // [NEW] Handles explicit freeze/unfreeze commands from the Probe
+    bool on_freeze_request_from_probe(const json& payload);
+    bool on_unfreeze_request_from_probe(const json& payload);
+
+    // Get payloads for UI and Probe
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
@@ -67,15 +51,12 @@ public:
 private:
     void reconcile_process_state();
     void load_all_configs();
-
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
-    void add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid);
+    void add_pid_to_app(int pid, const std::string&, int user_id, int uid);
     void remove_pid_from_app(int pid);
     
-    bool transition_state(AppRuntimeState& app, AppRuntimeState::Status new_status, const std::string& reason);
-    
-    AppRuntimeState* get_or_create_app_state(const std::string& package_name, int user_id);
-    bool is_critical_system_app(const std::string& package_name) const;
+    AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
+    bool is_critical_system_app(const std::string&) const;
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
@@ -84,15 +65,10 @@ private:
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
     
-    bool is_screen_on_ = true;
-
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
-    
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
-
-    int probe_fd_ = -1; 
 };
 
 #endif //CERBERUS_STATE_MANAGER_H
