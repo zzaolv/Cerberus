@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v12.1_fix" // Version bump
+#define LOG_TAG "cerberusd_main_v12.2_debug"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,12 +42,12 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
+        // [关键调试点]
         if (type == "event.probe_hello") {
-            LOGI("Probe hello received from fd %d. Registering as official Probe.", client_fd);
+            LOGI("<<<<< PROBE HELLO DETECTED from fd %d >>>>>", client_fd);
             g_probe_fd = client_fd;
-            // [关键修复] 直接调用，不等后续逻辑，确保第一时间发送配置
             notify_probe_of_config_change();
-            return; // 处理完毕，直接返回
+            return; 
         }
 
         bool state_changed = false;
