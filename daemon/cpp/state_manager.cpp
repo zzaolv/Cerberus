@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
-#define LOG_TAG "cerberusd_state_v12.1_linkfix" // Version bump
+#define LOG_TAG "cerberusd_state_v12.2_configfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,7 +32,7 @@ static std::string status_to_string(AppRuntimeState::Status status, bool is_fore
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
-    LOGI("StateManager (v12.1, Linker Fix) Initializing...");
+    LOGI("StateManager (v12.2, Config Fix) Initializing...");
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -380,8 +380,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
-// --- [FIX] Re-added all missing function implementations ---
-
 void StateManager::load_all_configs() {
     auto configs = db_manager_->get_all_app_configs();
     for (const auto& db_config : configs) {
@@ -414,7 +412,7 @@ void StateManager::reconcile_process_state() {
     for(const auto& [pid, info_tuple] : current_pids) {
         if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
             const auto& [pkg_name, user_id, uid] = info_tuple;
-            add_pid_to_app(pid, pkg_name, user_id, uid);
+            add_pid_to_app(pkg_name, user_id, uid);
         }
     }
 }
@@ -447,7 +445,7 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name; // Default to package name
+    new_state.app_name = package_name;
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
 
     if (is_critical_system_app(package_name)) {
@@ -456,7 +454,7 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         new_state.config = config_opt.value_or(AppConfig{package_name, user_id, AppPolicy::EXEMPTED});
     }
     
-    new_state.current_status = new_state.config.policy == AppPolicy::EXEMPTED ? AppRuntimeState::Status::EXEMPTED : AppRuntimeState::Status::RUNNING;
+    new_state.current_status = AppRuntimeState::Status::STOPPED;
 
     auto [map_iterator, success] = managed_apps_.emplace(key, new_state);
     return &map_iterator->second;
@@ -466,7 +464,7 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
-    if (app->app_name == package_name) { // Only fetch name if it's the default
+    if (app->app_name == package_name) {
         app->app_name = sys_monitor_->get_app_name_from_pid(pid);
     }
     if (std::find(app->pids.begin(), app->pids.end(), pid) == app->pids.end()) {
@@ -499,48 +497,9 @@ bool StateManager::is_critical_system_app(const std::string& package_name) const
     return critical_system_apps_.count(package_name) > 0;
 }
 
-json StateManager::get_full_config_for_ui() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    std::map<AppInstanceKey, AppConfig> final_app_configs;
-    auto all_db_configs = db_manager_->get_all_app_configs();
-    for (const auto& config : all_db_configs) {
-        final_app_configs[{config.package_name, config.user_id}] = config;
-    }
-
-    for (const auto& [key, app_state] : managed_apps_) {
-        if (final_app_configs.find(key) == final_app_configs.end()) {
-            final_app_configs[key] = app_state.config;
-        }
-    }
-
-    json response;
-    // For now, we don't expose master/exempt config to UI, so create defaults
-    response["master_config"] = {{"is_enabled", true}, {"freeze_on_screen_off", true}};
-    response["exempt_config"] = {
-        {"exempt_foreground_services", true},
-        {"exempt_audio_playback", true},
-        {"exempt_camera_microphone", true},
-        {"exempt_overlay_windows", true}
-    };
-    json policies = json::array();
-    for (const auto& [key, config] : final_app_configs) {
-        policies.push_back({
-            {"package_name", config.package_name},
-            {"user_id", config.user_id},
-            {"policy", static_cast<int>(config.policy)}
-        });
-    }
-    response["policies"] = policies;
-    return response;
-}
-
 json StateManager::get_probe_config_payload() {
-    // This function will be very similar to get_full_config_for_ui
     return get_full_config_for_ui();
 }
-
-// --- End of re-added functions ---
 
 bool StateManager::on_freeze_request_from_probe(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -613,39 +572,74 @@ bool StateManager::tick() {
 bool StateManager::on_config_changed_from_ui(const json& payload) { 
     std::lock_guard<std::mutex> lock(state_mutex_); 
     
-    // For now, we only handle the policies part from the full config payload.
-    if (!payload.contains("policies")) return false;
-
-    for (const auto& policy_item : payload["policies"]) {
+    if (!payload.contains("policies")) {
+        LOGW("on_config_changed_from_ui received payload without 'policies' field.");
+        return false;
+    }
+    
+    LOGI("Received new configuration from UI. Applying...");
+    
+    db_manager_->clear_all_policies();
+    
+    const auto& policies = payload["policies"];
+    for (const auto& policy_item : policies) {
         AppConfig new_config;
         new_config.package_name = policy_item.value("package_name", "");
         new_config.user_id = policy_item.value("user_id", 0);
-        new_config.policy = static_cast<AppPolicy>(policy_item.value("policy", 0));
+        new_config.policy = static_cast<AppPolicy>(policy_item.value("policy", 0)); 
 
         if (new_config.package_name.empty()) continue;
 
         if (is_critical_system_app(new_config.package_name) && new_config.policy != AppPolicy::EXEMPTED) { 
-            LOGW("UI tried to set non-exempt policy for critical app %s. Denied.", new_config.package_name.c_str()); 
-            continue;
+            LOGW("UI tried to set non-exempt policy for critical app %s. Overriding to EXEMPTED.", new_config.package_name.c_str()); 
+            new_config.policy = AppPolicy::EXEMPTED;
         } 
         db_manager_->set_app_config(new_config); 
-        
-        AppRuntimeState* app_state = get_or_create_app_state(new_config.package_name, new_config.user_id); 
-        if(app_state) {
-            bool was_exempt = app_state->config.policy == AppPolicy::EXEMPTED;
-            app_state->config = new_config;
-            LOGI("Applied new config for %s (user %d). Policy is now %d.", app_state->package_name.c_str(), app_state->user_id, (int)new_config.policy);
-            
-            bool is_now_exempt = new_config.policy == AppPolicy::EXEMPTED;
-            if (app_state->current_status == AppRuntimeState::Status::FROZEN && is_now_exempt) {
-                action_executor_->unfreeze_and_cleanup({app_state->package_name, app_state->user_id});
-                app_state->current_status = AppRuntimeState::Status::EXEMPTED;
-            } else if (!is_now_exempt && was_exempt && app_state->current_status != AppRuntimeState::Status::STOPPED) {
-                app_state->current_status = AppRuntimeState::Status::RUNNING;
-            }
+    }
+    
+    managed_apps_.clear();
+    pid_to_app_map_.clear();
+    load_all_configs();
+    reconcile_process_state();
+
+    LOGI("New configuration applied and states reloaded.");
+    return true;
+}
+
+json StateManager::get_full_config_for_ui() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    std::map<AppInstanceKey, AppConfig> final_app_configs;
+
+    auto all_db_configs = db_manager_->get_all_app_configs();
+    for (const auto& config : all_db_configs) {
+        final_app_configs[{config.package_name, config.user_id}] = config;
+    }
+
+    for (const auto& [key, app_state] : managed_apps_) {
+        if (final_app_configs.find(key) == final_app_configs.end()) {
+            final_app_configs[key] = app_state.config;
         }
     }
-    return true; // Config changed, notify probe
+
+    json response;
+    response["master_config"] = {{"is_enabled", true}, {"freeze_on_screen_off", true}};
+    response["exempt_config"] = {
+        {"exempt_foreground_services", true},
+        {"exempt_audio_playback", true},
+        {"exempt_camera_microphone", true},
+        {"exempt_overlay_windows", true}
+    };
+    json policies = json::array();
+    for (const auto& [key, config] : final_app_configs) {
+        policies.push_back({
+            {"package_name", config.package_name},
+            {"user_id", config.user_id},
+            {"policy", static_cast<int>(config.policy)}
+        });
+    }
+    response["policies"] = policies;
+    return response;
 }
 
 json StateManager::get_dashboard_payload() {

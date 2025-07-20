@@ -36,6 +36,8 @@ public:
     
     // 设置/更新单个应用的配置
     bool set_app_config(const AppConfig& config);
+
+    bool clear_all_policies();
     
     // 获取所有已配置应用的列表
     std::vector<AppConfig> get_all_app_configs();

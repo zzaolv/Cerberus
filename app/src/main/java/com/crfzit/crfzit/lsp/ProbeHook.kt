@@ -21,18 +21,16 @@ class ProbeHook : IXposedHookLoadPackage {
     private val probeScope = CoroutineScope(SupervisorJob() + Executors.newSingleThreadExecutor().asCoroutineDispatcher())
     private var udsClient: UdsClient? = null
     private val gson = Gson()
-    private lateinit var powerManager: PowerManager
+    private var powerManager: PowerManager? = null
 
     companion object {
-        private const val TAG = "CerberusProbe_v12.0_final"
-        private const val PER_USER_RANGE = 100000
+        private const val TAG = "CerberusProbe_v12.4_compat"
         private const val DECISION_FIELD_NAME = "cerberus_decision"
+        private const val PER_USER_RANGE = 100000
     }
-    
-    // Simple data class to hold the decision made in computeOomAdj
+
     private data class Decision(val shouldBeFrozen: Boolean)
 
-    // --- Xposed Entry Point ---
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName == "android") {
             log("Loading into system_server (PID: ${Process.myPid()}). Initializing...")
@@ -46,74 +44,77 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             hookOomAdjuster(classLoader)
             hookServices(classLoader)
-            log("All hooks in system_server attached successfully.")
         } catch (t: Throwable) {
             logError("CRITICAL: Failed to attach hooks in system_server: $t")
         }
     }
-    
-    // --- Core Hooking Logic ---
+
+    // [CRITICAL COMPATIBILITY FIX] Use hookAllMethods to find the correct method signature
     private fun hookOomAdjuster(classLoader: ClassLoader) {
         val oomAdjusterClass = XposedHelpers.findClass("com.android.server.am.OomAdjuster", classLoader)
+        val processRecordClass = XposedHelpers.findClass("com.android.server.am.ProcessRecord", classLoader)
 
-        // 1. The Decision Point
-        XposedHelpers.findAndHookMethod(
-            oomAdjusterClass, "computeOomAdjLSP",
-            "com.android.server.am.ProcessRecord", Int::class.javaPrimitiveType, "com.android.server.am.ProcessRecord",
-            Boolean::class.javaPrimitiveType, Long::class.javaPrimitiveType,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val process = param.args[0] ?: return
+        XposedBridge.hookAllMethods(oomAdjusterClass, "computeOomAdj", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                // Find the correct ProcessRecord argument, which is usually the first one.
+                val process = param.args.firstOrNull { it != null && it::class.java == processRecordClass } ?: return
+
+                try {
                     val procState = XposedHelpers.getIntField(process, "mState.mCurProcState")
-
                     val decision = makeFreezeDecision(process, procState)
-                    // Attach the decision to the process record for the next hook
                     XposedHelpers.setAdditionalInstanceField(process, DECISION_FIELD_NAME, decision)
-                    
-                    // We completely take over the logic, so prevent the original method from running
-                    param.result = null
+                    param.result = null // Prevent original method
+                } catch(e: Throwable) {
+                    logError("Error in computeOomAdj hook: ${e.message}")
+                    // Let the original method run if we fail
                 }
-            }
-        )
-
-        // 2. The Execution Point
-        XposedHelpers.findAndHookMethod(
-            oomAdjusterClass, "applyOomAdjLSP",
-            "com.android.server.am.ProcessRecord", Boolean::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val process = param.args[0] ?: return
-                    val decision = XposedHelpers.getAdditionalInstanceField(process, DECISION_FIELD_NAME) as? Decision ?: return
-                    val isCurrentlyFrozen = XposedHelpers.getBooleanField(process, "mState.isFrozen()")
-
-                    if (decision.shouldBeFrozen && !isCurrentlyFrozen) {
-                        // Decision is to freeze, and it's not frozen yet
-                        executeFreeze(process)
-                    } else if (!decision.shouldBeFrozen && isCurrentlyFrozen) {
-                        // Decision is to unfreeze, and it's currently frozen
-                        executeUnfreeze(process)
-                    }
-                    
-                    // We take over, so prevent original method
-                    param.result = null
-                }
-            }
-        )
-        log("Hooked OomAdjuster successfully.")
-    }
-    
-    private fun hookServices(classLoader: ClassLoader) {
-        val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
-        XposedBridge.hookAllConstructors(amsClass, object: XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val ams = param.thisObject
-                powerManager = XposedHelpers.getObjectField(ams, "mPowerManager") as PowerManager
-                log("Got PowerManager instance.")
             }
         })
+
+        XposedBridge.hookAllMethods(oomAdjusterClass, "applyOomAdj", object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                val process = param.args.firstOrNull { it != null && it::class.java == processRecordClass } ?: return
+
+                try {
+                    val decision = XposedHelpers.getAdditionalInstanceField(process, DECISION_FIELD_NAME) as? Decision ?: return
+
+                    val isCurrentlyFrozen = try {
+                        XposedHelpers.getBooleanField(process, "mState.isFrozen()")
+                    } catch (e: NoSuchFieldError) { false }
+
+                    if (decision.shouldBeFrozen && !isCurrentlyFrozen) {
+                        executeFreeze(process)
+                    } else if (!decision.shouldBeFrozen && isCurrentlyFrozen) {
+                        executeUnfreeze(process)
+                    }
+                    param.result = null // Prevent original method
+                } catch(e: Throwable) {
+                    logError("Error in applyOomAdj hook: ${e.message}")
+                }
+            }
+        })
+
+        log("Hooked all OomAdjuster methods successfully.")
     }
-    
-    // --- Decision Logic ---
+    private fun hookServices(classLoader: ClassLoader) {
+        try {
+            val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
+            XposedBridge.hookAllConstructors(amsClass, object: XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val ams = param.thisObject
+                    powerManager = XposedHelpers.getObjectField(ams, "mPowerManager") as? PowerManager
+                    if (powerManager != null) {
+                        log("Got PowerManager instance.")
+                    } else {
+                        logError("Failed to get PowerManager instance.")
+                    }
+                }
+            })
+        } catch (t: Throwable) {
+            logError("Error hooking services: $t")
+        }
+    }
+
     private fun makeFreezeDecision(process: Any, procState: Int): Decision {
         val appInfo = XposedHelpers.getObjectField(process, "info") as? android.content.pm.ApplicationInfo ?: return Decision(false)
         val uid = appInfo.uid
@@ -122,29 +123,23 @@ class ProbeHook : IXposedHookLoadPackage {
         if (uid < Process.FIRST_APPLICATION_UID || packageName == "android") {
             return Decision(false)
         }
-        
-        // --- Pre-checks ---
+
         if (!ConfigManager.isEnabled()) return Decision(false)
         if (ConfigManager.isWhitelisted(packageName)) return Decision(false)
-        if (ConfigManager.freezeOnScreenOff() && powerManager.isInteractive) return Decision(false)
+        if (ConfigManager.freezeOnScreenOff() && powerManager?.isInteractive == true) return Decision(false)
 
-        // --- Exemption Checks ---
         val isInteresting = XposedHelpers.callMethod(process, "isInterestingToUser") as Boolean
-        if (isInteresting) return Decision(false) // Visible, perceptible, etc.
-        
+        if (isInteresting) return Decision(false)
+
         if (ConfigManager.exemptForegroundServices() && XposedHelpers.callMethod(process, "hasForegroundServices") as Boolean) {
             return Decision(false)
         }
 
-        // TODO: Implement more complex exemption checks (Audio, Camera, Overlay) by hooking respective services
-        
-        // --- Final Decision ---
-        // The core logic: we freeze if the process is considered "cached" by the system
-        val isCached = procState >= 15 // PROCESS_STATE_CACHED_ACTIVITY and above
+        // Corresponds to PROCESS_STATE_CACHED_ACTIVITY and above
+        val isCached = procState >= 15
         return Decision(isCached)
     }
 
-    // --- Execution Logic ---
     private fun executeFreeze(process: Any) {
         val appInfo = XposedHelpers.getObjectField(process, "info") as android.content.pm.ApplicationInfo
         val payload = ProbeFreezePayload(
@@ -156,10 +151,10 @@ class ProbeHook : IXposedHookLoadPackage {
         sendToDaemon("cmd.freeze_process", payload)
         log("Requested FREEZE for ${appInfo.packageName}")
     }
-    
+
     private fun executeUnfreeze(process: Any) {
         val appInfo = XposedHelpers.getObjectField(process, "info") as android.content.pm.ApplicationInfo
-         val payload = ProbeUnfreezePayload(
+        val payload = ProbeUnfreezePayload(
             packageName = appInfo.packageName,
             userId = appInfo.uid / PER_USER_RANGE,
             pid = XposedHelpers.getIntField(process, "mPid"),
@@ -169,7 +164,6 @@ class ProbeHook : IXposedHookLoadPackage {
         log("Requested UNFREEZE for ${appInfo.packageName}")
     }
 
-    // --- UDS Communication & Config Management ---
     private fun setupUdsCommunication() {
         udsClient?.start()
         probeScope.launch(Dispatchers.IO) {
@@ -185,7 +179,7 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         }
     }
-    
+
     private fun sendToDaemon(type: String, payload: Any) {
         udsClient?.let { client ->
             probeScope.launch {
@@ -195,10 +189,9 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         }
     }
-    
-    // --- ConfigManager Singleton ---
+
     private object ConfigManager {
-        private var config: FullConfigPayload? = null
+        @Volatile private var config: FullConfigPayload? = null
         private val gson = Gson()
 
         fun updateConfig(json: String) {
@@ -206,19 +199,18 @@ class ProbeHook : IXposedHookLoadPackage {
                 val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<FullConfigPayload>>(json, type)
                 config = msg.payload
-                log("Probe config updated successfully.")
+                XposedBridge.log("$TAG: Probe config updated successfully.")
             } catch (e: Exception) {
-                logError("Failed to parse probe config: $e")
+                XposedBridge.log("$TAG: [ERROR] Failed to parse probe config: $e")
             }
         }
-        
+
         fun isEnabled(): Boolean = config?.masterConfig?.isEnabled ?: false
         fun freezeOnScreenOff(): Boolean = config?.masterConfig?.freezeOnScreenOff ?: true
         fun isWhitelisted(pkg: String): Boolean = config?.policies?.any { it.packageName == pkg && it.policy == 0 } ?: true
         fun exemptForegroundServices(): Boolean = config?.exemptConfig?.exemptForegroundServices ?: true
     }
-    
-    // --- Logging ---
+
     private fun log(message: String) = XposedBridge.log("$TAG: $message")
     private fun logError(message: String) = XposedBridge.log("$TAG: [ERROR] $message")
 }

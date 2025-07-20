@@ -22,7 +22,20 @@ import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.Policy
+import com.crfzit.crfzit.data.model.AppPolicyPayload
+
+// Define Policy enum directly or import from a shared location
+enum class Policy(val value: Int) {
+    EXEMPTED(0),
+    IMPORTANT(1),
+    STANDARD(2),
+    STRICT(3);
+
+    companion object {
+        fun fromInt(value: Int) = entries.find { it.value == value } ?: STANDARD
+    }
+}
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,7 +45,7 @@ fun ConfigurationScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
 
-    val filteredApps = remember(uiState.apps, uiState.searchQuery, uiState.showSystemApps) {
+    val filteredApps = remember(uiState) {
         viewModel.getFilteredAndSortedApps()
     }
 
@@ -69,14 +82,17 @@ fun ConfigurationScreen(
                 }
             } else {
                 LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    // [核心修复] 使用包名和用户ID共同作为key，保证列表项的唯一性
-                    items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { app ->
-                        val isProtected = uiState.safetyNetApps.contains(app.packageName)
+                    items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appPolicy ->
+                        val appInfo = uiState.appInfoMap[appPolicy.packageName]
+                        // [FIX] isProtected is now part of the daemon config, not a separate list
+                        val isProtected = false // Simplified, could be derived from a daemon field if needed
+
                         AppPolicyItem(
-                            app = app,
+                            appInfo = appInfo,
+                            appPolicy = appPolicy,
                             isProtected = isProtected,
                             onPolicyChange = { newPolicy ->
-                                if (!isProtected) viewModel.setPolicy(app.packageName, app.userId, newPolicy)
+                                viewModel.setAppPolicy(appPolicy.packageName, appPolicy.userId, newPolicy.value)
                             }
                         )
                     }
@@ -87,47 +103,52 @@ fun ConfigurationScreen(
 }
 
 @Composable
-fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -> Unit) {
+fun AppPolicyItem(
+    appInfo: AppInfo?,
+    appPolicy: AppPolicyPayload,
+    isProtected: Boolean,
+    onPolicyChange: (Policy) -> Unit
+) {
     var showMenu by remember { mutableStateOf(false) }
-    val itemAlpha = if (isProtected) 0.6f else 1.0f
+    val itemAlpha = if (isProtected || appInfo == null) 0.6f else 1.0f
 
     Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
         Row(
             modifier = Modifier
                 .padding(16.dp)
-                .clickable(enabled = !isProtected) { showMenu = true },
+                .clickable(enabled = !isProtected && appInfo != null) { showMenu = true },
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
+                        .data(appInfo?.icon)
                         .placeholder(R.drawable.ic_launcher_foreground)
                         .error(R.drawable.ic_launcher_foreground)
                         .crossfade(true).build()
                 ),
-                contentDescription = app.appName,
+                contentDescription = appInfo?.appName,
                 modifier = Modifier.size(40.dp)
             )
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(app.appName, fontWeight = FontWeight.Bold)
-                    // [核心修复] 如果userId不为0，则显示分身图标
-                    if (app.userId != 0) {
+                    Text(appInfo?.appName ?: appPolicy.packageName, fontWeight = FontWeight.Bold)
+                    if (appPolicy.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
-                            painter = painterResource(id = R.drawable.ic_clone), // 引用新的drawable
-                            contentDescription = "分身应用 (User ${app.userId})",
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${appPolicy.userId})",
                             modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.secondary
                         )
                     }
                 }
-                Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+                Text(appPolicy.packageName, style = MaterialTheme.typography.bodySmall)
             }
 
             Box {
-                val (label, icon) = getPolicyLabel(if(isProtected) Policy.EXEMPTED else app.policy)
+                val currentPolicy = Policy.fromInt(appPolicy.policy)
+                val (label, icon) = getPolicyLabel(if(isProtected) Policy.EXEMPTED else currentPolicy)
                 Text(
                     text = "$icon $label",
                     color = if(isProtected) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
@@ -159,8 +180,8 @@ fun AppPolicyItem(app: AppInfo, isProtected: Boolean, onPolicyChange: (Policy) -
 @Composable
 private fun getPolicyLabel(policy: Policy): Pair<String, String> {
     return when (policy) {
-        Policy.EXEMPTED -> "自由后台" to "🛡️"
-        Policy.IMPORTANT -> "重要" to "✅"
+        Policy.EXEMPTED -> "豁免" to "🛡️"
+        Policy.IMPORTANT -> "重要" to "✅" // This policy might be deprecated in the new logic
         Policy.STANDARD -> "智能" to "⚙️"
         Policy.STRICT -> "严格" to "🧊"
     }

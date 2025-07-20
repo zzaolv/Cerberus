@@ -24,16 +24,18 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
-import com.google.accompanist.swiperefresh.SwipeRefresh
-import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.icons.AppIcons
+import com.crfzit.crfzit.ui.theme.CRFzitTheme
+import com.google.accompanist.swiperefresh.SwipeRefresh
+import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
 import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -133,8 +135,10 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
     Column(modifier = Modifier.padding(bottom = 8.dp)) {
+        // [FIX] Removed activeProfileName as it's no longer in the model
+        // You can add a static or dynamic title here if needed
         Text(
-            text = "MODE: ${stats.activeProfileName}",
+            text = "系统状态",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             modifier = Modifier
@@ -300,16 +304,14 @@ fun AppStatusIcons(state: AppRuntimeState) {
         val iconModifier = Modifier.padding(horizontal = 2.dp)
         if (state.isForeground) Text("▶️", iconModifier)
         if (state.isWhitelisted) Text("🛡️", iconModifier)
-        if (state.hasPlayback) Text("🎵", iconModifier)
-        if (state.hasNotification) Text("🔔", iconModifier)
-        if (state.hasNetworkActivity) Text("📡", iconModifier)
 
-        // [REFACTORED] Simplified icon logic
+        // [FIX] Removed hasPlayback etc. as they are no longer in the model
         if (state.displayStatus.uppercase() == "FROZEN") {
             Text("❄️", iconModifier)
         }
     }
 }
+
 
 @Composable
 fun ConnectionLoadingIndicator() {
@@ -364,18 +366,9 @@ private fun formatStatus(state: AppRuntimeState): String {
 fun DashboardPreview() {
     CRFzitTheme {
         DashboardContent(
-            globalStats = GlobalStats(activeProfileName = "🎮 游戏模式"),
+            globalStats = GlobalStats(),
             networkSpeed = NetworkSpeed(),
-            apps = listOf(
-                UiAppRuntime(
-                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = true, displayStatus = "FOREGROUND", userId = 0),
-                    appName = "示例应用", icon = null, isSystem = false, userId = 0
-                ),
-                 UiAppRuntime(
-                    runtimeState = AppRuntimeState(packageName = "com.example.app", appName = "示例应用", isForeground = false, displayStatus = "BACKGROUND_IDLE", userId = 999),
-                    appName = "示例应用 (分身)", icon = null, isSystem = false, userId = 999
-                )
-            )
+            apps = emptyList()
         )
     }
 }

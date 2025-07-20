@@ -87,6 +87,18 @@ bool DatabaseManager::set_app_config(const AppConfig& config) {
     }
 }
 
+// Add this function implementation to the .cpp file
+bool DatabaseManager::clear_all_policies() {
+    try {
+        db_.exec("DELETE FROM app_policies_v2");
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("Failed to clear all policies: %s", e.what());
+        return false;
+    }
+}
+
+
 // [核心修复] 修改函数实现以支持分身，查询所有配置时，需要把 user_id 也一并查出
 std::vector<AppConfig> DatabaseManager::get_all_app_configs() {
     std::vector<AppConfig> configs;
