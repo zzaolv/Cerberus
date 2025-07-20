@@ -10,6 +10,7 @@
 #include <mutex>
 #include "database_manager.h"
 #include "system_monitor.h"
+#include <unordered_set>
 
 class ActionExecutor;
 using json = nlohmann::json;
