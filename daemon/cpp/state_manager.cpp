@@ -1,5 +1,5 @@
 // daemon/cpp/state_manager.cpp
-#include "state_manager.h"
+#include "state_manager.hh"
 #include "action_executor.h"
 #include <android/log.h>
 #include <filesystem>
@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
-#define LOG_TAG "cerberusd_state_v12.3_finalfix"
+#define LOG_TAG "cerberusd_state_v12.4_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -19,6 +19,7 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// 辅助函数，用于将AppRuntimeState的状态枚举转换为字符串，供UI显示
 static std::string status_to_string(AppRuntimeState::Status status, bool is_foreground) {
     if (is_foreground) return "FOREGROUND";
     switch (status) {
@@ -32,7 +33,9 @@ static std::string status_to_string(AppRuntimeState::Status status, bool is_fore
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
-    LOGI("StateManager (v12.3, Final Fix) Initializing...");
+    LOGI("StateManager Initializing...");
+    
+    // 内置的关键系统应用豁免列表
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
@@ -375,8 +378,10 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+   
     load_all_configs();
-    reconcile_process_state();
+    // 在构造函数中首次同步进程状态
+    reconcile_process_state_full();
     LOGI("StateManager Initialized.");
 }
 
@@ -387,38 +392,8 @@ void StateManager::load_all_configs() {
     }
 }
 
-/*
-void StateManager::reconcile_process_state() {
-    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        try {
-            int pid = std::stoi(entry.path().filename().string());
-            int uid = -1, user_id = -1;
-            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
-            if (!pkg_name.empty()) {
-                current_pids[pid] = {pkg_name, user_id, uid};
-            }
-        } catch (...) { continue; }
-    }
-
-    std::vector<int> dead_pids;
-    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (current_pids.find(pid) == current_pids.end()) {
-            dead_pids.push_back(pid);
-        }
-    }
-    for (int pid : dead_pids) remove_pid_from_app(pid);
-
-    for(const auto& [pid, info_tuple] : current_pids) {
-        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
-            const auto& [pkg_name, user_id, uid] = info_tuple;
-            // [FIX] Pass the 'pid' as the first argument
-            add_pid_to_app(pid, pkg_name, user_id, uid);
-        }
-    }
-}
-*/
+// 这个函数被新的`reconcile_process_state_full`取代，可以安全删除
+// void StateManager::reconcile_process_state() { ... }
 
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
@@ -548,11 +523,9 @@ bool StateManager::on_unfreeze_request_from_probe(const json& payload) {
     return false;
 }
 
-// [关键修复] tick函数需要完整地同步进程列表
 bool StateManager::tick() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    // 这个函数会检查新生和死亡的进程，并返回列表是否有变化
     bool list_changed = reconcile_process_state_full();
 
     sys_monitor_->update_global_stats();
@@ -568,44 +541,6 @@ bool StateManager::tick() {
     }
     
     return list_changed;
-}
-
-// [新增] 一个完整的对账函数
-bool StateManager::reconcile_process_state_full() {
-    bool changed = false;
-    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
-    for (const auto& entry : fs::directory_iterator("/proc")) {
-        if (!entry.is_directory()) continue;
-        try {
-            int pid = std::stoi(entry.path().filename().string());
-            int uid = -1, user_id = -1;
-            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
-            if (!pkg_name.empty()) {
-                current_pids[pid] = {pkg_name, user_id, uid};
-            }
-        } catch (...) { continue; }
-    }
-
-    std::vector<int> dead_pids;
-    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
-        if (current_pids.find(pid) == current_pids.end()) {
-            dead_pids.push_back(pid);
-        }
-    }
-    if (!dead_pids.empty()) {
-        changed = true;
-        for (int pid : dead_pids) remove_pid_from_app(pid);
-    }
-    
-
-    for(const auto& [pid, info_tuple] : current_pids) {
-        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
-            changed = true;
-            const auto& [pkg_name, user_id, uid] = info_tuple;
-            add_pid_to_app(pid, pkg_name, user_id, uid);
-        }
-    }
-    return changed;
 }
 
 bool StateManager::on_config_changed_from_ui(const json& payload) { 
@@ -639,7 +574,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
     managed_apps_.clear();
     pid_to_app_map_.clear();
     load_all_configs();
-    reconcile_process_state();
+    reconcile_process_state_full();
 
     LOGI("New configuration applied and states reloaded.");
     return true;
@@ -709,4 +644,42 @@ json StateManager::get_dashboard_payload() {
     }
     payload["apps_runtime_state"] = apps_state;
     return payload;
+}
+
+
+// 这是新的、完整的进程列表同步函数
+bool StateManager::reconcile_process_state_full() {
+    bool changed = false;
+    std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        try {
+            int pid = std::stoi(entry.path().filename().string());
+            int uid = -1, user_id = -1;
+            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+            if (!pkg_name.empty()) {
+                current_pids[pid] = {pkg_name, user_id, uid};
+            }
+        } catch (...) { continue; }
+    }
+
+    std::vector<int> dead_pids;
+    for(const auto& [pid, app_ptr] : pid_to_app_map_) {
+        if (current_pids.find(pid) == current_pids.end()) {
+            dead_pids.push_back(pid);
+        }
+    }
+    if (!dead_pids.empty()) {
+        changed = true;
+        for (int pid : dead_pids) remove_pid_from_app(pid);
+    }
+    
+    for(const auto& [pid, info_tuple] : current_pids) {
+        if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
+            changed = true;
+            const auto& [pkg_name, user_id, uid] = info_tuple;
+            add_pid_to_app(pid, pkg_name, user_id, uid);
+        }
+    }
+    return changed;
 }
