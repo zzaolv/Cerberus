@@ -387,6 +387,7 @@ void StateManager::load_all_configs() {
     }
 }
 
+/*
 void StateManager::reconcile_process_state() {
     std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
@@ -417,6 +418,7 @@ void StateManager::reconcile_process_state() {
         }
     }
 }
+*/
 
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;

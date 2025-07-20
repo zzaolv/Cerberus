@@ -50,7 +50,12 @@ public:
     json get_probe_config_payload();
 
 private:
-    void reconcile_process_state();
+    // [关键修复] 移除旧的reconcile_process_state声明
+    // void reconcile_process_state();
+    
+    // [关键修复] 添加新的、返回bool值的reconcile_process_state_full声明
+    bool reconcile_process_state_full(); 
+    
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
     void add_pid_to_app(int pid, const std::string&, int user_id, int uid);
