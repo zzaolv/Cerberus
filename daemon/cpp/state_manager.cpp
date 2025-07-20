@@ -1,5 +1,5 @@
 // daemon/cpp/state_manager.cpp
-#include "state_manager.hh"
+#include "state_manager.h"
 #include "action_executor.h"
 #include <android/log.h>
 #include <filesystem>
