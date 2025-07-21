@@ -348,16 +348,15 @@ private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
 
 // [REFACTORED] Updated status formatting to reflect the new, simpler state machine.
 private fun formatStatus(state: AppRuntimeState): String {
-    // The isForeground flag now takes precedence
-    if (state.isForeground) {
-        return "前台运行"
-    }
     return when (state.displayStatus.uppercase()) {
         "STOPPED" -> "未运行"
-        "RUNNING" -> "后台运行" // Simplified status
         "FROZEN" -> "已冻结"
+        "FOREGROUND" -> "前台运行"
+        "PENDING_FREEZE" -> "等待冻结"
         "EXEMPTED" -> "已豁免"
-        else -> state.displayStatus // Fallback
+        "EXEMPTED_BACKGROUND" -> "后台运行 (已豁免)" // 新增
+        "BACKGROUND" -> "后台运行"
+        else -> state.displayStatus
     }
 }
 

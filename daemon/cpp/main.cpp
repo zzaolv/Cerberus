@@ -1,4 +1,5 @@
 // daemon/cpp/main.cpp
+#include "main.h" // 引入新的头文件
 #include "uds_server.h"
 #include "state_manager.h"
 #include "system_monitor.h"
@@ -14,9 +15,8 @@
 #include <filesystem>
 #include <mutex>
 #include <unistd.h>
-#include "main.h"
 
-#define LOG_TAG "cerberusd_main_v3_reborn"
+#define LOG_TAG "cerberusd_main_v8_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,9 +32,8 @@ std::atomic<bool> g_is_running = true;
 std::atomic<int> g_probe_fd = -1;
 std::mutex g_broadcast_mutex;
 
-// --- Forward Declarations ---
-// void broadcast_dashboard_update();
-void notify_probe_of_config_change();
+// [V8 修复] 定义全局广播请求标志
+std::atomic<bool> g_needs_broadcast = false;
 
 // --- Message Handler (重构) ---
 void handle_client_message(int client_fd, const std::string& message_str) {
@@ -43,55 +42,36 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        bool state_changed = false;
         bool config_changed = false;
 
-        // --- Probe 连接事件 ---
         if (type == "event.probe_hello") {
             LOGI("<<<<< PROBE HELLO from fd %d >>>>>", client_fd);
             g_probe_fd = client_fd;
-            notify_probe_of_config_change(); // Probe连接后立即发送一次完整配置
-            return; 
-        }
-
-        // --- Probe 上报事件 ---
-        else if (type == "event.app_foreground") {
-            if (g_state_manager) {
-                state_changed = g_state_manager->on_app_foreground(msg.at("payload"));
+            notify_probe_of_config_change();
+            return;
+        } else if (type == "event.app_foreground") {
+            if (g_state_manager) g_state_manager->on_app_foreground(msg.at("payload"));
+        } else if (type == "event.app_background") {
+             if (g_state_manager) g_state_manager->on_app_background(msg.at("payload"));
+        } else if (type == "cmd.set_policy") {
+            if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
+                config_changed = true;
             }
-        }
-        else if (type == "event.app_background") {
-             if (g_state_manager) {
-                state_changed = g_state_manager->on_app_background(msg.at("payload"));
-            }
-        }
-        
-        // --- UI 指令 ---
-        else if (type == "cmd.set_policy") {
-            if (g_state_manager) {
-                if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
-                    config_changed = true;
-                }
-                state_changed = true; // 配置改变也算状态改变，需要刷新UI
-            }
-        }
-        else if (type == "query.get_all_policies") {
+            // [V8 修复] 状态变更后，请求广播而不是直接调用
+            g_needs_broadcast = true;
+        } else if (type == "query.get_all_policies") {
             if (g_state_manager) {
                 json response_payload = g_state_manager->get_full_config_for_ui();
                 json response_msg = {{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", response_payload}};
                 g_server->send_message(client_fd, response_msg.dump());
             }
-        }
-        else if (type == "query.refresh_dashboard") {
-            state_changed = true;
+        } else if (type == "query.refresh_dashboard") {
+            // [V8 修复] 请求广播
+            g_needs_broadcast = true;
         }
 
-        // --- 触发更新 ---
         if (config_changed) {
             notify_probe_of_config_change();
-        }
-        if (state_changed) {
-            broadcast_dashboard_update();
         }
 
     } catch (const json::exception& e) {
@@ -136,18 +116,30 @@ void signal_handler(int signum) {
     }
 }
 
+// [V8 修复] 重构 worker_thread_func
 void worker_thread_func() {
     LOGI("Worker thread started.");
+    auto next_tick_time = std::chrono::steady_clock::now();
+
     while (g_is_running) {
-        // 维持3秒的轮询周期，用于处理超时冻结和资源监控
-        std::this_thread::sleep_for(std::chrono::seconds(3)); 
+        // 主循环以100ms的频率运行，保证UI响应
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!g_is_running) break;
-        
-        if (g_state_manager) {
-            if (g_state_manager->tick()) {
-                LOGD("StateManager tick reported a change, broadcasting update.");
-                broadcast_dashboard_update();
+
+        // 消费者：检查是否需要广播
+        if (g_needs_broadcast.exchange(false)) {
+            broadcast_dashboard_update();
+        }
+
+        // 定时器：每3秒执行一次耗时的tick任务
+        if (std::chrono::steady_clock::now() >= next_tick_time) {
+            if (g_state_manager) {
+                if (g_state_manager->tick()) {
+                    LOGD("StateManager tick reported a change, requesting broadcast.");
+                    g_needs_broadcast = true;
+                }
             }
+            next_tick_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         }
     }
     LOGI("Worker thread finished.");

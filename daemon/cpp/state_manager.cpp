@@ -400,6 +400,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
+// [V8 修复] 重写 on_top_app_changed 以避免死锁
 void StateManager::on_top_app_changed(const std::set<int>& top_pids) {
     auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_top_app_change_processed_).count() < 250) {
@@ -445,8 +446,9 @@ void StateManager::on_top_app_changed(const std::set<int>& top_pids) {
         }
     }
     
+    // 如果有任何状态变化，请求一次广播
     if (state_has_changed) {
-        broadcast_dashboard_update();
+        g_needs_broadcast = true;
     }
 }
 
