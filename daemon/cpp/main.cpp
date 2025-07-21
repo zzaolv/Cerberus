@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v7_hotfix"
+#define LOG_TAG "cerberusd_main_v7_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -46,8 +46,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
-            // Force an immediate update after config change, UI will see the result faster
-            has_new_top_app_event = true;
+            has_new_top_app_event = true; // Force an immediate update after config change
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
@@ -93,20 +92,20 @@ void notify_probe_of_config_change() {
 void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
-    if (g_server) g_server->stop();
+    if (g_server) g_server->stop(); // This will unblock the main thread's run()
 }
 
 // --- Worker Thread ---
 void worker_thread_func() {
-    LOGI("Worker thread started with LPE model.");
-    has_new_top_app_event = true;
+    LOGI("Worker thread started.");
+    has_new_top_app_event = true; // Force initial update
     
     while (g_is_running) {
         bool needs_broadcast = false;
         
-        // 只有当 inotify 线程发来信号时，才执行昂贵的前台状态更新
         if (has_new_top_app_event.exchange(false)) {
-            auto top_pids = g_sys_monitor->read_top_app_pids();
+            // [修复] 调用正确的函数名 get_current_top_pids
+            auto top_pids = g_sys_monitor->get_current_top_pids();
             if (g_state_manager->update_foreground_state(top_pids)) {
                 needs_broadcast = true;
             }
@@ -125,7 +124,6 @@ void worker_thread_func() {
     LOGI("Worker thread finished.");
 }
 
-
 // --- Main Entry ---
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
@@ -134,7 +132,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v7 (Hotfix) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v7 (Final Fix) starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
@@ -154,7 +152,7 @@ int main(int argc, char *argv[]) {
     g_server = std::make_unique<UdsServer>("cerberus_socket");
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
-    g_server->run();
+    g_server->run(); // Blocks until g_server->stop() is called
     
     g_is_running = false;
     if(g_worker_thread.joinable()) g_worker_thread.join();
