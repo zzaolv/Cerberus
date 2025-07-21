@@ -7,11 +7,14 @@
 #include <filesystem>
 #include <sys/inotify.h>
 #include <sys/select.h>
+#include <sys/time.h>
+#include <climits> // For NAME_MAX
 
 #define LOG_TAG "cerberusd_monitor_v7_hotfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
@@ -55,33 +58,28 @@ void SystemMonitor::top_app_monitor_thread() {
         LOGE("inotify_init1 failed: %s", strerror(errno));
         return;
     }
-    int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_MODIFY | IN_OPEN);
+    
+    int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_CLOSE_WRITE | IN_OPEN | IN_MODIFY);
     if (wd < 0) {
-        LOGE("inotify_add_watch failed: %s", strerror(errno));
+        LOGE("inotify_add_watch failed for %s: %s", top_app_tasks_path_.c_str(), strerror(errno));
         close(fd);
         return;
     }
 
-    char buf[1024] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
     while (monitoring_active_) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(fd, &read_fds);
-        struct timeval tv { .tv_sec = 2, .tv_usec = 0 };
-
-        int ret = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+        // This is a BLOCKING call, ensuring ZERO CPU usage when idle.
+        ssize_t len = read(fd, buf, sizeof(buf));
         if (!monitoring_active_) break;
-        if (ret < 0) {
+
+        if (len < 0) {
             if (errno == EINTR) continue;
-            LOGE("select on inotify fd failed: %s", strerror(errno));
+            LOGE("read from inotify fd failed: %s", strerror(errno));
             break;
         }
 
-        if (ret > 0 && FD_ISSET(fd, &read_fds)) {
-             read(fd, buf, sizeof(buf)); // Drain the event to prevent busy-loop
-        }
-
+        // Event occurred, update the internal list and set the global flag.
         {
             std::lock_guard<std::mutex> lock(top_pids_mutex_);
             std::ifstream file(top_app_tasks_path_);
@@ -90,7 +88,9 @@ void SystemMonitor::top_app_monitor_thread() {
             while (file >> pid) {
                 current_top_pids_.insert(pid);
             }
+            LOGD("Top-app list updated, %zu pids.", current_top_pids_.size());
         }
+        has_new_top_app_event = true; 
     }
     inotify_rm_watch(fd, wd);
     close(fd);

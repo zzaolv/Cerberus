@@ -24,6 +24,9 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
+// 声明一个全局原子标志，用于在 inotify 线程和主工作线程之间通信
+extern std::atomic<bool> has_new_top_app_event;
+
 class SystemMonitor {
 public:
     SystemMonitor();

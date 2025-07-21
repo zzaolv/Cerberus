@@ -31,6 +31,7 @@ static std::shared_ptr<SystemMonitor> g_sys_monitor;
 static std::atomic<bool> g_is_running = true;
 static std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
+std::atomic<bool> has_new_top_app_event = false;
 
 // --- Forward Declarations ---
 void broadcast_dashboard_update();
@@ -41,12 +42,12 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
-        
         if (type == "cmd.set_policy") {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
-            broadcast_dashboard_update(); // Config change should trigger immediate update
+            // Force an immediate update after config change, UI will see the result faster
+            has_new_top_app_event = true;
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
@@ -58,9 +59,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             g_probe_fd = client_fd;
             notify_probe_of_config_change();
         }
-
-    } catch (const json::exception& e) {
-        LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str());
+    } catch (const json::exception& e) { 
+        LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); 
     }
 }
 
@@ -93,18 +93,22 @@ void notify_probe_of_config_change() {
 void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
-    if (g_server) g_server->stop(); // This will unblock the main thread's run()
+    if (g_server) g_server->stop();
 }
 
 // --- Worker Thread ---
 void worker_thread_func() {
-    LOGI("Worker thread started.");
+    LOGI("Worker thread started with LPE model.");
+    has_new_top_app_event = true; // Force initial update
+    
     while (g_is_running) {
         bool needs_broadcast = false;
         
-        auto top_pids = g_sys_monitor->get_current_top_pids();
-        if (g_state_manager->update_foreground_state(top_pids)) {
-            needs_broadcast = true;
+        if (has_new_top_app_event.exchange(false)) {
+            auto top_pids = g_sys_monitor->get_current_top_pids();
+            if (g_state_manager->update_foreground_state(top_pids)) {
+                needs_broadcast = true;
+            }
         }
 
         if (g_state_manager->tick()) {
@@ -130,7 +134,12 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     LOGI("Project Cerberus Daemon v7 (Hotfix) starting... (PID: %d)", getpid());
     
-    if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
+    try {
+        if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
+    } catch(const fs::filesystem_error& e) {
+        LOGE("Failed to create data dir: %s", e.what());
+        return 1;
+    }
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto action_executor = std::make_shared<ActionExecutor>();
@@ -143,7 +152,7 @@ int main(int argc, char *argv[]) {
     g_server = std::make_unique<UdsServer>("cerberus_socket");
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
-    g_server->run(); // Blocks until g_server->stop() is called
+    g_server->run();
     
     g_is_running = false;
     if(g_worker_thread.joinable()) g_worker_thread.join();
