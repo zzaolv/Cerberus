@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v7_final"
+#define LOG_TAG "cerberusd_main_v7_final3"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -24,20 +24,17 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// --- Globals ---
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
 static std::shared_ptr<SystemMonitor> g_sys_monitor;
 static std::atomic<bool> g_is_running = true;
 static std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
-std::atomic<bool> has_new_top_app_event = false;
+std::atomic<int> g_top_app_refresh_tickets = 0;
 
-// --- Forward Declarations ---
 void broadcast_dashboard_update();
 void notify_probe_of_config_change();
 
-// --- UDS Callbacks ---
 void handle_client_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
@@ -46,7 +43,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
-            has_new_top_app_event = true; // Force an immediate update after config change
+            g_top_app_refresh_tickets = 1; 
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
@@ -58,9 +55,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             g_probe_fd = client_fd;
             notify_probe_of_config_change();
         }
-    } catch (const json::exception& e) { 
-        LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); 
-    }
+    } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
 
 void handle_client_disconnect(int client_fd) {
@@ -71,7 +66,6 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
-// --- Global Functions ---
 void broadcast_dashboard_update() {
     if (g_server && g_server->has_clients() && g_state_manager) {
         LOGD("Broadcasting dashboard update...");
@@ -92,20 +86,20 @@ void notify_probe_of_config_change() {
 void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
-    if (g_server) g_server->stop(); // This will unblock the main thread's run()
+    if (g_server) g_server->stop();
 }
 
-// --- Worker Thread ---
 void worker_thread_func() {
-    LOGI("Worker thread started.");
-    has_new_top_app_event = true; // Force initial update
+    LOGI("Worker thread started with metronome model.");
+    g_top_app_refresh_tickets = 2; 
     
     while (g_is_running) {
         bool needs_broadcast = false;
         
-        if (has_new_top_app_event.exchange(false)) {
-            // [修复] 调用正确的函数名 get_current_top_pids
-            auto top_pids = g_sys_monitor->get_current_top_pids();
+        if (g_top_app_refresh_tickets > 0) {
+            g_top_app_refresh_tickets--;
+            // [修复] 调用正确的函数名 read_top_app_pids
+            auto top_pids = g_sys_monitor->read_top_app_pids();
             if (g_state_manager->update_foreground_state(top_pids)) {
                 needs_broadcast = true;
             }
@@ -124,7 +118,6 @@ void worker_thread_func() {
     LOGI("Worker thread finished.");
 }
 
-// --- Main Entry ---
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
@@ -132,7 +125,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v7 (Final Fix) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v7 (Final Fix 2) starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
@@ -152,7 +145,7 @@ int main(int argc, char *argv[]) {
     g_server = std::make_unique<UdsServer>("cerberus_socket");
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
-    g_server->run(); // Blocks until g_server->stop() is called
+    g_server->run();
     
     g_is_running = false;
     if(g_worker_thread.joinable()) g_worker_thread.join();
