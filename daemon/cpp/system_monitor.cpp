@@ -6,8 +6,9 @@
 #include <unistd.h>
 #include <filesystem>
 #include <sys/inotify.h>
+#include <sys/select.h>
 
-#define LOG_TAG "cerberusd_monitor_v6"
+#define LOG_TAG "cerberusd_monitor_v7_hotfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -29,10 +30,8 @@ SystemMonitor::~SystemMonitor() {
     stop_top_app_monitor();
 }
 
-void SystemMonitor::start_top_app_monitor(std::function<void(const std::set<int>&)> callback) {
+void SystemMonitor::start_top_app_monitor() {
     if (top_app_tasks_path_.empty()) return;
-
-    on_top_app_changed_ = std::move(callback);
     monitoring_active_ = true;
     monitor_thread_ = std::thread(&SystemMonitor::top_app_monitor_thread, this);
     LOGI("Top-app monitor started for path: %s", top_app_tasks_path_.c_str());
@@ -45,15 +44,9 @@ void SystemMonitor::stop_top_app_monitor() {
     }
 }
 
-std::set<int> SystemMonitor::read_top_app_pids() {
-    std::set<int> pids;
-    std::ifstream file(top_app_tasks_path_);
-    if (!file.is_open()) return pids;
-    int pid;
-    while (file >> pid) {
-        pids.insert(pid);
-    }
-    return pids;
+std::set<int> SystemMonitor::get_current_top_pids() {
+    std::lock_guard<std::mutex> lock(top_pids_mutex_);
+    return current_top_pids_;
 }
 
 void SystemMonitor::top_app_monitor_thread() {
@@ -62,51 +55,48 @@ void SystemMonitor::top_app_monitor_thread() {
         LOGE("inotify_init1 failed: %s", strerror(errno));
         return;
     }
-
     int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_MODIFY | IN_OPEN);
     if (wd < 0) {
-        LOGE("inotify_add_watch for %s failed: %s", top_app_tasks_path_.c_str(), strerror(errno));
+        LOGE("inotify_add_watch failed: %s", strerror(errno));
         close(fd);
         return;
     }
 
-    if (on_top_app_changed_) {
-        on_top_app_changed_(read_top_app_pids());
-    }
-
-    char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    char buf[1024] __attribute__ ((aligned(__alignof__(struct inotify_event))));
 
     while (monitoring_active_) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(fd, &read_fds);
-        struct timeval tv { .tv_sec = 1, .tv_usec = 0 };
+        struct timeval tv { .tv_sec = 2, .tv_usec = 0 };
 
         int ret = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+        if (!monitoring_active_) break;
         if (ret < 0) {
             if (errno == EINTR) continue;
             LOGE("select on inotify fd failed: %s", strerror(errno));
             break;
         }
-        if (ret == 0) continue;
 
-        ssize_t len = read(fd, buf, sizeof(buf));
-        if (len <= 0) continue;
-
-        if (on_top_app_changed_) {
-            on_top_app_changed_(read_top_app_pids());
+        if (ret > 0 && FD_ISSET(fd, &read_fds)) {
+             read(fd, buf, sizeof(buf)); // Drain the event to prevent busy-loop
         }
 
-        // [性能优化] 增加一个短暂的休眠，作为物理节流，防止毫秒级事件风暴
-        usleep(50 * 1000); // 50ms
+        {
+            std::lock_guard<std::mutex> lock(top_pids_mutex_);
+            std::ifstream file(top_app_tasks_path_);
+            int pid;
+            current_top_pids_.clear();
+            while (file >> pid) {
+                current_top_pids_.insert(pid);
+            }
+        }
     }
-
     inotify_rm_watch(fd, wd);
     close(fd);
     LOGI("Top-app monitor stopped.");
 }
 
-// --- 其他函数保持不变 ---
 void SystemMonitor::update_global_stats() {
     update_cpu_usage();
     update_mem_info();
@@ -180,7 +170,6 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
         while (std::getline(status_file, line)) {
             if (line.rfind("Name:", 0) == 0) {
                 std::string name = line.substr(line.find(":") + 1);
-                // Trim leading whitespace
                 name.erase(0, name.find_first_not_of(" \t"));
                 return name;
             }
@@ -196,11 +185,9 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
     return "Unknown";
 }
 
-
 void SystemMonitor::update_cpu_usage() {
     std::ifstream stat_file("/proc/stat");
     if (!stat_file.is_open()) return;
-
     std::string line;
     std::getline(stat_file, line);
     std::string cpu_label;
@@ -217,7 +204,6 @@ void SystemMonitor::update_cpu_usage() {
         if (delta_total > 0) {
             long long delta_idle = current_times.idle_total() - prev_total_cpu_times_.idle_total();
             float cpu_usage = 100.0f * (static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total));
-            
             std::lock_guard<std::mutex> lock(data_mutex_);
             current_stats_.total_cpu_usage_percent = std::max(0.0f, cpu_usage);
         }
@@ -230,7 +216,6 @@ void SystemMonitor::update_mem_info() {
     if (!meminfo_file.is_open()) return;
     std::string line;
     long mem_total = 0, mem_available = 0, swap_total = 0, swap_free = 0;
-
     while (std::getline(meminfo_file, line)) {
         std::string key;
         long value;
@@ -241,7 +226,6 @@ void SystemMonitor::update_mem_info() {
         else if (key == "SwapTotal:") swap_total = value;
         else if (key == "SwapFree:") swap_free = value;
     }
-    
     std::lock_guard<std::mutex> lock(data_mutex_);
     current_stats_.total_mem_kb = mem_total;
     current_stats_.avail_mem_kb = mem_available;

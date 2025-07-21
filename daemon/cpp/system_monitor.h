@@ -6,11 +6,10 @@
 #include <mutex>
 #include <map>
 #include <vector>
-#include <chrono>
 #include <set>
-#include <functional>
 #include <thread>
 #include <atomic>
+#include <functional>
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -34,20 +33,16 @@ public:
     GlobalStatsData get_global_stats() const;
 
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
-    
     std::string get_app_name_from_pid(int pid);
 
-    // [V6 新增] 主动探测 top-app 核心功能
-    void start_top_app_monitor(std::function<void(const std::set<int>&)> callback);
+    void start_top_app_monitor();
     void stop_top_app_monitor();
+    std::set<int> get_current_top_pids();
 
 private:
     void update_cpu_usage();
     void update_mem_info();
-    
-    // [V6 新增] top-app 监控线程
     void top_app_monitor_thread();
-    std::set<int> read_top_app_pids();
 
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
@@ -59,13 +54,12 @@ private:
     mutable std::mutex data_mutex_;
     GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
-    
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
-    // [V6 新增] 监控线程相关
+    std::set<int> current_top_pids_;
+    std::mutex top_pids_mutex_;
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};
-    std::function<void(const std::set<int>&)> on_top_app_changed_;
     std::string top_app_tasks_path_;
 };
 
