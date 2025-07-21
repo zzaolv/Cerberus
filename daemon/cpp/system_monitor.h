@@ -41,17 +41,15 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
 
-    // [修复] 修正函数声明和成员变量名
-    void start_audio_monitor();
-    void stop_audio_monitor();
+    // [修复] 采用新的轮询接口
+    void update_audio_state();
     bool is_uid_playing_audio(int uid);
 
 private:
     void update_cpu_usage();
     void update_mem_info();
     void top_app_monitor_thread();
-    void audio_monitor_thread();
-
+    
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
         long long iowait = 0, irq = 0, softirq = 0, steal = 0;
@@ -69,8 +67,6 @@ private:
     std::atomic<bool> monitoring_active_{false};
     std::string top_app_tasks_path_;
 
-    std::thread audio_thread_;
-    std::atomic<bool> audio_monitoring_active_{false};
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
 };
