@@ -20,6 +20,7 @@ import com.crfzit.crfzit.ui.dashboard.DashboardScreen
 import com.crfzit.crfzit.ui.dashboard.DashboardViewModel
 import com.crfzit.crfzit.ui.logs.LogsScreen
 import com.crfzit.crfzit.ui.settings.SettingsScreen
+import com.crfzit.crfzit.ui.settings.SettingsViewModel
 
 @Composable
 fun MainScreen() {

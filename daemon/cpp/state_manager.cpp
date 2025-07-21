@@ -430,20 +430,28 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
         if (app.is_foreground != is_now_foreground) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
+            // [修复] 严格的状态转换逻辑
             if (is_now_foreground) {
-                if (app.background_since > 0 || app.observation_since > 0) LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
-                app.background_since = 0;
-                app.observation_since = 0;
+                // 进入前台: 清除所有计时器
+                if (app.observation_since > 0 || app.background_since > 0) {
+                    LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
+                }
+                app.observation_since = 0; // <--- 关键修复
+                app.background_since = 0;  // <--- 关键修复
+
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
                     LOGI("State: Unfreezing %s (foreground).", key.first.c_str());
                     action_executor_->unfreeze(key, app.pids);
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
+                // 进入后台: 清除冻结计时器，启动观察期
+                app.background_since = 0; // <--- 关键修复
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
                     LOGI("State: Observation period started for %s.", key.first.c_str());
                     app.observation_since = now;
-                    app.background_since = 0;
+                } else {
+                    app.observation_since = 0;
                 }
             }
         }
@@ -457,24 +465,19 @@ bool StateManager::tick_state_machine() {
     time_t now = time(nullptr);
 
     for (auto& [key, app] : managed_apps_) {
-        if (!app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING &&
-            app.observation_since == 0 && app.background_since == 0 &&
-            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT))
-        {
-            LOGD("TICK: Found app %s in background without timer. Starting observation.", app.package_name.c_str());
-            app.observation_since = now;
-            changed = true;
-        }
-
+        // [修复] 移除保险检查，因为它现在是多余的，且可能导致逻辑错误
+        
+        // 1. 处理观察期
         if (app.observation_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
-            if (now - app.observation_since >= 10) {
-                LOGI("TICK: Observation period ended for %s. Starting freeze timer.", app.package_name.c_str());
+            if (now - app.observation_since >= 10) { // 10秒观察期结束
+                LOGI("TICK: Observation for %s ended. Starting freeze timer.", app.package_name.c_str());
                 app.observation_since = 0;
                 app.background_since = now;
                 changed = true;
             }
         }
         
+        // 2. 处理冻结倒计时
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) {
@@ -495,6 +498,7 @@ bool StateManager::tick_state_machine() {
     }
     return changed;
 }
+
 
 bool StateManager::perform_deep_scan() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -576,7 +580,8 @@ json StateManager::get_dashboard_payload() {
         app_json["package_name"] = app.package_name;
         app_json["app_name"] = app.app_name;
         app_json["user_id"] = app.user_id;
-        app_json["display_status"] = status_to_string(app);
+        // [修复] 将 master_config 传递给状态字符串函数
+        app_json["display_status"] = status_to_string(app, master_config_);
         app_json["mem_usage_kb"] = app.mem_usage_kb;
         app_json["swap_usage_kb"] = app.swap_usage_kb;
         app_json["cpu_usage_percent"] = app.cpu_usage_percent;

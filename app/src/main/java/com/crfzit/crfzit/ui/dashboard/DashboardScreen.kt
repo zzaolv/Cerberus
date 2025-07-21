@@ -346,16 +346,24 @@ private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
     }
 }
 
-// [REFACTORED] Updated status formatting to reflect the new, simpler state machine.
 private fun formatStatus(state: AppRuntimeState): String {
-    return when (state.displayStatus.uppercase()) {
-        "STOPPED" -> "未运行"
-        "FROZEN" -> "已冻结"
-        "FOREGROUND" -> "前台运行"
-        "PENDING_FREEZE" -> "等待冻结"
-        "EXEMPTED" -> "已豁免"
-        "EXEMPTED_BACKGROUND" -> "后台运行 (已豁免)" // 新增
-        "BACKGROUND" -> "后台运行"
+    val status = state.displayStatus.uppercase()
+    
+    // [修复] 新的状态处理
+    return when {
+        status.startsWith("PENDING_FREEZE") -> {
+            val time = status.substringAfter("(").substringBefore("s")
+            "等待冻结 (${time}s)"
+        }
+        status.startsWith("OBSERVING") -> {
+            val time = status.substringAfter("(").substringBefore("s")
+            "后台观察中 (${time}s)"
+        }
+        status == "STOPPED" -> "未运行"
+        status == "FROZEN" -> "已冻结"
+        status == "FOREGROUND" -> "前台运行"
+        status == "EXEMPTED_BACKGROUND" -> "后台运行 (已豁免)"
+        status == "BACKGROUND" -> "后台运行"
         else -> state.displayStatus
     }
 }
