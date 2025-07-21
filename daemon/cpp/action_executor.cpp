@@ -49,7 +49,7 @@ bool ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& p
         case FreezeMethod::CGROUP_V2:
             physical_freeze_ok = freeze_cgroup(key, pids);
             break;
-        case FreezeMethod::SIGSTOP:
+        case FreezeMethod::METHOD_SIGSTOP: // [修复] 使用新的枚举成员名
             freeze_sigstop(pids);
             physical_freeze_ok = true; // SIGSTOP 总是“成功”
             break;

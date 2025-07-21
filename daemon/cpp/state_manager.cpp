@@ -39,7 +39,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         default_freeze_method_ = FreezeMethod::CGROUP_V2;
         LOGI("Default freeze method set to CGROUP_V2.");
     } else {
-        default_freeze_method_ = FreezeMethod::SIGSTOP;
+        default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
         LOGI("Default freeze method set to SIGSTOP.");
     }
 

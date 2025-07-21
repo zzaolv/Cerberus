@@ -11,7 +11,7 @@ using AppInstanceKey = std::pair<std::string, int>;
 // 从 freezeitVS 借鉴的多模式冻结策略
 enum class FreezeMethod {
     CGROUP_V2,
-    SIGSTOP
+    METHOD_SIGSTOP // [修复] 将 SIGSTOP 重命名为 METHOD_SIGSTOP 以避免宏冲突
 };
 
 class ActionExecutor {
