@@ -7,6 +7,10 @@
 #include <map>
 #include <vector>
 #include <chrono>
+#include <set>
+#include <functional>
+#include <thread>
+#include <atomic>
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -16,7 +20,6 @@ struct GlobalStatsData {
     long swap_free_kb = 0;
 };
 
-// 记录单个进程的CPU时间片，用于计算使用率
 struct CpuTimeSlice {
     long long app_jiffies = 0;
     long long total_jiffies = 0;
@@ -25,20 +28,26 @@ struct CpuTimeSlice {
 class SystemMonitor {
 public:
     SystemMonitor();
+    ~SystemMonitor();
     
-    // 更新全局统计数据 (CPU, Mem)
     void update_global_stats();
     GlobalStatsData get_global_stats() const;
 
-    // 【核心增强】更新一个应用（可能包含多个PID）的资源统计数据
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
     
-    // 【新增】通过PID获取应用的可读名称
     std::string get_app_name_from_pid(int pid);
+
+    // [V6 新增] 主动探测 top-app 核心功能
+    void start_top_app_monitor(std::function<void(const std::set<int>&)> callback);
+    void stop_top_app_monitor();
 
 private:
     void update_cpu_usage();
     void update_mem_info();
+    
+    // [V6 新增] top-app 监控线程
+    void top_app_monitor_thread();
+    std::set<int> read_top_app_pids();
 
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
@@ -51,8 +60,13 @@ private:
     GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
     
-    // 缓存每个PID的CPU时间片，用于计算增量
     std::map<int, CpuTimeSlice> app_cpu_times_;
+
+    // [V6 新增] 监控线程相关
+    std::thread monitor_thread_;
+    std::atomic<bool> monitoring_active_{false};
+    std::function<void(const std::set<int>&)> on_top_app_changed_;
+    std::string top_app_tasks_path_;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H

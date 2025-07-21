@@ -1,371 +1,190 @@
-// app/src/main/java/com/crfzit/crfzit/ui/dashboard/DashboardScreen.kt
-package com.crfzit.crfzit.ui.dashboard
+// app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
+package com.crfzit.crfzit.ui.configuration
 
-import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
-import com.crfzit.crfzit.data.model.AppRuntimeState
-import com.crfzit.crfzit.data.model.GlobalStats
-import com.crfzit.crfzit.data.system.NetworkSpeed
-import com.crfzit.crfzit.ui.icons.AppIcons
-import com.crfzit.crfzit.ui.theme.CRFzitTheme
-import com.google.accompanist.swiperefresh.SwipeRefresh
-import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
-import java.util.*
+import com.crfzit.crfzit.data.model.AppInfo
+import com.crfzit.crfzit.data.model.AppInstanceKey
+import com.crfzit.crfzit.data.model.AppPolicyPayload
+
+// [修复] 将此枚举移至此文件，以解决之前因文件内容错误导致的引用失败
+enum class Policy(val value: Int, val displayName: String) {
+    EXEMPTED(0, "豁免"),
+    STANDARD(2, "智能"),
+    STRICT(3, "严格");
+
+    companion object {
+        fun fromInt(value: Int) = entries.find { it.value == value } ?: EXEMPTED
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DashboardScreen(viewModel: DashboardViewModel) {
-    // ... (Scaffold and TopAppBar code remains the same) ...
+fun ConfigurationScreen(
+    navController: NavController,
+    viewModel: ConfigurationViewModel
+) {
     val uiState by viewModel.uiState.collectAsState()
-    var showMenu by remember { mutableStateOf(false) }
+
+    // 筛选和排序逻辑现在从ViewModel中获取，保持UI的整洁
+    val filteredApps = remember(uiState.searchQuery, uiState.showSystemApps, uiState.policies) {
+        viewModel.getFilteredAndSortedApps()
+    }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("主页") },
-                actions = {
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "更多")
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
-                            onClick = {
-                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
-                                showMenu = false
+        topBar = { TopAppBar(title = { Text("应用配置") }) }
+    ) { padding ->
+        Column(Modifier.padding(padding)) {
+            OutlinedTextField(
+                value = uiState.searchQuery,
+                onValueChange = viewModel::onSearchQueryChanged,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                label = { Text("搜索应用或包名") },
+                leadingIcon = { Icon(Icons.Default.Search, null) },
+                singleLine = true
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .clickable { viewModel.onShowSystemAppsChanged(!uiState.showSystemApps) },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("显示系统应用", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = uiState.showSystemApps,
+                    onCheckedChange = viewModel::onShowSystemAppsChanged
+                )
+            }
+
+            if (uiState.isLoading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
+                        val key = AppInstanceKey(appInfo.packageName, appInfo.userId)
+                        // 从state中获取最新的策略，如果不存在则使用默认值
+                        val policyPayload = uiState.policies[key]
+                            ?: AppPolicyPayload(appInfo.packageName, appInfo.userId, Policy.EXEMPTED.value)
+
+                        AppPolicyItem(
+                            appInfo = appInfo,
+                            policy = Policy.fromInt(policyPayload.policy),
+                            onPolicyChange = { newPolicy ->
+                                viewModel.setAppPolicy(appInfo.packageName, appInfo.userId, newPolicy.value)
                             }
                         )
                     }
                 }
-            )
-        }
-    ) { paddingValues ->
-        Crossfade(
-            targetState = uiState.isConnected,
-            modifier = Modifier.padding(paddingValues),
-            label = "ConnectionState"
-        ) { isConnected ->
-            if (isConnected) {
-                SwipeRefresh(
-                    state = rememberSwipeRefreshState(isRefreshing = uiState.isRefreshing),
-                    onRefresh = { viewModel.refresh() }
-                ) {
-                    DashboardContent(
-                        globalStats = uiState.globalStats,
-                        networkSpeed = uiState.networkSpeed,
-                        apps = uiState.apps
-                    )
-                }
-            } else {
-                ConnectionLoadingIndicator()
             }
         }
     }
 }
 
-
-// ... (DashboardContent, GlobalStatusArea, StatusGridItem, AppRuntimeCard, AppStatusIcons, ConnectionLoadingIndicator, formatMemory, formatSpeed remain the same) ...
-
 @Composable
-fun DashboardContent(
-    globalStats: GlobalStats,
-    networkSpeed: NetworkSpeed,
-    apps: List<UiAppRuntime>
+fun AppPolicyItem(
+    appInfo: AppInfo,
+    policy: Policy,
+    onPolicyChange: (Policy) -> Unit
 ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            GlobalStatusArea(stats = globalStats, speed = networkSpeed)
-        }
-        item {
-            Text(
-                text = "运行状态列表",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
-            )
-        }
-        items(apps, key = { "${it.runtimeState.packageName}-${it.runtimeState.userId}" }) { app ->
-            AppRuntimeCard(app = app)
-        }
-    }
-}
+    var showMenu by remember { mutableStateOf(false) }
+    // 豁免的应用半透明显示，以示区别
+    val itemAlpha = if (policy == Policy.EXEMPTED) 0.7f else 1.0f
 
-@Composable
-fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
-    val memUsedPercent = if (stats.totalMemKb > 0) {
-        (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
-    } else 0f
-    
-    val swapUsedPercent = if (stats.swapTotalKb > 0) {
-        (stats.swapTotalKb - stats.swapFreeKb).toFloat() / stats.swapTotalKb
-    } else 0f
-    
-    val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
-    
-    val downSpeed = formatSpeed(speed.downloadSpeedBps)
-    val upSpeed = formatSpeed(speed.uploadSpeedBps)
-
-    Column(modifier = Modifier.padding(bottom = 8.dp)) {
-        Text(
-            text = "系统状态",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .align(Alignment.CenterHorizontally)
-                .padding(bottom = 12.dp)
-        )
-        
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
-            modifier = Modifier.height(180.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            userScrollEnabled = false
-        ) {
-            item {
-                StatusGridItem(
-                    label = "CPU",
-                    value = "%.1f".format(Locale.US, stats.totalCpuUsagePercent) + "%",
-                    progress = cpuUsedPercent,
-                    icon = AppIcons.Memory
-                )
-            }
-            item {
-                StatusGridItem(
-                    label = "内存 (MEM)",
-                    value = formatMemory(stats.totalMemKb - stats.availMemKb),
-                    progress = memUsedPercent,
-                    icon = AppIcons.SdStorage
-                )
-            }
-            item {
-                 StatusGridItem(
-                    label = "交换 (SWAP)",
-                    value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
-                    progress = swapUsedPercent,
-                    icon = AppIcons.SwapHoriz
-                )
-            }
-            item {
-                StatusGridItem(
-                    label = "网络",
-                    value = "↓${downSpeed.first} | ↑${upSpeed.first}",
-                    subValue = "${downSpeed.second} / ${upSpeed.second}",
-                    icon = AppIcons.Wifi
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun StatusGridItem(
-    label: String,
-    value: String,
-    subValue: String? = null,
-    progress: Float? = null,
-    icon: ImageVector
-) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        shape = MaterialTheme.shapes.large
-    ) {
-        Column(Modifier.padding(12.dp).fillMaxSize()) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(icon, contentDescription = label, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(label, style = MaterialTheme.typography.labelLarge)
-            }
-            Spacer(Modifier.weight(1f))
-            if (subValue != null) {
-                 Text(value, style = MaterialTheme.typography.titleMedium)
-                 Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else {
-                Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-            }
-            if (progress != null) {
-                Spacer(Modifier.height(4.dp))
-                LinearProgressIndicator(
-                    progress = { progress ?: 0f },
-                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape)
-                )
-            }
-        }
-    }
-}
-
-
-@Composable
-fun AppRuntimeCard(app: UiAppRuntime) {
-    val state = app.runtimeState
-    Card {
+    Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
         Row(
-            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+            modifier = Modifier
+                .padding(16.dp)
+                .clickable { showMenu = true },
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
-                        .placeholder(android.R.drawable.sym_def_app_icon)
-                        .error(android.R.drawable.sym_def_app_icon)
+                        .data(appInfo.icon)
+                        .placeholder(R.drawable.ic_launcher_foreground)
+                        .error(R.drawable.ic_launcher_foreground)
                         .crossfade(true).build()
                 ),
-                contentDescription = app.appName,
-                modifier = Modifier.size(48.dp)
+                contentDescription = appInfo.appName,
+                modifier = Modifier.size(40.dp)
             )
-            
-            Column(
-                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
+            Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = app.appName,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    if (app.userId != 0) {
+                    Text(appInfo.appName, fontWeight = FontWeight.Bold)
+                    if (appInfo.userId != 0) {
                         Spacer(Modifier.width(4.dp))
                         Icon(
                             painter = painterResource(id = R.drawable.ic_clone),
-                            contentDescription = "分身应用 (User ${app.userId})",
+                            contentDescription = "分身应用 (User ${appInfo.userId})",
                             modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.secondary
                         )
                     }
-                    Spacer(Modifier.weight(1f))
-                    AppStatusIcons(state = state)
                 }
-                
-                val resourceText = buildAnnotatedString {
-                    append("MEM: ${formatMemory(state.memUsageKb)}")
-                    if (state.swapUsageKb > 1024) {
-                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
-                            append(" (+${formatMemory(state.swapUsageKb)} S)")
-                        }
-                    }
-                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
-                }
+                Text(appInfo.packageName, style = MaterialTheme.typography.bodySmall)
+            }
 
+            Box {
+                val (label, icon) = getPolicyLabelAndIcon(policy)
                 Text(
-                    text = resourceText,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Text(
-                    text = "状态：${formatStatus(state)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
+                    text = "$icon $label",
+                    color = if (policy == Policy.EXEMPTED) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Bold
                 )
+
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false }
+                ) {
+                    // 只提供用户可选的策略
+                    listOf(Policy.EXEMPTED, Policy.STANDARD, Policy.STRICT).forEach { p ->
+                        DropdownMenuItem(
+                            text = {
+                                val (policyLabel, policyIcon) = getPolicyLabelAndIcon(p)
+                                Text("$policyIcon $policyLabel")
+                            },
+                            onClick = {
+                                onPolicyChange(p)
+                                showMenu = false
+                            }
+                        )
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun AppStatusIcons(state: AppRuntimeState) {
-    Row {
-        val iconModifier = Modifier.padding(horizontal = 2.dp)
-        if (state.isForeground) Text("▶️", iconModifier)
-        if (state.isWhitelisted) Text("🛡️", iconModifier)
-        if (state.displayStatus.uppercase() == "FROZEN") {
-            Text("❄️", iconModifier)
-        }
-    }
-}
-
-@Composable
-fun ConnectionLoadingIndicator() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator()
-            Spacer(Modifier.height(16.dp))
-            Text("正在连接到守护进程...")
-        }
-    }
-}
-
-private fun formatMemory(kb: Long): String {
-    if (kb <= 0) return "0 KB"
-    val mb = kb / 1024.0
-    val gb = mb / 1024.0
-    return when {
-        gb >= 1 -> "%.1f GB".format(Locale.US, gb)
-        mb >= 1 -> "%.1f MB".format(Locale.US, mb)
-        else -> "$kb KB"
-    }
-}
-
-private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
-    if (bitsPerSecond < 50000) return Pair("0.0", "Kbps")
-    return when {
-        bitsPerSecond < 1_000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
-        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1_000_000.0), "Mbps")
-    }
-}
-
-
-// [关键适配] 更新状态格式化函数以匹配新的后台状态机
-private fun formatStatus(state: AppRuntimeState): String {
-    return when (state.displayStatus.uppercase()) {
-        "STOPPED" -> "未运行"
-        "FROZEN" -> "已冻结"
-        "FOREGROUND" -> "前台运行"
-        "PENDING_FREEZE" -> "等待冻结"
-        "EXEMPTED" -> "已豁免"
-        "BACKGROUND" -> "后台运行" // 刚切换到后台，还未进入等待队列
-        else -> state.displayStatus // Fallback
-    }
-}
-
-@Preview(showBackground = true)
-@Composable
-fun DashboardPreview() {
-    CRFzitTheme {
-        DashboardContent(
-            globalStats = GlobalStats(),
-            networkSpeed = NetworkSpeed(),
-            apps = emptyList()
-        )
+private fun getPolicyLabelAndIcon(policy: Policy): Pair<String, String> {
+    return when (policy) {
+        Policy.EXEMPTED -> policy.displayName to "🛡️"
+        Policy.STANDARD -> policy.displayName to "⚙️"
+        Policy.STRICT -> policy.displayName to "🧊"
     }
 }

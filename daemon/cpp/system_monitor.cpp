@@ -5,17 +5,109 @@
 #include <android/log.h>
 #include <unistd.h>
 #include <filesystem>
+#include <sys/inotify.h>
 
-#define LOG_TAG "cerberusd_monitor"
+#define LOG_TAG "cerberusd_monitor_v6"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
 SystemMonitor::SystemMonitor() {
+    // 确定 top-app tasks 文件的准确路径
+    if (fs::exists("/dev/cpuset/top-app/tasks")) {
+        top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
+    } else if (fs::exists("/dev/cpuset/top-app/cgroup.procs")) {
+        top_app_tasks_path_ = "/dev/cpuset/top-app/cgroup.procs";
+    } else {
+        LOGE("Could not find top-app tasks file. Active monitoring disabled.");
+    }
     update_global_stats();
 }
 
+SystemMonitor::~SystemMonitor() {
+    stop_top_app_monitor();
+}
+
+void SystemMonitor::start_top_app_monitor(std::function<void(const std::set<int>&)> callback) {
+    if (top_app_tasks_path_.empty()) return;
+
+    on_top_app_changed_ = std::move(callback);
+    monitoring_active_ = true;
+    monitor_thread_ = std::thread(&SystemMonitor::top_app_monitor_thread, this);
+    LOGI("Top-app monitor started for path: %s", top_app_tasks_path_.c_str());
+}
+
+void SystemMonitor::stop_top_app_monitor() {
+    monitoring_active_ = false;
+    if (monitor_thread_.joinable()) {
+        monitor_thread_.join();
+    }
+}
+
+std::set<int> SystemMonitor::read_top_app_pids() {
+    std::set<int> pids;
+    std::ifstream file(top_app_tasks_path_);
+    if (!file.is_open()) return pids;
+    int pid;
+    while (file >> pid) {
+        pids.insert(pid);
+    }
+    return pids;
+}
+
+void SystemMonitor::top_app_monitor_thread() {
+    int fd = inotify_init1(IN_CLOEXEC);
+    if (fd < 0) {
+        LOGE("inotify_init1 failed: %s", strerror(errno));
+        return;
+    }
+
+    int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_MODIFY | IN_OPEN);
+    if (wd < 0) {
+        LOGE("inotify_add_watch for %s failed: %s", top_app_tasks_path_.c_str(), strerror(errno));
+        close(fd);
+        return;
+    }
+
+    // 首次启动时，立即触发一次回调
+    if (on_top_app_changed_) {
+        on_top_app_changed_(read_top_app_pids());
+    }
+
+    char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+
+    while (monitoring_active_) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        struct timeval tv { .tv_sec = 1, .tv_usec = 0 }; // 1秒超时，防止永久阻塞
+
+        int ret = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            LOGE("select on inotify fd failed: %s", strerror(errno));
+            break;
+        }
+        if (ret == 0) continue; // Timeout
+
+        ssize_t len = read(fd, buf, sizeof(buf));
+        if (len <= 0) continue;
+
+        // 我们不需要解析事件内容，只要有事件就重新读取文件
+        if (on_top_app_changed_) {
+            on_top_app_changed_(read_top_app_pids());
+        }
+    }
+
+    inotify_rm_watch(fd, wd);
+    close(fd);
+    LOGI("Top-app monitor stopped.");
+}
+
+
+// --- 其他函数保持不变 ---
 void SystemMonitor::update_global_stats() {
     update_cpu_usage();
     update_mem_info();
@@ -37,7 +129,6 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
         std::string proc_path = "/proc/" + std::to_string(pid);
         if (!fs::exists(proc_path)) continue;
 
-        // 1. 内存获取 (优先smaps_rollup，更准确)
         std::ifstream rollup_file(proc_path + "/smaps_rollup");
         if (rollup_file.is_open()) {
             std::string line;
@@ -51,14 +142,13 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
             }
         }
 
-        // 2. CPU使用率获取
         std::ifstream stat_file(proc_path + "/stat");
         if (stat_file.is_open()) {
             std::string line;
             std::getline(stat_file, line);
             std::stringstream ss(line);
             std::string value;
-            for(int i = 0; i < 13; ++i) ss >> value; // 跳过前面13个字段
+            for(int i = 0; i < 13; ++i) ss >> value;
             long long utime, stime;
             ss >> utime >> stime;
             
@@ -90,11 +180,13 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
         std::string line;
         while (std::getline(status_file, line)) {
             if (line.rfind("Name:", 0) == 0) {
-                return line.substr(line.find(":") + 1);
+                std::string name = line.substr(line.find(":") + 1);
+                // Trim leading whitespace
+                name.erase(0, name.find_first_not_of(" \t"));
+                return name;
             }
         }
     }
-    // Fallback to cmdline
     std::string cmdline_path = "/proc/" + std::to_string(pid) + "/cmdline";
     std::ifstream cmdline_file(cmdline_path);
      if (cmdline_file.is_open()) {

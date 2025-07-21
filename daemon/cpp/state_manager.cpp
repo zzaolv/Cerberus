@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v3_reborn"
+#define LOG_TAG "cerberusd_state_v6_active"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -19,22 +19,28 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// 辅助函数，将内部状态转换为UI可读的字符串
 static std::string status_to_string(const AppRuntimeState& app) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
     if (app.is_foreground) return "FOREGROUND";
     if (app.background_since > 0) return "PENDING_FREEZE";
     if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "EXEMPTED";
-    return "BACKGROUND"; // 运行中但未进入待冻结队列 (例如刚从前台切换)
+    return "BACKGROUND"; 
 }
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
     LOGI("StateManager Initializing...");
     
-    // [关键] 根据 ActionExecutor 的能力决定默认冻结方式
-    // 优先使用cgroup，因为它更现代；若不可用，则回退到SIGSTOP
+    if (fs::exists("/dev/cpuset/top-app/tasks") || fs::exists("/dev/cpuset/top-app/cgroup.procs")) {
+        // [V6] 启动主动监控
+        sys_monitor_->start_top_app_monitor([this](const std::set<int>& top_pids) {
+            this->on_top_app_changed(top_pids);
+        });
+    } else {
+        LOGE("Cannot start active monitor, top-app path not found. Daemon will be passive.");
+    }
+    
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
         default_freeze_method_ = FreezeMethod::CGROUP_V2;
         LOGI("Default freeze method set to CGROUP_V2.");
@@ -389,6 +395,53 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
+}
+
+// [V6 新增] top-app 变化的回调函数，这是新的事件驱动核心
+void StateManager::on_top_app_changed(const std::set<int>& top_pids) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    std::set<AppInstanceKey> current_foreground_apps;
+    
+    for (int pid : top_pids) {
+        auto it = pid_to_app_map_.find(pid);
+        if (it != pid_to_app_map_.end()) {
+            current_foreground_apps.insert({it->second->package_name, it->second->user_id});
+        }
+    }
+    
+    bool changed = false;
+    // 遍历所有受管应用
+    for (auto& [key, app] : managed_apps_) {
+        bool is_now_foreground = current_foreground_apps.count(key);
+
+        if (app.is_foreground != is_now_foreground) {
+            app.is_foreground = is_now_foreground;
+            changed = true;
+            if (is_now_foreground) {
+                // 应用进入前台
+                LOGI("EVENT (Active): App became foreground: %s (user %d)", key.first.c_str(), key.second);
+                if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                    LOGI("Unfreezing %s because it came to foreground.", key.first.c_str());
+                    action_executor_->unfreeze(key, app.pids);
+                    app.current_status = AppRuntimeState::Status::RUNNING;
+                }
+                app.background_since = 0; // 清除计时器
+            } else {
+                // 应用进入后台
+                LOGI("EVENT (Active): App became background: %s (user %d)", key.first.c_str(), key.second);
+                if ((app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) || app.pids.empty()) {
+                    app.background_since = 0;
+                } else {
+                    app.background_since = time(nullptr); // 启动计时器
+                }
+            }
+        }
+    }
+    
+    if (changed) {
+        // 可以在这里触发一次UI更新，但为了避免过于频繁，也可以依赖tick
+    }
 }
 
 // [新增] 处理前台事件
