@@ -1,11 +1,17 @@
 // daemon/cpp/main.cpp
+
+// 核心项目头文件
 #include "main.h"
 #include "uds_server.h"
 #include "state_manager.h"
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
+
+// 第三方库头文件
 #include <nlohmann/json.hpp>
+
+// C++ 标准库与系统库头文件
 #include <android/log.h>
 #include <csignal>
 #include <thread>
@@ -16,31 +22,32 @@
 #include <mutex>
 #include <unistd.h>
 #include <queue>
-#include <condition_variable>
 #include <sys/eventfd.h>
+#include <sys/select.h> // 明确包含 select
 
+// 日志宏定义
 #define LOG_TAG "cerberusd_main_v9_stable"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
+// 命名空间别名
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-
-extern std::atomic<int> g_probe_fd; // `extern` 关键字表示“声明”
-// --- Globals ---
+// --- 全局变量定义 ---
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
 static std::atomic<bool> g_is_running = true;
-static std::atomic<int> g_probe_fd = -1;
 
-// --- Task Queue Implementation ---
+// 在 main.h 中声明为 extern，在此处进行定义
 std::atomic<int> g_probe_fd = -1;
+
+// 任务队列相关全局变量 (仅限 main.cpp 使用)
 static std::queue<Task> g_task_queue;
 static std::mutex g_task_queue_mutex;
-//static int g_event_fd = -1; // Used to wake up the main loop
+static int g_event_fd = -1;
 
 void schedule_task(Task task) {
     {
