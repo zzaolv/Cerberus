@@ -1,6 +1,6 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
-#include "main.h" // 引入 main.h 以便调用 broadcast_dashboard_update
+#include "main.h" // 引入 main.h 以便调用 schedule_task
 #include <android/log.h>
 #include <filesystem>
 #include <fstream>
@@ -12,7 +12,7 @@
 #include <ctime>
 #include <chrono>
 
-#define LOG_TAG "cerberusd_state_v7_perf"
+#define LOG_TAG "cerberusd_state_v9_threadsafe"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,7 +21,6 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// [UI优化] 优化状态字符串，为豁免应用提供更清晰的后台状态
 static std::string status_to_string(const AppRuntimeState& app) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
@@ -36,10 +35,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initializing...");
     
     if (fs::exists("/dev/cpuset/top-app/tasks") || fs::exists("/dev/cpuset/top-app/cgroup.procs")) {
-        // [V6] 启动主动监控
-        sys_monitor_->start_top_app_monitor([this](const std::set<int>& top_pids) {
-            this->on_top_app_changed(top_pids);
-        });
+        // [V9] 启动任务移到主循环
     } else {
         LOGE("Cannot start active monitor, top-app path not found. Daemon will be passive.");
     }
@@ -400,16 +396,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
-// [V8 修复] 重写 on_top_app_changed 以避免死锁
 void StateManager::on_top_app_changed(const std::set<int>& top_pids) {
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_top_app_change_processed_).count() < 250) {
-        return;
-    }
-    last_top_app_change_processed_ = now;
-
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    
     std::set<AppInstanceKey> current_foreground_keys;
     for (int pid : top_pids) {
         auto it = pid_to_app_map_.find(pid);
@@ -427,36 +414,30 @@ void StateManager::on_top_app_changed(const std::set<int>& top_pids) {
             app.is_foreground = is_now_foreground;
 
             if (is_now_foreground) {
-                if (app.background_since > 0) {
-                    LOGI("EVENT: Freeze timer cancelled for %s (came to foreground).", key.first.c_str());
-                }
+                if (app.background_since > 0) LOGI("EVENT: Freeze timer cancelled for %s.", key.first.c_str());
                 app.background_since = 0;
-
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    LOGI("EVENT: Unfreezing %s (came to foreground).", key.first.c_str());
+                    LOGI("EVENT: Unfreezing %s.", key.first.c_str());
                     action_executor_->unfreeze(key, app.pids);
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
                 if (app.current_status == AppRuntimeState::Status::RUNNING && app.config.policy != AppPolicy::EXEMPTED && app.config.policy != AppPolicy::IMPORTANT && !app.pids.empty()) {
-                    LOGI("EVENT: Freeze timer started for %s (went to background).", key.first.c_str());
+                    LOGI("EVENT: Freeze timer started for %s.", key.first.c_str());
                     app.background_since = time(nullptr);
                 }
             }
         }
     }
     
-    // 如果有任何状态变化，请求一次广播
     if (state_has_changed) {
-        g_needs_broadcast = true;
+        schedule_task(RefreshDashboardTask{});
     }
 }
 
 bool StateManager::tick() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    
     bool changed_by_reconcile = reconcile_process_state_full();
-
+    
     sys_monitor_->update_global_stats();
     global_stats_ = sys_monitor_->get_global_stats();
     for (auto& [key, app] : managed_apps_) {
@@ -464,9 +445,6 @@ bool StateManager::tick() {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
         } else if (app.current_status != AppRuntimeState::Status::STOPPED) {
             app.current_status = AppRuntimeState::Status::STOPPED;
-            app.mem_usage_kb = 0;
-            app.swap_usage_kb = 0;
-            app.cpu_usage_percent = 0.0f;
             changed_by_reconcile = true;
         }
     }
@@ -476,14 +454,11 @@ bool StateManager::tick() {
     for (auto& [key, app] : managed_apps_) {
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
             int timeout_sec = 0;
-            switch(app.config.policy) {
-                case AppPolicy::STRICT: timeout_sec = 15; break;
-                case AppPolicy::STANDARD: timeout_sec = 90; break;
-                default: break;
-            }
-
+            if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
+            else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = 90;
+            
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                LOGI("TICK: Timeout reached for %s. Freezing now.", app.package_name.c_str());
+                LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
                     app.current_status = AppRuntimeState::Status::FROZEN;
                     changed_by_tick_logic = true;
@@ -491,23 +466,13 @@ bool StateManager::tick() {
                 app.background_since = 0;
             }
         }
-        else if (app.current_status == AppRuntimeState::Status::FROZEN && (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT)) {
-            LOGI("TICK: Policy for frozen app %s changed to exempt. Unfreezing.", app.package_name.c_str());
-            action_executor_->unfreeze(key, app.pids);
-            app.current_status = AppRuntimeState::Status::RUNNING;
-            changed_by_tick_logic = true;
-        }
     }
     
-    if(changed_by_reconcile || changed_by_tick_logic) {
-        broadcast_dashboard_update();
-    }
-    
-    return false; // 返回false，因为我们已经在这里手动广播了
+    return changed_by_reconcile || changed_by_tick_logic;
 }
 
 bool StateManager::on_config_changed_from_ui(const json& payload) { 
-    std::lock_guard<std::mutex> lock(state_mutex_); 
+    ; 
     
     if (!payload.contains("policies")) {
         LOGW("on_config_changed_from_ui received payload without 'policies' field.");
@@ -547,7 +512,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
 }
 
 json StateManager::get_full_config_for_ui() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    ;
     auto all_db_configs = db_manager_->get_all_app_configs();
     json response;
     response["master_config"] = {{"is_enabled", true}, {"freeze_on_screen_off", true}};
@@ -565,7 +530,7 @@ json StateManager::get_full_config_for_ui() {
 }
 
 json StateManager::get_probe_config_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    ;
     json payload = get_full_config_for_ui();
     json frozen_uids = json::array();
     for (const auto& [key, app] : managed_apps_) {
@@ -578,7 +543,7 @@ json StateManager::get_probe_config_payload() {
 }
 
 json StateManager::get_dashboard_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    ;
     json payload;
     payload["global_stats"] = {
         {"total_cpu_usage_percent", global_stats_.total_cpu_usage_percent},
@@ -733,7 +698,7 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
 }
 
 bool StateManager::on_app_foreground(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    ;
     try {
         std::string pkg = payload.at("package_name").get<std::string>();
         int user_id = payload.value("user_id", 0);
@@ -761,7 +726,7 @@ bool StateManager::on_app_foreground(const json& payload) {
 }
 
 bool StateManager::on_app_background(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    ;
     try {
         std::string pkg = payload.at("package_name").get<std::string>();
         int user_id = payload.value("user_id", 0);

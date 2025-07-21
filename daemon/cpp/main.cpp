@@ -1,5 +1,5 @@
 // daemon/cpp/main.cpp
-#include "main.h" // 引入新的头文件
+#include "main.h"
 #include "uds_server.h"
 #include "state_manager.h"
 #include "system_monitor.h"
@@ -15,8 +15,11 @@
 #include <filesystem>
 #include <mutex>
 #include <unistd.h>
+#include <queue>
+#include <condition_variable>
+#include <sys/eventfd.h>
 
-#define LOG_TAG "cerberusd_main_v8_final"
+#define LOG_TAG "cerberusd_main_v9_stable"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -25,159 +28,184 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// --- Global Variables ---
-std::unique_ptr<UdsServer> g_server;
-std::shared_ptr<StateManager> g_state_manager;
-std::atomic<bool> g_is_running = true;
-std::atomic<int> g_probe_fd = -1;
-std::mutex g_broadcast_mutex;
+// --- Globals ---
+static std::unique_ptr<UdsServer> g_server;
+static std::shared_ptr<StateManager> g_state_manager;
+static std::atomic<bool> g_is_running = true;
+static std::atomic<int> g_probe_fd = -1;
 
-// [V8 修复] 定义全局广播请求标志
-std::atomic<bool> g_needs_broadcast = false;
+// --- Task Queue Implementation ---
+static std::queue<Task> g_task_queue;
+static std::mutex g_task_queue_mutex;
+static int g_event_fd = -1; // Used to wake up the main loop
 
-// --- Message Handler (重构) ---
+void schedule_task(Task task) {
+    {
+        std::lock_guard<std::mutex> lock(g_task_queue_mutex);
+        g_task_queue.push(std::move(task));
+    }
+    // Write to eventfd to wake up the select() in main loop
+    uint64_t val = 1;
+    if (write(g_event_fd, &val, sizeof(val)) < 0) {
+        LOGE("Failed to write to eventfd: %s", strerror(errno));
+    }
+}
+
+// --- UDS Callbacks ---
 void handle_client_message(int client_fd, const std::string& message_str) {
-    LOGD("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        bool config_changed = false;
-
-        if (type == "event.probe_hello") {
-            LOGI("<<<<< PROBE HELLO from fd %d >>>>>", client_fd);
-            g_probe_fd = client_fd;
-            notify_probe_of_config_change();
-            return;
-        } else if (type == "event.app_foreground") {
-            if (g_state_manager) g_state_manager->on_app_foreground(msg.at("payload"));
-        } else if (type == "event.app_background") {
-             if (g_state_manager) g_state_manager->on_app_background(msg.at("payload"));
-        } else if (type == "cmd.set_policy") {
-            if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
-                config_changed = true;
-            }
-            // [V8 修复] 状态变更后，请求广播而不是直接调用
-            g_needs_broadcast = true;
-        } else if (type == "query.get_all_policies") {
+        if (type == "event.probe_hello") schedule_task(ProbeHelloTask{client_fd});
+        else if (type == "event.app_foreground") schedule_task(ProbeFgEventTask{msg.at("payload")});
+        else if (type == "event.app_background") schedule_task(ProbeBgEventTask{msg.at("payload")});
+        else if (type == "cmd.set_policy") schedule_task(ConfigChangeTask{msg.at("payload")});
+        else if (type == "query.refresh_dashboard") schedule_task(RefreshDashboardTask{});
+        else if (type == "query.get_all_policies") {
             if (g_state_manager) {
-                json response_payload = g_state_manager->get_full_config_for_ui();
-                json response_msg = {{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", response_payload}};
-                g_server->send_message(client_fd, response_msg.dump());
+                json payload = g_state_manager->get_full_config_for_ui();
+                g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
             }
-        } else if (type == "query.refresh_dashboard") {
-            // [V8 修复] 请求广播
-            g_needs_broadcast = true;
         }
-
-        if (config_changed) {
-            notify_probe_of_config_change();
-        }
-
     } catch (const json::exception& e) {
-        LOGE("JSON Error: %s. Message: %s", e.what(), message_str.c_str());
+        LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str());
     }
 }
 
-// --- 广播与通知函数 (逻辑不变) ---
+void handle_client_disconnect(int client_fd) {
+    schedule_task(ClientDisconnectTask{client_fd});
+}
+
+// --- Global Functions ---
 void broadcast_dashboard_update() {
-    std::lock_guard<std::mutex> lock(g_broadcast_mutex);
     if (g_server && g_server->has_clients() && g_state_manager) {
         LOGD("Broadcasting dashboard update...");
         json payload = g_state_manager->get_dashboard_payload();
-        json message = {{"type", "stream.dashboard_update"}, {"payload", payload}};
-        g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
+        g_server->broadcast_message_except(json{{"type", "stream.dashboard_update"}, {"payload", payload}}.dump(), g_probe_fd.load());
     }
 }
 
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
-        LOGD("[NOTIFY_PROBE] Sending config update to Probe fd %d.", probe_fd);
+        LOGD("Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
-        json message = {{"type", "stream.probe_config_update"}, {"payload", payload}};
-        g_server->send_message(probe_fd, message.dump());
-    }
-}
-
-void handle_client_disconnect(int client_fd) {
-    LOGI("Client fd %d has disconnected.", client_fd);
-    if (client_fd == g_probe_fd.load()) {
-        LOGW("Probe has disconnected! fd: %d", client_fd);
-        g_probe_fd = -1;
+        g_server->send_message(probe_fd, json{{"type", "stream.probe_config_update"}, {"payload", payload}}.dump());
     }
 }
 
 void signal_handler(int signum) {
-    LOGW("Signal %d received, initiating shutdown...", signum);
+    LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
-    if (g_server) {
-        g_server->stop();
-    }
+    // Write to eventfd to break the main loop immediately
+    uint64_t val = 1;
+    write(g_event_fd, &val, sizeof(val));
 }
 
-// [V8 修复] 重构 worker_thread_func
-void worker_thread_func() {
-    LOGI("Worker thread started.");
-    auto next_tick_time = std::chrono::steady_clock::now();
-
-    while (g_is_running) {
-        // 主循环以100ms的频率运行，保证UI响应
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!g_is_running) break;
-
-        // 消费者：检查是否需要广播
-        if (g_needs_broadcast.exchange(false)) {
-            broadcast_dashboard_update();
-        }
-
-        // 定时器：每3秒执行一次耗时的tick任务
-        if (std::chrono::steady_clock::now() >= next_tick_time) {
-            if (g_state_manager) {
-                if (g_state_manager->tick()) {
-                    LOGD("StateManager tick reported a change, requesting broadcast.");
-                    g_needs_broadcast = true;
-                }
-            }
-            next_tick_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-        }
-    }
-    LOGI("Worker thread finished.");
-}
-
-// --- 主函数入口 (逻辑不变) ---
+// --- Main Loop ---
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    const std::string DATA_DIR = "/data/adb/cerberus";
-    const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-
-    LOGI("Project Cerberus Daemon v3 (Reborn) starting... (PID: %d)", getpid());
-    
-    try {
-        if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
-    } catch (const fs::filesystem_error& e) {
-        LOGE("Failed to create data directory: %s. Exiting.", e.what());
+    g_event_fd = eventfd(0, EFD_CLOEXEC);
+    if (g_event_fd < 0) {
+        LOGE("Failed to create eventfd, exiting.");
         return 1;
     }
+
+    const std::string DATA_DIR = "/data/adb/cerberus";
+    const std::string DB_PATH = DATA_DIR + "/cerberus.db";
+    LOGI("Project Cerberus Daemon v9 (Stable) starting... (PID: %d)", getpid());
+    
+    if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto action_executor = std::make_shared<ActionExecutor>();
     auto sys_monitor = std::make_shared<SystemMonitor>();
     g_state_manager = std::make_shared<StateManager>(db_manager, sys_monitor, action_executor);
     
-    std::thread worker_thread(worker_thread_func);
-    
-    g_server = std::make_unique<UdsServer>("cerberus_socket");
-    g_server->set_message_handler(handle_client_message);
-    g_server->set_disconnect_handler(handle_client_disconnect);
-    g_server->run();
-    
-    g_is_running = false;
-    if (worker_thread.joinable()) worker_thread.join();
-    
+    // Start active monitor
+    sys_monitor->start_top_app_monitor([](const std::set<int>& pids){
+        schedule_task(TopAppChangeTask{pids});
+    });
+
+    std::thread uds_thread([](){
+        g_server = std::make_unique<UdsServer>("cerberus_socket");
+        g_server->set_message_handler(handle_client_message);
+        g_server->set_disconnect_handler(handle_client_disconnect);
+        g_server->run();
+    });
+
+    LOGI("Main event loop started.");
+
+    while (g_is_running) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(g_event_fd, &read_fds);
+        
+        struct timeval tv { .tv_sec = 3, .tv_usec = 0 }; // 3-second timeout for tick
+        int ret = select(g_event_fd + 1, &read_fds, nullptr, nullptr, &tv);
+
+        if (!g_is_running) break;
+
+        if (ret < 0) {
+            if(errno == EINTR) continue;
+            LOGE("select() failed: %s. Exiting.", strerror(errno));
+            break;
+        }
+
+        if (ret == 0) { // Timeout
+            schedule_task(TickTask{});
+        }
+
+        if (FD_ISSET(g_event_fd, &read_fds)) {
+            uint64_t val;
+            read(g_event_fd, &val, sizeof(val)); // Clear the eventfd
+        }
+
+        // Process all tasks in the queue
+        std::queue<Task> tasks_to_process;
+        {
+            std::lock_guard<std::mutex> lock(g_task_queue_mutex);
+            tasks_to_process.swap(g_task_queue);
+        }
+
+        while(!tasks_to_process.empty()) {
+            Task task = tasks_to_process.front();
+            tasks_to_process.pop();
+            
+            std::visit([&](auto&& arg) {
+                using T = std::decay_t<decltype(arg)>;
+                if constexpr (std::is_same_v<T, TickTask>) {
+                    if (g_state_manager->tick()) broadcast_dashboard_update();
+                } else if constexpr (std::is_same_v<T, RefreshDashboardTask>) {
+                    broadcast_dashboard_update();
+                } else if constexpr (std::is_same_v<T, ConfigChangeTask>) {
+                    if(g_state_manager->on_config_changed_from_ui(arg.payload)) {
+                        notify_probe_of_config_change();
+                    }
+                    broadcast_dashboard_update();
+                } else if constexpr (std::is_same_v<T, TopAppChangeTask>) {
+                    g_state_manager->on_top_app_changed(arg.pids);
+                } else if constexpr (std::is_same_v<T, ProbeHelloTask>) {
+                     g_probe_fd = arg.fd;
+                     notify_probe_of_config_change();
+                } else if constexpr (std::is_same_v<T, ClientDisconnectTask>) {
+                    if(arg.fd == g_probe_fd.load()) g_probe_fd = -1;
+                }
+                // (ProbeFgEventTask and ProbeBgEventTask are kept for fallback)
+            }, task);
+        }
+    }
+
+    LOGI("Shutting down...");
+    g_server->stop();
+    if (uds_thread.joinable()) uds_thread.join();
+    sys_monitor->stop_top_app_monitor();
+    close(g_event_fd);
+
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;
 }

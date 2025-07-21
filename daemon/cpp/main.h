@@ -3,14 +3,35 @@
 #define CERBERUS_MAIN_H
 
 #include <atomic>
+#include <nlohmann/json.hpp>
+#include <functional>
+#include <variant>
+#include <string>
 
-// 声明全局可用的广播函数
+// [V9] 定义任务类型
+struct ConfigChangeTask { nlohmann::json payload; };
+struct TopAppChangeTask { std::set<int> pids; };
+struct TickTask {};
+struct RefreshDashboardTask {};
+struct ProbeHelloTask { int fd; };
+struct ClientDisconnectTask { int fd; };
+struct ProbeFgEventTask { nlohmann::json payload; };
+struct ProbeBgEventTask { nlohmann::json payload; };
+
+using Task = std::variant<
+    ConfigChangeTask,
+    TopAppChangeTask,
+    TickTask,
+    RefreshDashboardTask,
+    ProbeHelloTask,
+    ClientDisconnectTask,
+    ProbeFgEventTask,
+    ProbeBgEventTask
+>;
+
+// 全局函数声明
 void broadcast_dashboard_update();
-
-// [修复] 将 notify_probe_of_config_change 的声明也加入头文件
 void notify_probe_of_config_change();
-
-// 声明全局广播请求标志
-extern std::atomic<bool> g_needs_broadcast;
+void schedule_task(Task task);
 
 #endif //CERBERUS_MAIN_H
