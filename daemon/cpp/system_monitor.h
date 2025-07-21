@@ -39,8 +39,7 @@ public:
 
     void start_top_app_monitor();
     void stop_top_app_monitor();
-    // [V7-Hotfix 2] get_current_top_pids 被 read_top_app_pids 替代
-    std::set<int> read_top_app_pids();
+    std::set<int> get_current_top_pids();
 
 private:
     void update_cpu_usage();
@@ -58,6 +57,10 @@ private:
     GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
+
+    // [修复] 恢复这些必要的成员变量
+    std::set<int> current_top_pids_;
+    std::mutex top_pids_mutex_;
 
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};

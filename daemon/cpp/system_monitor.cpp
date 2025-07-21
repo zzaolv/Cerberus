@@ -8,7 +8,8 @@
 #include <sys/inotify.h>
 #include <sys/select.h>
 #include <sys/time.h>
-#include <climits> // For NAME_MAX
+#include <fcntl.h>      // [修复] 添加缺失的头文件
+#include <climits>      // For NAME_MAX
 
 #define LOG_TAG "cerberusd_monitor_v7_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -53,6 +54,7 @@ void SystemMonitor::stop_top_app_monitor() {
     }
 }
 
+// [修复] 恢复 get_current_top_pids 的实现
 std::set<int> SystemMonitor::get_current_top_pids() {
     std::lock_guard<std::mutex> lock(top_pids_mutex_);
     return current_top_pids_;
@@ -63,7 +65,7 @@ void SystemMonitor::top_app_monitor_thread() {
     if (fd < 0) { LOGE("inotify_init1 failed: %s", strerror(errno)); return; }
     
     int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_CLOSE_WRITE | IN_OPEN | IN_MODIFY);
-    if (wd < 0) { LOGE("inotify_add_watch failed for %s: %s", top_app_tasks_path_.c_str(), strerror(errno)); close(fd); return; }
+    if (wd < 0) { LOGE("inotify_add_watch failed for %s: %s", strerror(errno), top_app_tasks_path_.c_str()); close(fd); return; }
 
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
@@ -78,6 +80,7 @@ void SystemMonitor::top_app_monitor_thread() {
         }
 
         {
+            // [修复] 更新正确的成员变量
             std::lock_guard<std::mutex> lock(top_pids_mutex_);
             std::ifstream file(top_app_tasks_path_);
             int pid;
@@ -85,11 +88,11 @@ void SystemMonitor::top_app_monitor_thread() {
             while (file >> pid) {
                 current_top_pids_.insert(pid);
             }
+            LOGD("Top-app list updated, %zu pids.", current_top_pids_.size());
         }
         has_new_top_app_event = true; 
 
-        // [V7-Final CPU Fix] 物理节流阀: 处理完一次事件后，强制休眠250毫秒
-        // 这将把事件风暴的频率降低到最多每秒4次。
+        // 物理节流阀
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     inotify_rm_watch(fd, wd);
