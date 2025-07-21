@@ -163,36 +163,6 @@ bool SystemMonitor::is_uid_playing_audio(int uid) {
 }
 
 
-std::vector<int> get_pids_from_snd_device(const std::string& device_name) {
-    std::vector<int> pids;
-    std::string full_device_path = "/dev/snd/" + device_name;
-    try {
-        for (const auto& dir_entry : fs::directory_iterator("/proc")) {
-            if (!dir_entry.is_directory()) continue;
-            
-            int pid = 0;
-            try { pid = std::stoi(dir_entry.path().filename().string()); } catch(...) { continue; }
-            if (pid == 0) continue;
-
-            std::string fd_path = dir_entry.path().string() + "/fd";
-            if (!fs::exists(fd_path)) continue;
-
-            for (const auto& fd_entry : fs::directory_iterator(fd_path)) {
-                if (fs::is_symlink(fd_entry.symlink_status())) {
-                    try {
-                        if (fs::read_symlink(fd_entry.path()) == full_device_path) {
-                            pids.push_back(pid);
-                        }
-                    } catch (...) { continue; }
-                }
-            }
-        }
-    } catch(const fs::filesystem_error& e) {
-        LOGW("Filesystem error while scanning for audio PIDs: %s", e.what());
-    }
-    return pids;
-}
-
 void SystemMonitor::audio_monitor_thread() {
     int fd = inotify_init1(IN_CLOEXEC);
     if (fd < 0) { LOGE("Audio inotify_init1 failed: %s", strerror(errno)); return; }
