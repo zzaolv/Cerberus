@@ -162,13 +162,6 @@ bool SystemMonitor::is_uid_playing_audio(int uid) {
     return uids_playing_audio_.count(uid) > 0;
 }
 
-int get_uid_from_pid(int pid) {
-    char path_buffer[64];
-    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
-    struct stat st;
-    if (stat(path_buffer, &st) != 0) return -1;
-    return st.st_uid;
-}
 
 std::vector<int> get_pids_from_snd_device(const std::string& device_name) {
     std::vector<int> pids;
