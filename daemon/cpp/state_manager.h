@@ -51,6 +51,7 @@ public:
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
+    void update_master_config(const MasterConfig& config);
 
 private:
     bool reconcile_process_state_full(); 
@@ -76,6 +77,7 @@ private:
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
+    MasterConfig master_config_;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H

@@ -3,7 +3,7 @@
 #include <android/log.h>
 #include <filesystem>
 
-#define LOG_TAG "cerberusd_db"
+#define LOG_TAG "cerberusd_db_v8"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -15,13 +15,12 @@ DatabaseManager::DatabaseManager(const std::string& db_path)
 
 void DatabaseManager::initialize_database() {
     try {
-        if (!db_.tableExists("app_policies_v3")) { // 使用新版本表名
+        if (!db_.tableExists("app_policies_v3")) {
             LOGI("Table 'app_policies_v3' does not exist. Creating it.");
             if (db_.tableExists("app_policies_v2")) {
                  LOGI("Old 'app_policies_v2' table found. Dropping it.");
                  db_.exec("DROP TABLE app_policies_v2;");
             }
-            // [关键修改] 将 policy 的 DEFAULT 值从 2 (智能) 修改为 0 (豁免)
             db_.exec(R"(
                 CREATE TABLE app_policies_v3 (
                     package_name TEXT NOT NULL,
@@ -31,8 +30,47 @@ void DatabaseManager::initialize_database() {
                 )
             )");
         }
+
+        if (!db_.tableExists("master_config_v1")) {
+            LOGI("Table 'master_config_v1' does not exist. Creating it.");
+            db_.exec(R"(
+                CREATE TABLE master_config_v1 (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+            )");
+            db_.exec("INSERT OR IGNORE INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', 90)");
+        }
     } catch (const std::exception& e) {
         LOGE("Database initialization failed: %s", e.what());
+    }
+}
+
+std::optional<MasterConfig> DatabaseManager::get_master_config() {
+    try {
+        MasterConfig config;
+        SQLite::Statement query(db_, "SELECT value FROM master_config_v1 WHERE key = 'standard_timeout_sec'");
+        if (query.executeStep()) {
+            config.standard_timeout_sec = query.getColumn(0).getInt();
+            return config;
+        }
+    } catch (const std::exception& e) {
+        LOGE("Failed to get master config: %s", e.what());
+    }
+    return std::nullopt;
+}
+
+bool DatabaseManager::set_master_config(const MasterConfig& config) {
+    try {
+        SQLite::Statement query(db_, R"(
+            INSERT INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        )");
+        query.bind(1, config.standard_timeout_sec);
+        return query.exec() > 0;
+    } catch (const std::exception& e) {
+        LOGE("Failed to set master config: %s", e.what());
+        return false;
     }
 }
 

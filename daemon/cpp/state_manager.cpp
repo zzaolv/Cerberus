@@ -24,9 +24,15 @@ static std::string status_to_string(const AppRuntimeState& app) {
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
     if (app.is_foreground) return "FOREGROUND";
     if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "EXEMPTED_BACKGROUND";
-    if (app.background_since > 0) return "PENDING_FREEZE";
-    // 当处于观察期时，为了UI简洁，依然显示为“后台运行”
-    if (app.observation_since > 0) return "BACKGROUND";
+    if (app.background_since > 0) {
+        time_t now = time(nullptr);
+        // This is a temporary calculation for display, actual timeout is in tick_state_machine
+        int timeout_sec = (app.config.policy == AppPolicy::STRICT) ? 15 : 90;
+        int remaining = timeout_sec - (now - app.background_since);
+        if (remaining < 0) remaining = 0;
+        return "PENDING_FREEZE (" + std::to_string(remaining) + "s)";
+    }
+    if (app.observation_since > 0) return "OBSERVING";
     return "BACKGROUND";
 }
 
@@ -41,6 +47,9 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
         LOGI("Default freeze method set to SIGSTOP.");
     }
+    
+    master_config_ = db_manager_->get_master_config().value_or(MasterConfig{});
+    LOGI("Loaded master config: standard_timeout=%ds", master_config_.standard_timeout_sec);
 
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -384,9 +393,17 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+   
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
+}
+
+void StateManager::update_master_config(const MasterConfig& config) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    master_config_ = config;
+    db_manager_->set_master_config(config);
+    LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
 }
 
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
@@ -414,7 +431,6 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
             if (is_now_foreground) {
-                // 进入前台，清除所有计时器
                 if (app.background_since > 0 || app.observation_since > 0) LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
                 app.background_since = 0;
                 app.observation_since = 0;
@@ -424,11 +440,10 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
-                // 进入后台，启动观察期
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
                     LOGI("State: Observation period started for %s.", key.first.c_str());
                     app.observation_since = now;
-                    app.background_since = 0; // 确保冻结计时器是关闭的
+                    app.background_since = 0;
                 }
             }
         }
@@ -442,21 +457,31 @@ bool StateManager::tick_state_machine() {
     time_t now = time(nullptr);
 
     for (auto& [key, app] : managed_apps_) {
-        // 1. 处理观察期
+        if (!app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING &&
+            app.observation_since == 0 && app.background_since == 0 &&
+            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT))
+        {
+            LOGD("TICK: Found app %s in background without timer. Starting observation.", app.package_name.c_str());
+            app.observation_since = now;
+            changed = true;
+        }
+
         if (app.observation_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
-            if (now - app.observation_since >= 10) { // 10秒观察期结束
+            if (now - app.observation_since >= 10) {
                 LOGI("TICK: Observation period ended for %s. Starting freeze timer.", app.package_name.c_str());
                 app.observation_since = 0;
-                app.background_since = now; // 立即启动冻结倒计时
+                app.background_since = now;
                 changed = true;
             }
         }
         
-        // 2. 处理冻结倒计时
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
             int timeout_sec = 0;
-            if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
-            else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = 90;
+            if(app.config.policy == AppPolicy::STRICT) {
+                timeout_sec = 15;
+            } else if(app.config.policy == AppPolicy::STANDARD) {
+                timeout_sec = master_config_.standard_timeout_sec;
+            }
             
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
@@ -714,7 +739,9 @@ void StateManager::remove_pid_from_app(int pid) {
     if (app) {
         auto& pids = app->pids;
         pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-        // The decision to set the app to STOPPED is now handled by the tick/deep_scan grace period logic
+        if (pids.empty()) {
+            // Keep the state, let the deep scan handle it after grace period
+        }
     }
 }
 

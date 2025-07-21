@@ -88,4 +88,9 @@ class DaemonRepository(
 
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
+
+    fun setMasterConfig(payload: Map<String, Any>) {
+        val message = CerberusMessage(type = "cmd.set_master_config", payload = payload)
+        udsClient.sendMessage(gson.toJson(message))
+    }
 }

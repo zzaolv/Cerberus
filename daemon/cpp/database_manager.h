@@ -26,10 +26,20 @@ struct AppConfig {
     // [简化] 移除 force_playback_exempt 等选项，这些高级豁免逻辑应由Probe判断
 };
 
+// [新] 全局配置结构体
+struct MasterConfig {
+    int standard_timeout_sec = 90; // 智能模式默认超时90秒
+};
+
+
 class DatabaseManager {
 public:
     explicit DatabaseManager(const std::string& db_path);
 
+    // [新] MasterConfig的读写接口
+    std::optional<MasterConfig> get_master_config();
+    bool set_master_config(const MasterConfig& config);
+    
     std::optional<AppConfig> get_app_config(const std::string& package_name, int user_id);
     bool set_app_config(const AppConfig& config);
     bool clear_all_policies();

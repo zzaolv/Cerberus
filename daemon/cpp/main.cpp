@@ -44,6 +44,12 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 notify_probe_of_config_change();
             }
             g_top_app_refresh_tickets = 1; 
+        } else if (type == "cmd.set_master_config") {
+            if (g_state_manager) {
+                MasterConfig cfg;
+                cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+                g_state_manager->update_master_config(cfg);
+            }
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
@@ -90,7 +96,7 @@ void signal_handler(int signum) {
 }
 
 void worker_thread_func() {
-    LOGI("Worker thread started with smart observation model.");
+    LOGI("Worker thread started with final model.");
     g_top_app_refresh_tickets = 2; 
     
     int deep_scan_countdown = 10;
@@ -133,7 +139,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v7 (Final Fix 4) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v7 (Final Fix 3) starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);

@@ -71,7 +71,10 @@ fun MainScreen() {
                 ConfigurationScreen(navController = navController, viewModel = configViewModel)
             }
             composable(Screen.Logs.route) { LogsScreen() }
-            composable(Screen.Settings.route) { SettingsScreen() }
+            composable(Screen.Settings.route) { 
+                val settingsViewModel: SettingsViewModel = viewModel()
+                SettingsScreen(viewModel = settingsViewModel)
+             }
             // composable(Screen.ProfileManagement.route) { ... } // 未来实现
         }
     }
