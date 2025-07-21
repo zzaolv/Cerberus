@@ -1,6 +1,5 @@
 // daemon/cpp/uds_server.cpp
 #include "uds_server.h"
-#include "main.h" // [修复] 添加此头文件以访问 g_probe_fd
 #include <android/log.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -13,13 +12,11 @@
 #include <sys/select.h>
 #include <thread>
 
-#define LOG_TAG "cerberusd_uds_v11.1" 
+#define LOG_TAG "cerberusd_uds_v7_hotfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// [修复] 移除此处不再需要的前向声明
-// extern std::atomic<int> g_probe_fd;
 
 UdsServer::UdsServer(const std::string& socket_name)
     : socket_name_(socket_name), server_fd_(-1), is_running_(false) {}
@@ -32,6 +29,10 @@ void UdsServer::set_message_handler(std::function<void(int, const std::string&)>
     on_message_received_ = std::move(handler);
 }
 
+void UdsServer::set_disconnect_handler(std::function<void(int)> handler) {
+    on_disconnect_ = std::move(handler);
+}
+
 bool UdsServer::has_clients() const {
     std::lock_guard<std::mutex> lock(client_mutex_);
     return !client_fds_.empty();
@@ -42,20 +43,6 @@ void UdsServer::add_client(int client_fd) {
     client_fds_.push_back(client_fd);
     client_buffers_[client_fd] = "";
     LOGI("Client connected, fd: %d. Total clients: %zu", client_fd, client_fds_.size());
-
-    // [修复] 此处的 g_probe_fd 现在是合法的
-    std::thread([client_fd]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        // Probe连接很快，250ms后如果g_probe_fd还是-1或者不等于当前fd，说明是UI
-        if (client_fd != g_probe_fd.load()) {
-            LOGI("New UI client (fd: %d) connected, scheduling initial dashboard broadcast.", client_fd);
-            schedule_task(RefreshDashboardTask{});
-        }
-    }).detach();
-}
-
-void UdsServer::set_disconnect_handler(std::function<void(int)> handler) {
-    on_disconnect_ = std::move(handler);
 }
 
 void UdsServer::remove_client(int client_fd) {
@@ -90,7 +77,6 @@ bool UdsServer::send_message(int client_fd, const std::string& message) {
     if (bytes_sent < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
             LOGW("Send to fd %d failed (connection closed), removing client.", client_fd);
-            // This call is now safe because remove_client handles the lock
             remove_client(client_fd);
         } else {
             LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
@@ -240,6 +226,5 @@ void UdsServer::run() {
             }
         }
     }
-
     LOGI("Server event loop terminated.");
 }
