@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v7_final3"
+#define LOG_TAG "cerberusd_main_v7_final4"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -90,23 +90,31 @@ void signal_handler(int signum) {
 }
 
 void worker_thread_func() {
-    LOGI("Worker thread started with metronome model.");
+    LOGI("Worker thread started with smart observation model.");
     g_top_app_refresh_tickets = 2; 
     
+    int deep_scan_countdown = 10;
+
     while (g_is_running) {
         bool needs_broadcast = false;
         
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
-            // [修复] 调用正确的函数名 read_top_app_pids
             auto top_pids = g_sys_monitor->read_top_app_pids();
             if (g_state_manager->update_foreground_state(top_pids)) {
                 needs_broadcast = true;
             }
         }
 
-        if (g_state_manager->tick()) {
+        if (g_state_manager->tick_state_machine()) {
             needs_broadcast = true;
+        }
+
+        if (--deep_scan_countdown <= 0) {
+            if (g_state_manager->perform_deep_scan()) {
+                needs_broadcast = true;
+            }
+            deep_scan_countdown = 10;
         }
 
         if (needs_broadcast) {
@@ -125,7 +133,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v7 (Final Fix 2) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v7 (Final Fix 4) starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);

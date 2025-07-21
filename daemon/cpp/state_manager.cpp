@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v7_hotfix2"
+#define LOG_TAG "cerberusd_state_v7_final4"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -25,6 +25,8 @@ static std::string status_to_string(const AppRuntimeState& app) {
     if (app.is_foreground) return "FOREGROUND";
     if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "EXEMPTED_BACKGROUND";
     if (app.background_since > 0) return "PENDING_FREEZE";
+    // 当处于观察期时，为了UI简洁，依然显示为“后台运行”
+    if (app.observation_since > 0) return "BACKGROUND";
     return "BACKGROUND";
 }
 
@@ -405,23 +407,28 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     }
     
     bool state_has_changed = false;
+    time_t now = time(nullptr);
     for (auto& [key, app] : managed_apps_) {
         bool is_now_foreground = current_foreground_keys.count(key);
         if (app.is_foreground != is_now_foreground) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
             if (is_now_foreground) {
-                if (app.background_since > 0) LOGI("State: Freeze timer cancelled for %s (user %d).", key.first.c_str(), key.second);
+                // 进入前台，清除所有计时器
+                if (app.background_since > 0 || app.observation_since > 0) LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
                 app.background_since = 0;
+                app.observation_since = 0;
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    LOGI("State: Unfreezing %s (user %d).", key.first.c_str(), key.second);
+                    LOGI("State: Unfreezing %s (foreground).", key.first.c_str());
                     action_executor_->unfreeze(key, app.pids);
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
+                // 进入后台，启动观察期
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
-                    LOGI("State: Freeze timer started for %s (user %d).", key.first.c_str(), key.second);
-                    app.background_since = time(nullptr);
+                    LOGI("State: Observation period started for %s.", key.first.c_str());
+                    app.observation_since = now;
+                    app.background_since = 0; // 确保冻结计时器是关闭的
                 }
             }
         }
@@ -429,36 +436,30 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     return state_has_changed;
 }
 
-bool StateManager::tick() {
+bool StateManager::tick_state_machine() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    bool changed = reconcile_process_state_full();
-    
-    sys_monitor_->update_global_stats();
-    global_stats_ = sys_monitor_->get_global_stats();
-    for (auto& [key, app] : managed_apps_) {
-        if (!app.pids.empty()) {
-            sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
-        } else if (app.current_status != AppRuntimeState::Status::STOPPED) {
-            app.current_status = AppRuntimeState::Status::STOPPED;
-            app.is_foreground = false;
-            app.background_since = 0;
-            app.mem_usage_kb = 0;
-            app.swap_usage_kb = 0;
-            app.cpu_usage_percent = 0.0f;
-            changed = true;
-        }
-    }
-    
+    bool changed = false;
     time_t now = time(nullptr);
+
     for (auto& [key, app] : managed_apps_) {
+        // 1. 处理观察期
+        if (app.observation_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
+            if (now - app.observation_since >= 10) { // 10秒观察期结束
+                LOGI("TICK: Observation period ended for %s. Starting freeze timer.", app.package_name.c_str());
+                app.observation_since = 0;
+                app.background_since = now; // 立即启动冻结倒计时
+                changed = true;
+            }
+        }
+        
+        // 2. 处理冻结倒计时
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
             else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = 90;
             
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                LOGI("TICK: Timeout for %s (user %d). Freezing.", app.package_name.c_str(), app.user_id);
+                LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
                     app.current_status = AppRuntimeState::Status::FROZEN;
                     changed = true;
@@ -467,7 +468,40 @@ bool StateManager::tick() {
             }
         }
     }
+    return changed;
+}
+
+bool StateManager::perform_deep_scan() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     
+    LOGD("Performing deep scan...");
+    bool changed = reconcile_process_state_full();
+    
+    sys_monitor_->update_global_stats();
+    global_stats_ = sys_monitor_->get_global_stats();
+    
+    time_t now = time(nullptr);
+    for (auto& [key, app] : managed_apps_) {
+        if (!app.pids.empty()) {
+            app.undetected_since = 0;
+            sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
+        } else if (app.current_status != AppRuntimeState::Status::STOPPED) {
+            if (app.undetected_since == 0) {
+                app.undetected_since = now;
+            } else if (now - app.undetected_since >= 3) {
+                LOGD("App %s confirmed stopped after grace period.", app.package_name.c_str());
+                app.current_status = AppRuntimeState::Status::STOPPED;
+                app.is_foreground = false;
+                app.background_since = 0;
+                app.observation_since = 0;
+                app.mem_usage_kb = 0;
+                app.swap_usage_kb = 0;
+                app.cpu_usage_percent = 0.0f;
+                app.undetected_since = 0;
+                changed = true;
+            }
+        }
+    }
     return changed;
 }
 
@@ -513,9 +547,6 @@ json StateManager::get_dashboard_payload() {
     };
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
-        // Show all apps that are either not stopped, or have a config.
-        if (app.current_status == AppRuntimeState::Status::STOPPED && app.config.policy == AppPolicy::EXEMPTED) continue;
-        
         json app_json;
         app_json["package_name"] = app.package_name;
         app_json["app_name"] = app.app_name;
@@ -609,28 +640,10 @@ void StateManager::load_all_configs() {
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
     uid = -1; user_id = -1;
-    
+
     char path_buffer[64];
-    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/stat", pid);
-    
-    std::ifstream stat_file(path_buffer);
-    if(!stat_file.is_open()) return "";
-
-    // Faster parsing of /proc/[pid]/stat
-    std::string comm, state;
-    int ppid, pgrp, session, tty_nr, tpgid;
-    unsigned int flags;
-    // We only need the first few fields to get comm
-    stat_file >> ppid >> comm >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid >> flags;
-    
-    // Filter out kernel threads (comm usually in brackets)
-    if (comm.front() == '(' && comm.back() == ')') {
-        comm = comm.substr(1, comm.size() - 2);
-    }
-    if(comm.find('.') == std::string::npos) return "";
-
-
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+
     struct stat st;
     if (stat(path_buffer, &st) != 0) return "";
     uid = st.st_uid;
@@ -640,13 +653,20 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
     std::ifstream cmdline_file(path_buffer);
-    if (!cmdline_file.is_open()) return comm; // Fallback to comm if cmdline unreadable
+    if (!cmdline_file.is_open()) return "";
     
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0');
-    if (cmdline.empty() || cmdline.find(':') != std::string::npos) {
-        return comm; // Often, comm is more reliable than a complex cmdline
+
+    if (cmdline.empty() || cmdline.find('.') == std::string::npos) {
+        return "";
     }
+
+    size_t colon_pos = cmdline.find(':');
+    if (colon_pos != std::string::npos) {
+        return cmdline.substr(0, colon_pos);
+    }
+    
     return cmdline;
 }
 
@@ -694,14 +714,7 @@ void StateManager::remove_pid_from_app(int pid) {
     if (app) {
         auto& pids = app->pids;
         pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
-        if (pids.empty()) {
-            app->current_status = AppRuntimeState::Status::STOPPED;
-            app->mem_usage_kb = 0;
-            app->swap_usage_kb = 0;
-            app->cpu_usage_percent = 0.0f;
-            app->is_foreground = false;
-            app->background_since = 0;
-        }
+        // The decision to set the app to STOPPED is now handled by the tick/deep_scan grace period logic
     }
 }
 

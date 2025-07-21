@@ -1,7 +1,6 @@
 // daemon/cpp/state_manager.h
 #ifndef CERBERUS_STATE_MANAGER_H
 #define CERBERUS_STATE_MANAGER_H
-
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -15,24 +14,21 @@
 #include "action_executor.h"
 
 using json = nlohmann::json;
-
 struct AppRuntimeState {
-    enum class Status { 
-        STOPPED,
-        RUNNING,
-        FROZEN
-    } current_status = Status::STOPPED;
-
-    std::string package_name;
+    enum class Status { STOPPED, RUNNING, FROZEN } current_status = Status::STOPPED;
+    std.string package_name;
     std::string app_name;
     int uid = -1;
     int user_id = 0;
     std::vector<int> pids; 
     AppConfig config;
-    
     bool is_foreground = false;
-    time_t background_since = 0;
+    
+    // [V7-Final-Fix 4] 引入新的时间戳
+    time_t background_since = 0;       // 正式冻结倒计时开始时间
+    time_t observation_since = 0;      // 后台观察期开始时间
 
+    time_t undetected_since = 0;
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
@@ -41,7 +37,9 @@ struct AppRuntimeState {
 class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>);
-    bool tick();
+    
+    bool tick_state_machine(); // 重命名
+    bool perform_deep_scan();
     bool update_foreground_state(const std::set<int>& top_pids);
     bool on_config_changed_from_ui(const json& payload);
     json get_dashboard_payload();
@@ -54,21 +52,13 @@ private:
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
     void add_pid_to_app(int pid, const std::string&, int user_id, int uid);
     void remove_pid_from_app(int pid);
-    
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
 
-    // [修复] 将这些被意外删除的成员变量声明加回来
-    std::shared_ptr<DatabaseManager> db_manager_;
-    std::shared_ptr<SystemMonitor> sys_monitor_;
-    std::shared_ptr<ActionExecutor> action_executor_;
-
     std::mutex state_mutex_;
     std::set<int> last_known_top_pids_;
-    
     GlobalStatsData global_stats_;
     FreezeMethod default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
-    
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
