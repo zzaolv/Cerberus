@@ -28,6 +28,8 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+
+extern std::atomic<int> g_probe_fd; // `extern` 关键字表示“声明”
 // --- Globals ---
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -35,9 +37,10 @@ static std::atomic<bool> g_is_running = true;
 static std::atomic<int> g_probe_fd = -1;
 
 // --- Task Queue Implementation ---
+std::atomic<int> g_probe_fd = -1;
 static std::queue<Task> g_task_queue;
 static std::mutex g_task_queue_mutex;
-static int g_event_fd = -1; // Used to wake up the main loop
+//static int g_event_fd = -1; // Used to wake up the main loop
 
 void schedule_task(Task task) {
     {

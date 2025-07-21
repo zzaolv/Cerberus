@@ -7,7 +7,7 @@
 #include <functional>
 #include <variant>
 #include <string>
-#include <set> // [修复] 添加 <set> 头文件
+#include <set>
 
 // [V9] 定义任务类型
 struct ConfigChangeTask { nlohmann::json payload; };
@@ -34,5 +34,8 @@ using Task = std::variant<
 void broadcast_dashboard_update();
 void notify_probe_of_config_change();
 void schedule_task(Task task);
+
+// [修复] 声明全局 probe fd
+extern std::atomic<int> g_probe_fd;
 
 #endif //CERBERUS_MAIN_H
