@@ -24,7 +24,8 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
-extern std::atomic<bool> has_new_top_app_event;
+// [V7-Final-Fix 2] 引入节拍器计数器
+extern std::atomic<int> g_top_app_refresh_tickets;
 
 class SystemMonitor {
 public:
@@ -39,7 +40,7 @@ public:
 
     void start_top_app_monitor();
     void stop_top_app_monitor();
-    std::set<int> get_current_top_pids();
+    std::set<int> read_top_app_pids();
 
 private:
     void update_cpu_usage();
@@ -57,10 +58,6 @@ private:
     GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
-
-    // [修复] 恢复这些必要的成员变量
-    std::set<int> current_top_pids_;
-    std::mutex top_pids_mutex_;
 
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};

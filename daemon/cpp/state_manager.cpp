@@ -389,7 +389,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
 
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-
     if (top_pids == last_known_top_pids_) {
         return false;
     }
@@ -408,11 +407,9 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     bool state_has_changed = false;
     for (auto& [key, app] : managed_apps_) {
         bool is_now_foreground = current_foreground_keys.count(key);
-
         if (app.is_foreground != is_now_foreground) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
-
             if (is_now_foreground) {
                 if (app.background_since > 0) LOGI("State: Freeze timer cancelled for %s (user %d).", key.first.c_str(), key.second);
                 app.background_since = 0;
@@ -612,18 +609,43 @@ void StateManager::load_all_configs() {
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
     uid = -1; user_id = -1;
+    
+    char path_buffer[64];
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/stat", pid);
+    
+    std::ifstream stat_file(path_buffer);
+    if(!stat_file.is_open()) return "";
+
+    // Faster parsing of /proc/[pid]/stat
+    std::string comm, state;
+    int ppid, pgrp, session, tty_nr, tpgid;
+    unsigned int flags;
+    // We only need the first few fields to get comm
+    stat_file >> ppid >> comm >> state >> ppid >> pgrp >> session >> tty_nr >> tpgid >> flags;
+    
+    // Filter out kernel threads (comm usually in brackets)
+    if (comm.front() == '(' && comm.back() == ')') {
+        comm = comm.substr(1, comm.size() - 2);
+    }
+    if(comm.find('.') == std::string::npos) return "";
+
+
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
     struct stat st;
-    std::string proc_path = "/proc/" + std::to_string(pid);
-    if (stat(proc_path.c_str(), &st) != 0) return "";
+    if (stat(path_buffer, &st) != 0) return "";
     uid = st.st_uid;
+
     if (uid < 10000) return "";
     user_id = uid / PER_USER_RANGE;
-    std::ifstream cmdline_file(proc_path + "/cmdline");
-    if (!cmdline_file.is_open()) return "";
+    
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
+    std::ifstream cmdline_file(path_buffer);
+    if (!cmdline_file.is_open()) return comm; // Fallback to comm if cmdline unreadable
+    
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0');
-    if (cmdline.empty() || cmdline.find(':') != std::string::npos || cmdline.find('.') == std::string::npos || cmdline == "zygote" || cmdline == "zygote64") {
-        return "";
+    if (cmdline.empty() || cmdline.find(':') != std::string::npos) {
+        return comm; // Often, comm is more reliable than a complex cmdline
     }
     return cmdline;
 }

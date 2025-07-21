@@ -8,10 +8,10 @@
 #include <sys/inotify.h>
 #include <sys/select.h>
 #include <sys/time.h>
-#include <fcntl.h>      // [修复] 添加缺失的头文件
-#include <climits>      // For NAME_MAX
+#include <fcntl.h>
+#include <climits>
 
-#define LOG_TAG "cerberusd_monitor_v7_final"
+#define LOG_TAG "cerberusd_monitor_v7_final2"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -43,7 +43,7 @@ void SystemMonitor::start_top_app_monitor() {
 
 void SystemMonitor::stop_top_app_monitor() {
     monitoring_active_ = false;
-    // This is a trick to unblock the blocking read() call
+    // Unblock the blocking read() call
     int fd = open(top_app_tasks_path_.c_str(), O_WRONLY | O_APPEND);
     if (fd >= 0) {
         write(fd, "\n", 1);
@@ -54,10 +54,15 @@ void SystemMonitor::stop_top_app_monitor() {
     }
 }
 
-// [修复] 恢复 get_current_top_pids 的实现
-std::set<int> SystemMonitor::get_current_top_pids() {
-    std::lock_guard<std::mutex> lock(top_pids_mutex_);
-    return current_top_pids_;
+std::set<int> SystemMonitor::read_top_app_pids() {
+    std::set<int> pids;
+    if (top_app_tasks_path_.empty()) return pids;
+    std::ifstream file(top_app_tasks_path_);
+    int pid;
+    while (file >> pid) {
+        pids.insert(pid);
+    }
+    return pids;
 }
 
 void SystemMonitor::top_app_monitor_thread() {
@@ -65,7 +70,7 @@ void SystemMonitor::top_app_monitor_thread() {
     if (fd < 0) { LOGE("inotify_init1 failed: %s", strerror(errno)); return; }
     
     int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_CLOSE_WRITE | IN_OPEN | IN_MODIFY);
-    if (wd < 0) { LOGE("inotify_add_watch failed for %s: %s", strerror(errno), top_app_tasks_path_.c_str()); close(fd); return; }
+    if (wd < 0) { LOGE("inotify_add_watch failed for %s: %s", top_app_tasks_path_.c_str(), strerror(errno)); close(fd); return; }
 
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
@@ -75,25 +80,10 @@ void SystemMonitor::top_app_monitor_thread() {
 
         if (len < 0) {
             if (errno == EINTR) continue;
-            LOGE("read from inotify fd failed: %s", strerror(errno));
             break;
         }
-
-        {
-            // [修复] 更新正确的成员变量
-            std::lock_guard<std::mutex> lock(top_pids_mutex_);
-            std::ifstream file(top_app_tasks_path_);
-            int pid;
-            current_top_pids_.clear();
-            while (file >> pid) {
-                current_top_pids_.insert(pid);
-            }
-            LOGD("Top-app list updated, %zu pids.", current_top_pids_.size());
-        }
-        has_new_top_app_event = true; 
-
-        // 物理节流阀
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        // [V7-Final-Fix 2] 收到事件，只发放处理券，不做任何其他事
+        g_top_app_refresh_tickets = 2; 
     }
     inotify_rm_watch(fd, wd);
     close(fd);
