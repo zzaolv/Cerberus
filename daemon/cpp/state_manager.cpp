@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v7_hotfix"
+#define LOG_TAG "cerberusd_state_v7_hotfix2"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -382,7 +382,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-   
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
@@ -390,6 +389,13 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
 
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     std::lock_guard<std::mutex> lock(state_mutex_);
+
+    if (top_pids == last_known_top_pids_) {
+        return false;
+    }
+    
+    LOGD("Foreground PIDs changed. Old count: %zu, New count: %zu", last_known_top_pids_.size(), top_pids.size());
+    last_known_top_pids_ = top_pids;
     
     std::set<AppInstanceKey> current_foreground_keys;
     for (int pid : top_pids) {
@@ -510,7 +516,8 @@ json StateManager::get_dashboard_payload() {
     };
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
-        // if (app.current_status == AppRuntimeState::Status::STOPPED && app.pids.empty()) continue;
+        // Show all apps that are either not stopped, or have a config.
+        if (app.current_status == AppRuntimeState::Status::STOPPED && app.config.policy == AppPolicy::EXEMPTED) continue;
         
         json app_json;
         app_json["package_name"] = app.package_name;

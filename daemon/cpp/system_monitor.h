@@ -24,7 +24,6 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
-// 声明一个全局原子标志，用于在 inotify 线程和主工作线程之间通信
 extern std::atomic<bool> has_new_top_app_event;
 
 class SystemMonitor {
@@ -40,7 +39,8 @@ public:
 
     void start_top_app_monitor();
     void stop_top_app_monitor();
-    std::set<int> get_current_top_pids();
+    // [V7-Hotfix 2] get_current_top_pids 被 read_top_app_pids 替代
+    std::set<int> read_top_app_pids();
 
 private:
     void update_cpu_usage();
@@ -59,8 +59,6 @@ private:
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
-    std::set<int> current_top_pids_;
-    std::mutex top_pids_mutex_;
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};
     std::string top_app_tasks_path_;

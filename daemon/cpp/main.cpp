@@ -99,13 +99,14 @@ void signal_handler(int signum) {
 // --- Worker Thread ---
 void worker_thread_func() {
     LOGI("Worker thread started with LPE model.");
-    has_new_top_app_event = true; // Force initial update
+    has_new_top_app_event = true;
     
     while (g_is_running) {
         bool needs_broadcast = false;
         
+        // 只有当 inotify 线程发来信号时，才执行昂贵的前台状态更新
         if (has_new_top_app_event.exchange(false)) {
-            auto top_pids = g_sys_monitor->get_current_top_pids();
+            auto top_pids = g_sys_monitor->read_top_app_pids();
             if (g_state_manager->update_foreground_state(top_pids)) {
                 needs_broadcast = true;
             }
@@ -123,6 +124,7 @@ void worker_thread_func() {
     }
     LOGI("Worker thread finished.");
 }
+
 
 // --- Main Entry ---
 int main(int argc, char *argv[]) {

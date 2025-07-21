@@ -41,7 +41,7 @@ struct AppRuntimeState {
 class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>);
-
+    
     bool tick();
     bool update_foreground_state(const std::set<int>& top_pids);
     bool on_config_changed_from_ui(const json& payload);
@@ -64,6 +64,7 @@ private:
     std::shared_ptr<ActionExecutor> action_executor_;
 
     std::mutex state_mutex_;
+    std::set<int> last_known_top_pids_;
     
     GlobalStatsData global_stats_;
     FreezeMethod default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
