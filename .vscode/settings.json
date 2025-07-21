@@ -2,6 +2,7 @@
     "files.associations": {
         "*.mmd": "markdown",
         "functional": "cpp",
-        "filesystem": "cpp"
+        "filesystem": "cpp",
+        "xstring": "cpp"
     }
 }
