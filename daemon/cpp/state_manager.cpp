@@ -472,12 +472,7 @@ bool StateManager::tick_state_machine() {
 }
 
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
-    for (int pid : app.pids) {
-        if (sys_monitor_->is_pid_playing_audio(pid)) {
-            return true;
-        }
-    }
-    return false;
+    return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
 bool StateManager::check_timers() {
@@ -495,6 +490,7 @@ bool StateManager::check_timers() {
         }
         
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
+            // [V8-Hotfix] 这里的豁免检查现在是基于UID的，将正确工作
             if (is_app_playing_audio(app)) {
                 LOGD("TICK: Deferring freeze for %s because it is playing audio.", app.package_name.c_str());
                 app.background_since = now;

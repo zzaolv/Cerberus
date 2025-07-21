@@ -44,7 +44,7 @@ public:
     // [V8 新增] 音频监控
     void start_audio_monitor();
     void stop_audio_monitor();
-    bool is_pid_playing_audio(int pid);
+    bool is_pid_playing_audio(int uid);
 
 private:
     void update_cpu_usage();
@@ -70,11 +70,11 @@ private:
     std::atomic<bool> monitoring_active_{false};
     std::string top_app_tasks_path_;
 
-    // [V8 新增] 音频监控相关成员
+    // [V8-Hotfix] 成员变量改为存储UID
     std::thread audio_thread_;
     std::atomic<bool> audio_monitoring_active_{false};
-    std::mutex audio_pids_mutex_;
-    std::set<int> pids_playing_audio_;
+    std::mutex audio_uids_mutex_;
+    std::set<int> uids_playing_audio_;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H
