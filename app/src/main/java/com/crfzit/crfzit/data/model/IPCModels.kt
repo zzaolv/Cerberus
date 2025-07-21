@@ -3,7 +3,7 @@ package com.crfzit.crfzit.data.model
 
 import com.google.gson.annotations.SerializedName
 
-// --- 通用消息结构 ---
+// --- 通用消息结构 (保持不变) ---
 data class CerberusMessage<T>(
     @SerializedName("v")
     val version: Int = 12,
@@ -13,7 +13,7 @@ data class CerberusMessage<T>(
     val payload: T
 )
 
-// --- UI <-> Daemon 模型 ---
+// --- UI <-> Daemon 模型 (保持不变) ---
 data class DashboardPayload(
     @SerializedName("global_stats")
     val globalStats: GlobalStats,
@@ -55,34 +55,29 @@ data class AppRuntimeState(
     val isForeground: Boolean = false
 )
 
-// --- Probe <-> Daemon 新指令模型 ---
-data class ProbeFreezePayload(
+// --- [移除] Probe -> Daemon 指令模型，因为决策已移至Daemon ---
+// data class ProbeFreezePayload(...)
+// data class ProbeUnfreezePayload(...)
+
+// --- [新增] Probe -> Daemon 事件模型 ---
+data class AppStateEventPayload(
     @SerializedName("package_name")
     val packageName: String,
     @SerializedName("user_id")
-    val userId: Int,
-    val pid: Int,
-    val uid: Int
+    val userId: Int
 )
 
-data class ProbeUnfreezePayload(
-    @SerializedName("package_name")
-    val packageName: String,
-    @SerializedName("user_id")
-    val userId: Int,
-    val pid: Int,
-    val uid: Int
-)
-
-
-// --- 配置模型 (UI -> Daemon -> Probe) ---
+// --- 配置模型 (UI -> Daemon -> Probe) (保持不变) ---
 data class FullConfigPayload(
     @SerializedName("master_config")
     val masterConfig: MasterConfig,
     @SerializedName("exempt_config")
     val exemptConfig: ExemptConfig,
     @SerializedName("policies")
-    val policies: List<AppPolicyPayload>
+    val policies: List<AppPolicyPayload>,
+    // [新增] Daemon会附加此列表给Probe
+    @SerializedName("frozen_uids") 
+    val frozenUids: List<Int>? = null 
 )
 
 data class MasterConfig(
@@ -93,14 +88,9 @@ data class MasterConfig(
 )
 
 data class ExemptConfig(
+    // [简化] 暂时只保留一个总开关
     @SerializedName("exempt_foreground_services")
-    val exemptForegroundServices: Boolean = true,
-    @SerializedName("exempt_audio_playback")
-    val exemptAudioPlayback: Boolean = true,
-    @SerializedName("exempt_camera_microphone")
-    val exemptCameraMicrophone: Boolean = true,
-    @SerializedName("exempt_overlay_windows")
-    val exemptOverlayWindows: Boolean = true
+    val exemptForegroundServices: Boolean = true
 )
 
 data class AppPolicyPayload(
@@ -111,7 +101,7 @@ data class AppPolicyPayload(
     val policy: Int // Corresponds to AppPolicy enum
 )
 
-// --- 通用键 ---
+// --- 通用键 (保持不变) ---
 data class AppInstanceKey(
     @SerializedName("package_name")
     val packageName: String,

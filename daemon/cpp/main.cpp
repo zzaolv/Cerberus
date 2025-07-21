@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v12.2_debug"
+#define LOG_TAG "cerberusd_main_v3_reborn"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,40 +35,43 @@ std::mutex g_broadcast_mutex;
 void broadcast_dashboard_update();
 void notify_probe_of_config_change();
 
-// --- Message Handler ---
+// --- Message Handler (重构) ---
 void handle_client_message(int client_fd, const std::string& message_str) {
     LOGD("[RECV MSG] From fd %d: %s", client_fd, message_str.c_str());
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
         
-        // [关键调试点]
-        if (type == "event.probe_hello") {
-            LOGI("<<<<< PROBE HELLO DETECTED from fd %d >>>>>", client_fd);
-            g_probe_fd = client_fd;
-            notify_probe_of_config_change();
-            return; 
-        }
-
         bool state_changed = false;
         bool config_changed = false;
 
-        if (type == "cmd.freeze_process") {
+        // --- Probe 连接事件 ---
+        if (type == "event.probe_hello") {
+            LOGI("<<<<< PROBE HELLO from fd %d >>>>>", client_fd);
+            g_probe_fd = client_fd;
+            notify_probe_of_config_change(); // Probe连接后立即发送一次完整配置
+            return; 
+        }
+
+        // --- Probe 上报事件 ---
+        else if (type == "event.app_foreground") {
             if (g_state_manager) {
-                state_changed = g_state_manager->on_freeze_request_from_probe(msg.at("payload"));
+                state_changed = g_state_manager->on_app_foreground(msg.at("payload"));
             }
         }
-        else if (type == "cmd.unfreeze_process") {
-            if (g_state_manager) {
-                state_changed = g_state_manager->on_unfreeze_request_from_probe(msg.at("payload"));
+        else if (type == "event.app_background") {
+             if (g_state_manager) {
+                state_changed = g_state_manager->on_app_background(msg.at("payload"));
             }
         }
+        
+        // --- UI 指令 ---
         else if (type == "cmd.set_policy") {
             if (g_state_manager) {
                 if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                     config_changed = true;
                 }
-                state_changed = true;
+                state_changed = true; // 配置改变也算状态改变，需要刷新UI
             }
         }
         else if (type == "query.get_all_policies") {
@@ -82,6 +85,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             state_changed = true;
         }
 
+        // --- 触发更新 ---
         if (config_changed) {
             notify_probe_of_config_change();
         }
@@ -94,14 +98,13 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     }
 }
 
-// --- Broadcast & Notification Functions ---
+// --- 广播与通知函数 (逻辑不变) ---
 void broadcast_dashboard_update() {
     std::lock_guard<std::mutex> lock(g_broadcast_mutex);
     if (g_server && g_server->has_clients() && g_state_manager) {
         LOGD("Broadcasting dashboard update...");
         json payload = g_state_manager->get_dashboard_payload();
         json message = {{"type", "stream.dashboard_update"}, {"payload", payload}};
-        // [关键修复] 确保有Probe时，绝对不会向Probe发送dashboard消息
         g_server->broadcast_message_except(message.dump(), g_probe_fd.load());
     }
 }
@@ -116,7 +119,6 @@ void notify_probe_of_config_change() {
     }
 }
 
-// --- Server Lifecycle & Worker Thread ---
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);
     if (client_fd == g_probe_fd.load()) {
@@ -125,7 +127,6 @@ void handle_client_disconnect(int client_fd) {
     }
 }
 
-// [关键修复] 实现信号处理函数，解决无法Ctrl+C退出的问题
 void signal_handler(int signum) {
     LOGW("Signal %d received, initiating shutdown...", signum);
     g_is_running = false;
@@ -137,7 +138,7 @@ void signal_handler(int signum) {
 void worker_thread_func() {
     LOGI("Worker thread started.");
     while (g_is_running) {
-        // [关键修复] 缩短轮询周期，提高UI响应性
+        // 维持3秒的轮询周期，用于处理超时冻结和资源监控
         std::this_thread::sleep_for(std::chrono::seconds(3)); 
         if (!g_is_running) break;
         
@@ -151,20 +152,17 @@ void worker_thread_func() {
     LOGI("Worker thread finished.");
 }
 
-
-// --- Main Entry Point ---
+// --- 主函数入口 (逻辑不变) ---
 int main(int argc, char *argv[]) {
-    // [关键修复] 注册所有必要的信号
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
-    signal(SIGPIPE, SIG_IGN); // 忽略此信号，防止写入断开的socket导致崩溃
+    signal(SIGPIPE, SIG_IGN);
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
 
-    LOGI("Project Cerberus Daemon v12.1 (Fix) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v3 (Reborn) starting... (PID: %d)", getpid());
     
-    // ... (rest of main is fine)
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
     } catch (const fs::filesystem_error& e) {

@@ -1,185 +1,371 @@
-// app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
-package com.crfzit.crfzit.ui.configuration
+// app/src/main/java/com/crfzit/crfzit/ui/dashboard/DashboardScreen.kt
+package com.crfzit.crfzit.ui.dashboard
 
+import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
-import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.AppInstanceKey
-import com.crfzit.crfzit.data.model.AppPolicyPayload
-
-enum class Policy(val value: Int) {
-    EXEMPTED(0),
-    STANDARD(2),
-    STRICT(3);
-
-    companion object {
-        fun fromInt(value: Int) = entries.find { it.value == value } ?: EXEMPTED
-    }
-}
-
+import com.crfzit.crfzit.data.model.AppRuntimeState
+import com.crfzit.crfzit.data.model.GlobalStats
+import com.crfzit.crfzit.data.system.NetworkSpeed
+import com.crfzit.crfzit.ui.icons.AppIcons
+import com.crfzit.crfzit.ui.theme.CRFzitTheme
+import com.google.accompanist.swiperefresh.SwipeRefresh
+import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
+import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConfigurationScreen(
-    navController: NavController,
-    viewModel: ConfigurationViewModel
-) {
+fun DashboardScreen(viewModel: DashboardViewModel) {
+    // ... (Scaffold and TopAppBar code remains the same) ...
     val uiState by viewModel.uiState.collectAsState()
-
-    val filteredApps = remember(uiState) {
-        viewModel.getFilteredAndSortedApps()
-    }
+    var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("应用配置") }) }
-    ) { padding ->
-        Column(Modifier.padding(padding)) {
-            OutlinedTextField(
-                value = uiState.searchQuery,
-                onValueChange = viewModel::onSearchQueryChanged,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                label = { Text("搜索应用或包名") },
-                leadingIcon = { Icon(Icons.Default.Search, null) },
-                singleLine = true
-            )
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .clickable { viewModel.onShowSystemAppsChanged(!uiState.showSystemApps) },
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("显示系统应用", modifier = Modifier.weight(1f))
-                Switch(
-                    checked = uiState.showSystemApps,
-                    onCheckedChange = viewModel::onShowSystemAppsChanged
-                )
-            }
-
-            if (uiState.isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else {
-                LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
-                        val key = AppInstanceKey(appInfo.packageName, appInfo.userId)
-                        val policyPayload = uiState.policies[key] ?: AppPolicyPayload(appInfo.packageName, appInfo.userId, 0)
-
-                        AppPolicyItem(
-                            appInfo = appInfo,
-                            appPolicy = policyPayload,
-                            isProtected = false, // Protection is now handled by whitelisting (policy=0)
-                            onPolicyChange = { newPolicy ->
-                                viewModel.setAppPolicy(appInfo.packageName, appInfo.userId, newPolicy.value)
-                            }
-                        )
+        topBar = {
+            TopAppBar(
+                title = { Text("主页") },
+                actions = {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "更多")
                     }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun AppPolicyItem(
-    appInfo: AppInfo,
-    appPolicy: AppPolicyPayload,
-    isProtected: Boolean,
-    onPolicyChange: (Policy) -> Unit
-) {
-    var showMenu by remember { mutableStateOf(false) }
-    val itemAlpha = if (isProtected) 0.6f else 1.0f
-
-    Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
-        Row(
-            modifier = Modifier
-                .padding(16.dp)
-                .clickable(enabled = !isProtected) { showMenu = true },
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Image(
-                painter = rememberAsyncImagePainter(
-                    ImageRequest.Builder(LocalContext.current)
-                        .data(appInfo.icon)
-                        .placeholder(R.drawable.ic_launcher_foreground)
-                        .error(R.drawable.ic_launcher_foreground)
-                        .crossfade(true).build()
-                ),
-                contentDescription = appInfo.appName,
-                modifier = Modifier.size(40.dp)
-            )
-            Column(Modifier.weight(1f).padding(start = 16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(appInfo.appName, fontWeight = FontWeight.Bold)
-                    if (appInfo.userId != 0) {
-                        Spacer(Modifier.width(4.dp))
-                        Icon(
-                            painter = painterResource(id = R.drawable.ic_clone),
-                            contentDescription = "分身应用 (User ${appInfo.userId})",
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.secondary
-                        )
-                    }
-                }
-                Text(appInfo.packageName, style = MaterialTheme.typography.bodySmall)
-            }
-
-            Box {
-                val currentPolicy = Policy.fromInt(appPolicy.policy)
-                val (label, icon) = getPolicyLabel(currentPolicy)
-                Text(
-                    text = "$icon $label",
-                    color = if (currentPolicy == Policy.EXEMPTED) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-
-                DropdownMenu(
-                    expanded = showMenu,
-                    onDismissRequest = { showMenu = false }
-                ) {
-                    Policy.entries.forEach { policy ->
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
                         DropdownMenuItem(
-                            text = {
-                                val (policyLabel, policyIcon) = getPolicyLabel(policy)
-                                Text("$policyIcon $policyLabel")
-                            },
+                            text = { Text(if (uiState.showSystemApps) "隐藏系统应用" else "显示系统应用") },
                             onClick = {
-                                onPolicyChange(policy)
+                                viewModel.onShowSystemAppsChanged(!uiState.showSystemApps)
                                 showMenu = false
                             }
                         )
                     }
                 }
+            )
+        }
+    ) { paddingValues ->
+        Crossfade(
+            targetState = uiState.isConnected,
+            modifier = Modifier.padding(paddingValues),
+            label = "ConnectionState"
+        ) { isConnected ->
+            if (isConnected) {
+                SwipeRefresh(
+                    state = rememberSwipeRefreshState(isRefreshing = uiState.isRefreshing),
+                    onRefresh = { viewModel.refresh() }
+                ) {
+                    DashboardContent(
+                        globalStats = uiState.globalStats,
+                        networkSpeed = uiState.networkSpeed,
+                        apps = uiState.apps
+                    )
+                }
+            } else {
+                ConnectionLoadingIndicator()
+            }
+        }
+    }
+}
+
+
+// ... (DashboardContent, GlobalStatusArea, StatusGridItem, AppRuntimeCard, AppStatusIcons, ConnectionLoadingIndicator, formatMemory, formatSpeed remain the same) ...
+
+@Composable
+fun DashboardContent(
+    globalStats: GlobalStats,
+    networkSpeed: NetworkSpeed,
+    apps: List<UiAppRuntime>
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            GlobalStatusArea(stats = globalStats, speed = networkSpeed)
+        }
+        item {
+            Text(
+                text = "运行状态列表",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+            )
+        }
+        items(apps, key = { "${it.runtimeState.packageName}-${it.runtimeState.userId}" }) { app ->
+            AppRuntimeCard(app = app)
+        }
+    }
+}
+
+@Composable
+fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
+    val memUsedPercent = if (stats.totalMemKb > 0) {
+        (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
+    } else 0f
+    
+    val swapUsedPercent = if (stats.swapTotalKb > 0) {
+        (stats.swapTotalKb - stats.swapFreeKb).toFloat() / stats.swapTotalKb
+    } else 0f
+    
+    val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
+    
+    val downSpeed = formatSpeed(speed.downloadSpeedBps)
+    val upSpeed = formatSpeed(speed.uploadSpeedBps)
+
+    Column(modifier = Modifier.padding(bottom = 8.dp)) {
+        Text(
+            text = "系统状态",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(bottom = 12.dp)
+        )
+        
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.height(180.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            userScrollEnabled = false
+        ) {
+            item {
+                StatusGridItem(
+                    label = "CPU",
+                    value = "%.1f".format(Locale.US, stats.totalCpuUsagePercent) + "%",
+                    progress = cpuUsedPercent,
+                    icon = AppIcons.Memory
+                )
+            }
+            item {
+                StatusGridItem(
+                    label = "内存 (MEM)",
+                    value = formatMemory(stats.totalMemKb - stats.availMemKb),
+                    progress = memUsedPercent,
+                    icon = AppIcons.SdStorage
+                )
+            }
+            item {
+                 StatusGridItem(
+                    label = "交换 (SWAP)",
+                    value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
+                    progress = swapUsedPercent,
+                    icon = AppIcons.SwapHoriz
+                )
+            }
+            item {
+                StatusGridItem(
+                    label = "网络",
+                    value = "↓${downSpeed.first} | ↑${upSpeed.first}",
+                    subValue = "${downSpeed.second} / ${upSpeed.second}",
+                    icon = AppIcons.Wifi
+                )
             }
         }
     }
 }
 
 @Composable
-private fun getPolicyLabel(policy: Policy): Pair<String, String> {
-    return when (policy) {
-        Policy.EXEMPTED -> "豁免" to "🛡️"
-        Policy.STANDARD -> "智能" to "⚙️"
-        Policy.STRICT -> "严格" to "🧊"
+fun StatusGridItem(
+    label: String,
+    value: String,
+    subValue: String? = null,
+    progress: Float? = null,
+    icon: ImageVector
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = MaterialTheme.shapes.large
+    ) {
+        Column(Modifier.padding(12.dp).fillMaxSize()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, contentDescription = label, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(label, style = MaterialTheme.typography.labelLarge)
+            }
+            Spacer(Modifier.weight(1f))
+            if (subValue != null) {
+                 Text(value, style = MaterialTheme.typography.titleMedium)
+                 Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            }
+            if (progress != null) {
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { progress ?: 0f },
+                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape)
+                )
+            }
+        }
+    }
+}
+
+
+@Composable
+fun AppRuntimeCard(app: UiAppRuntime) {
+    val state = app.runtimeState
+    Card {
+        Row(
+            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Image(
+                painter = rememberAsyncImagePainter(
+                    ImageRequest.Builder(LocalContext.current)
+                        .data(app.icon)
+                        .placeholder(android.R.drawable.sym_def_app_icon)
+                        .error(android.R.drawable.sym_def_app_icon)
+                        .crossfade(true).build()
+                ),
+                contentDescription = app.appName,
+                modifier = Modifier.size(48.dp)
+            )
+            
+            Column(
+                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = app.appName,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (app.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${app.userId})",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    AppStatusIcons(state = state)
+                }
+                
+                val resourceText = buildAnnotatedString {
+                    append("MEM: ${formatMemory(state.memUsageKb)}")
+                    if (state.swapUsageKb > 1024) {
+                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
+                            append(" (+${formatMemory(state.swapUsageKb)} S)")
+                        }
+                    }
+                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
+                }
+
+                Text(
+                    text = resourceText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Text(
+                    text = "状态：${formatStatus(state)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun AppStatusIcons(state: AppRuntimeState) {
+    Row {
+        val iconModifier = Modifier.padding(horizontal = 2.dp)
+        if (state.isForeground) Text("▶️", iconModifier)
+        if (state.isWhitelisted) Text("🛡️", iconModifier)
+        if (state.displayStatus.uppercase() == "FROZEN") {
+            Text("❄️", iconModifier)
+        }
+    }
+}
+
+@Composable
+fun ConnectionLoadingIndicator() {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator()
+            Spacer(Modifier.height(16.dp))
+            Text("正在连接到守护进程...")
+        }
+    }
+}
+
+private fun formatMemory(kb: Long): String {
+    if (kb <= 0) return "0 KB"
+    val mb = kb / 1024.0
+    val gb = mb / 1024.0
+    return when {
+        gb >= 1 -> "%.1f GB".format(Locale.US, gb)
+        mb >= 1 -> "%.1f MB".format(Locale.US, mb)
+        else -> "$kb KB"
+    }
+}
+
+private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
+    if (bitsPerSecond < 50000) return Pair("0.0", "Kbps")
+    return when {
+        bitsPerSecond < 1_000_000 -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1000.0), "Kbps")
+        else -> Pair("%.1f".format(Locale.US, bitsPerSecond / 1_000_000.0), "Mbps")
+    }
+}
+
+
+// [关键适配] 更新状态格式化函数以匹配新的后台状态机
+private fun formatStatus(state: AppRuntimeState): String {
+    return when (state.displayStatus.uppercase()) {
+        "STOPPED" -> "未运行"
+        "FROZEN" -> "已冻结"
+        "FOREGROUND" -> "前台运行"
+        "PENDING_FREEZE" -> "等待冻结"
+        "EXEMPTED" -> "已豁免"
+        "BACKGROUND" -> "后台运行" // 刚切换到后台，还未进入等待队列
+        else -> state.displayStatus // Fallback
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun DashboardPreview() {
+    CRFzitTheme {
+        DashboardContent(
+            globalStats = GlobalStats(),
+            networkSpeed = NetworkSpeed(),
+            apps = emptyList()
+        )
     }
 }

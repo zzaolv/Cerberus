@@ -10,36 +10,29 @@
 #include <SQLiteCpp/Transaction.h>
 
 // 应用策略等级，严格与文档和UI模型对应
+// [关键] 提升为全局可访问，方便 StateManager 使用
 enum class AppPolicy {
-    EXEMPTED = 0,   // 自由后台 (豁免)
-    IMPORTANT = 1,  // 重要
-    STANDARD = 2,   // 智能
-    STRICT = 3      // 严格
+    EXEMPTED = 0,   // 豁免 (永不冻结)
+    IMPORTANT = 1,  // 重要 (行为同豁免)
+    STANDARD = 2,   // 智能 (长延时后冻结)
+    STRICT = 3      // 严格 (短延时后冻结)
 };
 
 // 应用的持久化配置数据结构
 struct AppConfig {
     std::string package_name;
-    // [核心修复] 增加 user_id 以支持分身应用，这是解决问题3的关键
     int user_id = 0; 
-    AppPolicy policy = AppPolicy::EXEMPTED; // 默认值应为豁免，符合用户自选原则
-    bool force_playback_exempt = false;
-    bool force_network_exempt = false;
+    AppPolicy policy = AppPolicy::STANDARD; // 默认改为智能，更符合用户预期
+    // [简化] 移除 force_playback_exempt 等选项，这些高级豁免逻辑应由Probe判断
 };
 
 class DatabaseManager {
 public:
     explicit DatabaseManager(const std::string& db_path);
 
-    // [核心修复] 修改函数签名以支持分身，通过包名和用户ID唯一确定一个应用实例
     std::optional<AppConfig> get_app_config(const std::string& package_name, int user_id);
-    
-    // 设置/更新单个应用的配置
     bool set_app_config(const AppConfig& config);
-
     bool clear_all_policies();
-    
-    // 获取所有已配置应用的列表
     std::vector<AppConfig> get_all_app_configs();
 
 private:
