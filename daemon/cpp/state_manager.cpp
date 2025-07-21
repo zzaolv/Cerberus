@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v7_final4"
+#define LOG_TAG "cerberusd_state_v8"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -19,37 +19,45 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-static std::string status_to_string(const AppRuntimeState& app) {
+static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
     if (app.is_foreground) return "FOREGROUND";
     if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "EXEMPTED_BACKGROUND";
     if (app.background_since > 0) {
         time_t now = time(nullptr);
-        // This is a temporary calculation for display, actual timeout is in tick_state_machine
-        int timeout_sec = (app.config.policy == AppPolicy::STRICT) ? 15 : 90;
+        int timeout_sec = 0;
+        if (app.config.policy == AppPolicy::STRICT) {
+            timeout_sec = 15;
+        } else if (app.config.policy == AppPolicy::STANDARD) {
+            timeout_sec = master_config.standard_timeout_sec;
+        }
         int remaining = timeout_sec - (now - app.background_since);
         if (remaining < 0) remaining = 0;
         return "PENDING_FREEZE (" + std::to_string(remaining) + "s)";
     }
-    if (app.observation_since > 0) return "OBSERVING";
+    if (app.observation_since > 0) {
+        time_t now = time(nullptr);
+        int remaining = 10 - (now - app.observation_since);
+        if (remaining < 0) remaining = 0;
+        return "OBSERVING (" + std::to_string(remaining) + "s)";
+    }
     return "BACKGROUND";
 }
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
-    : db_manager_(db), sys_monitor_(sys), action_executor_(act) {
+    : db_manager_(db), sys_monitor_(sys), action_executor_(act), unfrozen_timeline_(4096, 0) {
     LOGI("StateManager Initializing...");
-    
-    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
-        default_freeze_method_ = FreezeMethod::CGROUP_V2;
-        LOGI("Default freeze method set to CGROUP_V2.");
-    } else {
-        default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
-        LOGI("Default freeze method set to SIGSTOP.");
-    }
     
     master_config_ = db_manager_->get_master_config().value_or(MasterConfig{});
     LOGI("Loaded master config: standard_timeout=%ds", master_config_.standard_timeout_sec);
+    
+    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
+        default_freeze_method_ = FreezeMethod::CGROUP_V2;
+    } else {
+        default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
+    }
+    LOGI("Default freeze method set to %s.", default_freeze_method_ == FreezeMethod::CGROUP_V2 ? "CGROUP_V2" : "SIGSTOP");
 
         critical_system_apps_ = {
         "com.xiaomi.mibrain.speech",
@@ -430,14 +438,12 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
         if (app.is_foreground != is_now_foreground) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
-            // [修复] 严格的状态转换逻辑
             if (is_now_foreground) {
-                // 进入前台: 清除所有计时器
                 if (app.observation_since > 0 || app.background_since > 0) {
                     LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
                 }
-                app.observation_since = 0; // <--- 关键修复
-                app.background_since = 0;  // <--- 关键修复
+                app.observation_since = 0;
+                app.background_since = 0;
 
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
                     LOGI("State: Unfreezing %s (foreground).", key.first.c_str());
@@ -445,8 +451,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
-                // 进入后台: 清除冻结计时器，启动观察期
-                app.background_since = 0; // <--- 关键修复
+                app.background_since = 0;
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
                     LOGI("State: Observation period started for %s.", key.first.c_str());
                     app.observation_since = now;
@@ -461,15 +466,27 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
 
 bool StateManager::tick_state_machine() {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    bool changed1 = check_timers();
+    bool changed2 = check_timed_unfreeze();
+    return changed1 || changed2;
+}
+
+bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
+    for (int pid : app.pids) {
+        if (sys_monitor_->is_pid_playing_audio(pid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool StateManager::check_timers() {
     bool changed = false;
     time_t now = time(nullptr);
 
     for (auto& [key, app] : managed_apps_) {
-        // [修复] 移除保险检查，因为它现在是多余的，且可能导致逻辑错误
-        
-        // 1. 处理观察期
         if (app.observation_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
-            if (now - app.observation_since >= 10) { // 10秒观察期结束
+            if (now - app.observation_since >= 10) {
                 LOGI("TICK: Observation for %s ended. Starting freeze timer.", app.package_name.c_str());
                 app.observation_since = 0;
                 app.background_since = now;
@@ -477,20 +494,24 @@ bool StateManager::tick_state_machine() {
             }
         }
         
-        // 2. 处理冻结倒计时
         if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
+            if (is_app_playing_audio(app)) {
+                LOGD("TICK: Deferring freeze for %s because it is playing audio.", app.package_name.c_str());
+                app.background_since = now;
+                continue;
+            }
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) {
                 timeout_sec = 15;
             } else if(app.config.policy == AppPolicy::STANDARD) {
                 timeout_sec = master_config_.standard_timeout_sec;
             }
-            
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
                     app.current_status = AppRuntimeState::Status::FROZEN;
                     changed = true;
+                    schedule_timed_unfreeze(app);
                 }
                 app.background_since = 0;
             }
@@ -499,6 +520,46 @@ bool StateManager::tick_state_machine() {
     return changed;
 }
 
+void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
+    const int unfreeze_interval_sec = 1800; // 30 minutes
+    if (unfreeze_interval_sec <= 0) return;
+    
+    uint32_t next_idx = (timeline_idx_ + unfreeze_interval_sec) % unfrozen_timeline_.size();
+    for (size_t i = 0; i < unfrozen_timeline_.size(); ++i) {
+        if (unfrozen_timeline_[next_idx] == 0) {
+            unfrozen_timeline_[next_idx] = app.uid;
+            LOGD("Scheduled timed unfreeze for %s at timeline index %u.", app.package_name.c_str(), next_idx);
+            return;
+        }
+        next_idx = (next_idx + 1) % unfrozen_timeline_.size();
+    }
+    LOGW("Unfreeze timeline is full! Cannot schedule for %s.", app.package_name.c_str());
+}
+
+bool StateManager::check_timed_unfreeze() {
+    timeline_idx_ = (timeline_idx_ + 1) % unfrozen_timeline_.size();
+    int uid_to_unfreeze = unfrozen_timeline_[timeline_idx_];
+    
+    if (uid_to_unfreeze == 0) {
+        return false;
+    }
+    
+    unfrozen_timeline_[timeline_idx_] = 0;
+
+    for (auto& [key, app] : managed_apps_) {
+        if (app.uid == uid_to_unfreeze) {
+            if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
+                LOGI("TIMED UNFREEZE: Waking up %s.", app.package_name.c_str());
+                action_executor_->unfreeze(key, app.pids);
+                app.current_status = AppRuntimeState::Status::RUNNING;
+                app.observation_since = time(nullptr);
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
+}
 
 bool StateManager::perform_deep_scan() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -518,7 +579,6 @@ bool StateManager::perform_deep_scan() {
             if (app.undetected_since == 0) {
                 app.undetected_since = now;
             } else if (now - app.undetected_since >= 3) {
-                LOGD("App %s confirmed stopped after grace period.", app.package_name.c_str());
                 app.current_status = AppRuntimeState::Status::STOPPED;
                 app.is_foreground = false;
                 app.background_since = 0;
@@ -580,13 +640,17 @@ json StateManager::get_dashboard_payload() {
         app_json["package_name"] = app.package_name;
         app_json["app_name"] = app.app_name;
         app_json["user_id"] = app.user_id;
-        // [修复] 将 master_config 传递给状态字符串函数
         app_json["display_status"] = status_to_string(app, master_config_);
         app_json["mem_usage_kb"] = app.mem_usage_kb;
         app_json["swap_usage_kb"] = app.swap_usage_kb;
         app_json["cpu_usage_percent"] = app.cpu_usage_percent;
         app_json["is_whitelisted"] = app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT;
         app_json["is_foreground"] = app.is_foreground;
+        if (app.current_status == AppRuntimeState::Status::RUNNING && !app.is_foreground) {
+            if (is_app_playing_audio(app)) {
+                app_json["exemption_reason"] = "PLAYING_AUDIO";
+            }
+        }
         apps_state.push_back(app_json);
     }
     payload["apps_runtime_state"] = apps_state;
@@ -597,7 +661,7 @@ json StateManager::get_full_config_for_ui() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto all_db_configs = db_manager_->get_all_app_configs();
     json response;
-    response["master_config"] = {{"is_enabled", true}, {"freeze_on_screen_off", true}};
+    response["master_config"] = {{"is_enabled", true}, {"freeze_on_screen_off", true}, {"standard_timeout_sec", master_config_.standard_timeout_sec}};
     response["exempt_config"] = {{"exempt_foreground_services", true}};
     json policies = json::array();
     for (const auto& config : all_db_configs) {
@@ -745,7 +809,14 @@ void StateManager::remove_pid_from_app(int pid) {
         auto& pids = app->pids;
         pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
         if (pids.empty()) {
-            // Keep the state, let the deep scan handle it after grace period
+            app->current_status = AppRuntimeState::Status::STOPPED;
+            app->mem_usage_kb = 0;
+            app->swap_usage_kb = 0;
+            app->cpu_usage_percent = 0.0f;
+            app->is_foreground = false;
+            app->background_since = 0;
+            app->observation_since = 0;
+            app->undetected_since = 0;
         }
     }
 }

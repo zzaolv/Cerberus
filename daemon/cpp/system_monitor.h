@@ -24,7 +24,6 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
-// [V7-Final-Fix 2] 引入节拍器计数器
 extern std::atomic<int> g_top_app_refresh_tickets;
 
 class SystemMonitor {
@@ -42,10 +41,18 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
 
+    // [V8 新增] 音频监控
+    void start_audio_monitor();
+    void stop_audio_monitor();
+    bool is_pid_playing_audio(int pid);
+
 private:
     void update_cpu_usage();
     void update_mem_info();
     void top_app_monitor_thread();
+    
+    // [V8 新增] 音频监控线程
+    void audio_monitor_thread();
 
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
@@ -62,6 +69,12 @@ private:
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};
     std::string top_app_tasks_path_;
+
+    // [V8 新增] 音频监控相关成员
+    std::thread audio_thread_;
+    std::atomic<bool> audio_monitoring_active_{false};
+    std::mutex audio_pids_mutex_;
+    std::set<int> pids_playing_audio_;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H

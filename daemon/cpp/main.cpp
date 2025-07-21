@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v7_final4"
+#define LOG_TAG "cerberusd_main_v8"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -44,18 +44,18 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 notify_probe_of_config_change();
             }
             g_top_app_refresh_tickets = 1; 
-        } else if (type == "cmd.set_master_config") {
-            if (g_state_manager) {
-                MasterConfig cfg;
-                cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
-                g_state_manager->update_master_config(cfg);
-            }
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
             if (g_state_manager) {
                 json payload = g_state_manager->get_full_config_for_ui();
                 g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
+            }
+        } else if (type == "cmd.set_master_config") {
+            if (g_state_manager) {
+                MasterConfig cfg;
+                cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+                g_state_manager->update_master_config(cfg);
             }
         } else if (type == "event.probe_hello") {
             g_probe_fd = client_fd;
@@ -65,11 +65,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 }
 
 void handle_client_disconnect(int client_fd) {
-    LOGI("Client fd %d has disconnected.", client_fd);
-    if (client_fd == g_probe_fd.load()) {
-        LOGW("Probe has disconnected! fd: %d", client_fd);
-        g_probe_fd = -1;
-    }
+    if (client_fd == g_probe_fd.load()) g_probe_fd = -1;
 }
 
 void broadcast_dashboard_update() {
@@ -83,7 +79,6 @@ void broadcast_dashboard_update() {
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
-        LOGD("Sending config update to Probe fd %d.", probe_fd);
         json payload = g_state_manager->get_probe_config_payload();
         g_server->send_message(probe_fd, json{{"type", "stream.probe_config_update"}, {"payload", payload}}.dump());
     }
@@ -96,7 +91,7 @@ void signal_handler(int signum) {
 }
 
 void worker_thread_func() {
-    LOGI("Worker thread started with final model.");
+    LOGI("Worker thread started.");
     g_top_app_refresh_tickets = 2; 
     
     int deep_scan_countdown = 10;
@@ -139,7 +134,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v7 (Final Fix 3) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon v8 starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
@@ -154,6 +149,7 @@ int main(int argc, char *argv[]) {
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor);
     
     g_sys_monitor->start_top_app_monitor();
+    g_sys_monitor->start_audio_monitor();
     g_worker_thread = std::thread(worker_thread_func);
     
     g_server = std::make_unique<UdsServer>("cerberus_socket");
@@ -165,6 +161,7 @@ int main(int argc, char *argv[]) {
     if(g_worker_thread.joinable()) g_worker_thread.join();
     
     g_sys_monitor->stop_top_app_monitor();
+    g_sys_monitor->stop_audio_monitor();
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;
