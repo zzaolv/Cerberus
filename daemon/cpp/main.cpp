@@ -45,9 +45,11 @@ void schedule_task(Task task) {
         g_task_queue.push(std::move(task));
     }
     // Write to eventfd to wake up the select() in main loop
-    uint64_t val = 1;
-    if (write(g_event_fd, &val, sizeof(val)) < 0) {
-        LOGE("Failed to write to eventfd: %s", strerror(errno));
+    if (g_event_fd >= 0) {
+        uint64_t val = 1;
+        if (write(g_event_fd, &val, sizeof(val)) < 0) {
+            LOGE("Failed to write to eventfd: %s", strerror(errno));
+        }
     }
 }
 
@@ -63,6 +65,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         else if (type == "cmd.set_policy") schedule_task(ConfigChangeTask{msg.at("payload")});
         else if (type == "query.refresh_dashboard") schedule_task(RefreshDashboardTask{});
         else if (type == "query.get_all_policies") {
+            // This request needs an immediate synchronous response, so handle it directly
             if (g_state_manager) {
                 json payload = g_state_manager->get_full_config_for_ui();
                 g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
@@ -99,8 +102,10 @@ void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
     // Write to eventfd to break the main loop immediately
-    uint64_t val = 1;
-    write(g_event_fd, &val, sizeof(val));
+    if (g_event_fd >= 0) {
+        uint64_t val = 1;
+        write(g_event_fd, &val, sizeof(val));
+    }
 }
 
 // --- Main Loop ---
@@ -119,7 +124,12 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     LOGI("Project Cerberus Daemon v9 (Stable) starting... (PID: %d)", getpid());
     
-    if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
+    try {
+        if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
+    } catch (const fs::filesystem_error& e) {
+        LOGE("Failed to create data directory: %s", e.what());
+        return 1;
+    }
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto action_executor = std::make_shared<ActionExecutor>();
@@ -194,17 +204,20 @@ int main(int argc, char *argv[]) {
                      notify_probe_of_config_change();
                 } else if constexpr (std::is_same_v<T, ClientDisconnectTask>) {
                     if(arg.fd == g_probe_fd.load()) g_probe_fd = -1;
+                } else if constexpr (std::is_same_v<T, ProbeFgEventTask>) {
+                    g_state_manager->on_app_foreground(arg.payload);
+                } else if constexpr (std::is_same_v<T, ProbeBgEventTask>) {
+                    g_state_manager->on_app_background(arg.payload);
                 }
-                // (ProbeFgEventTask and ProbeBgEventTask are kept for fallback)
             }, task);
         }
     }
 
     LOGI("Shutting down...");
-    g_server->stop();
+    if (g_server) g_server->stop();
     if (uds_thread.joinable()) uds_thread.join();
-    sys_monitor->stop_top_app_monitor();
-    close(g_event_fd);
+    if (sys_monitor) sys_monitor->stop_top_app_monitor();
+    if (g_event_fd >= 0) close(g_event_fd);
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;

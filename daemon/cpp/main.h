@@ -7,6 +7,7 @@
 #include <functional>
 #include <variant>
 #include <string>
+#include <set> // [修复] 添加 <set> 头文件
 
 // [V9] 定义任务类型
 struct ConfigChangeTask { nlohmann::json payload; };
