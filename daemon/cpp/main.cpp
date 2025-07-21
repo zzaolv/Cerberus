@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <mutex>
 #include <unistd.h>
+#include "main.h"
 
 #define LOG_TAG "cerberusd_main_v3_reborn"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -32,7 +33,7 @@ std::atomic<int> g_probe_fd = -1;
 std::mutex g_broadcast_mutex;
 
 // --- Forward Declarations ---
-void broadcast_dashboard_update();
+// void broadcast_dashboard_update();
 void notify_probe_of_config_change();
 
 // --- Message Handler (重构) ---

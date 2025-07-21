@@ -15,7 +15,6 @@
 namespace fs = std::filesystem;
 
 SystemMonitor::SystemMonitor() {
-    // 确定 top-app tasks 文件的准确路径
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
         top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
     } else if (fs::exists("/dev/cpuset/top-app/cgroup.procs")) {
@@ -71,7 +70,6 @@ void SystemMonitor::top_app_monitor_thread() {
         return;
     }
 
-    // 首次启动时，立即触发一次回调
     if (on_top_app_changed_) {
         on_top_app_changed_(read_top_app_pids());
     }
@@ -82,7 +80,7 @@ void SystemMonitor::top_app_monitor_thread() {
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(fd, &read_fds);
-        struct timeval tv { .tv_sec = 1, .tv_usec = 0 }; // 1秒超时，防止永久阻塞
+        struct timeval tv { .tv_sec = 1, .tv_usec = 0 };
 
         int ret = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
         if (ret < 0) {
@@ -90,22 +88,23 @@ void SystemMonitor::top_app_monitor_thread() {
             LOGE("select on inotify fd failed: %s", strerror(errno));
             break;
         }
-        if (ret == 0) continue; // Timeout
+        if (ret == 0) continue;
 
         ssize_t len = read(fd, buf, sizeof(buf));
         if (len <= 0) continue;
 
-        // 我们不需要解析事件内容，只要有事件就重新读取文件
         if (on_top_app_changed_) {
             on_top_app_changed_(read_top_app_pids());
         }
+
+        // [性能优化] 增加一个短暂的休眠，作为物理节流，防止毫秒级事件风暴
+        usleep(50 * 1000); // 50ms
     }
 
     inotify_rm_watch(fd, wd);
     close(fd);
     LOGI("Top-app monitor stopped.");
 }
-
 
 // --- 其他函数保持不变 ---
 void SystemMonitor::update_global_stats() {

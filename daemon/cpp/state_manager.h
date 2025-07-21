@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <set> // [修复] 添加 set 头文件以使用 std::set
+#include <chrono> // [性能优化] 引入chrono
 #include "database_manager.h"
 #include "system_monitor.h"
 #include "action_executor.h"
@@ -69,6 +70,9 @@ private:
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
+
+    // [性能优化] 节流阀时间戳
+    std::chrono::steady_clock::time_point last_top_app_change_processed_ = {};
 
     std::mutex state_mutex_;
     GlobalStatsData global_stats_;
