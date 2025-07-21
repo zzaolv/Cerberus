@@ -8,9 +8,10 @@
 #include <sys/inotify.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <climits>
-#include <sys/stat.h>
+#include <vector>
 
 #define LOG_TAG "cerberusd_monitor_v8_hotfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -19,6 +20,58 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// [V8-Hotfix] 新的辅助函数，通过PID获取UID
+int get_uid_from_pid(int pid) {
+    char path_buffer[64];
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+    struct stat st;
+    if (stat(path_buffer, &st) != 0) return -1;
+    return st.st_uid;
+}
+
+// [V8-Hotfix] 重写 lsof 逻辑，返回所有使用设备的PID
+std::vector<int> get_pids_from_snd_device(const std::string& device_name) {
+    std::vector<int> pids;
+    std::string full_device_path = "/dev/snd/" + device_name;
+    try {
+        for (const auto& dir_entry : fs::directory_iterator("/proc")) {
+            if (!dir_entry.is_directory()) continue;
+            
+            int pid = 0;
+            try {
+                pid = std::stoi(dir_entry.path().filename().string());
+            } catch(...) {
+                continue;
+            }
+
+            if (pid == 0) continue;
+
+            std::string fd_path = dir_entry.path().string() + "/fd";
+            if (!fs::exists(fd_path)) continue;
+
+            for (const auto& fd_entry : fs::directory_iterator(fd_path)) {
+                if (fs::is_symlink(fd_entry.symlink_status())) {
+                    try {
+                        std::string link_target = fs::read_symlink(fd_entry.path()).string();
+                        if (link_target == full_device_path) {
+                            pids.push_back(pid); // 找到后加入列表，而不是立即返回
+                        }
+                    } catch (...) { continue; }
+                }
+            }
+        }
+    } catch(...) {
+        LOGW("Error iterating /proc in get_pids_from_snd_device");
+    }
+    return pids;
+}
+
+// Helper function to find PID using a sound device (kept for compatibility)
+int get_pid_from_snd_device(const std::string& device_name) {
+    auto pids = get_pids_from_snd_device(device_name);
+    return pids.empty() ? -1 : pids[0];
+}
 
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
@@ -50,9 +103,15 @@ void SystemMonitor::stop_top_app_monitor() {
     }
 }
 
-std::set<int> SystemMonitor::get_current_top_pids() {
-    std::lock_guard<std::mutex> lock(top_pids_mutex_);
-    return current_top_pids_;
+std::set<int> SystemMonitor::read_top_app_pids() {
+    std::set<int> pids;
+    if (top_app_tasks_path_.empty()) return pids;
+    std::ifstream file(top_app_tasks_path_);
+    int pid;
+    while (file >> pid) {
+        pids.insert(pid);
+    }
+    return pids;
 }
 
 void SystemMonitor::top_app_monitor_thread() {
@@ -67,12 +126,11 @@ void SystemMonitor::top_app_monitor_thread() {
     while (monitoring_active_) {
         ssize_t len = read(fd, buf, sizeof(buf));
         if (!monitoring_active_) break;
-
         if (len < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        has_new_top_app_event = true; 
+        g_top_app_refresh_tickets = 2; 
     }
     inotify_rm_watch(fd, wd);
     close(fd);
@@ -92,65 +150,22 @@ void SystemMonitor::start_audio_monitor() {
 void SystemMonitor::stop_audio_monitor() {
     audio_monitoring_active_ = false;
     if (audio_thread_.joinable()) {
-        // Create a dummy event to unblock the read() call
-        int fd = inotify_init1(IN_CLOEXEC);
-        if (fd >= 0) {
-            inotify_add_watch(fd, "/dev/snd", IN_ACCESS);
-            // This is a bit of a hack, but safer than other methods
-            int dummy_fd = open("/dev/snd/timer", O_RDONLY);
-            if (dummy_fd >= 0) close(dummy_fd);
-            close(fd);
-        }
         audio_thread_.join();
     }
 }
 
+// [V8-Hotfix] 修改接口实现
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
     return uids_playing_audio_.count(uid) > 0;
 }
 
-int get_uid_from_pid(int pid) {
-    char path_buffer[64];
-    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
-    struct stat st;
-    if (stat(path_buffer, &st) != 0) return -1;
-    return st.st_uid;
+bool SystemMonitor::is_pid_playing_audio(int pid) {
+    std::lock_guard<std::mutex> lock(audio_pids_mutex_);
+    return pids_playing_audio_.count(pid) > 0;
 }
 
-std::vector<int> get_pids_from_snd_device(const std::string& device_name) {
-    std::vector<int> pids;
-    std::string full_device_path = "/dev/snd/" + device_name;
-
-    for (const auto& dir_entry : fs::directory_iterator("/proc")) {
-        if (!dir_entry.is_directory()) continue;
-        
-        // Basic check to skip non-PID directories
-        const char* filename = dir_entry.path().filename().c_str();
-        if (filename[0] < '0' || filename[0] > '9') continue;
-
-        try {
-            int pid = std::stoi(filename);
-            if (pid == 0) continue;
-
-            std::string fd_path = dir_entry.path().string() + "/fd";
-            if (!fs::exists(fd_path)) continue;
-
-            for (const auto& fd_entry : fs::directory_iterator(fd_path)) {
-                if (fs::is_symlink(fd_entry.symlink_status())) {
-                    try {
-                        std::string link_target = fs::read_symlink(fd_entry.path());
-                        if (link_target == full_device_path) {
-                            pids.push_back(pid);
-                        }
-                    } catch (...) { continue; }
-                }
-            }
-        } catch (...) { continue; }
-    }
-    return pids;
-}
-
+// [V8-Hotfix] 重写音频监控线程
 void SystemMonitor::audio_monitor_thread() {
     int fd = inotify_init1(IN_CLOEXEC);
     if (fd < 0) { LOGE("Audio inotify_init1 failed: %s", strerror(errno)); return; }
@@ -171,10 +186,7 @@ void SystemMonitor::audio_monitor_thread() {
         if (ret <= 0) continue;
 
         ssize_t len = read(fd, buf, sizeof(buf));
-        if (len < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+        if (len < 0) continue;
 
         const struct inotify_event *event;
         for (char *ptr = buf; ptr < buf + len; ptr += sizeof(struct inotify_event) + event->len) {
@@ -186,13 +198,15 @@ void SystemMonitor::audio_monitor_thread() {
                         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
                         for (int pid : pids) {
                             int uid = get_uid_from_pid(pid);
-                            if (uid >= 10000) {
+                            if (uid >= 10000) { // 只关心应用UID
                                 uids_playing_audio_.insert(uid);
                                 LOGI("Audio started by UID: %d (from PID: %d)", uid, pid);
                             }
                         }
                     }
                 } else if (event->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)) {
+                    // 当任何一个音频流关闭时，为保险起见，我们重新评估所有音频状态
+                    // 一个更复杂的实现会跟踪每个设备的打开/关闭计数，但这个方法更简单可靠
                     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
                     if (!uids_playing_audio_.empty()) {
                         LOGI("An audio stream closed. Clearing audio UID list for re-evaluation.");
@@ -221,13 +235,10 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
     total_mem_kb = 0;
     total_swap_kb = 0;
     total_cpu_percent = 0.0f;
-
     if (pids.empty()) return;
-
     for (int pid : pids) {
         std::string proc_path = "/proc/" + std::to_string(pid);
         if (!fs::exists(proc_path)) continue;
-
         std::ifstream rollup_file(proc_path + "/smaps_rollup");
         if (rollup_file.is_open()) {
             std::string line;
@@ -240,7 +251,6 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
                 else if (key == "Swap:") total_swap_kb += value;
             }
         }
-
         std::ifstream stat_file(proc_path + "/stat");
         if (stat_file.is_open()) {
             std::string line;
@@ -250,14 +260,12 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
             for(int i = 0; i < 13; ++i) ss >> value;
             long long utime, stime;
             ss >> utime >> stime;
-            
             long long current_app_jiffies = utime + stime;
             long long current_total_jiffies;
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 current_total_jiffies = prev_total_cpu_times_.total();
             }
-
             auto& prev_times = app_cpu_times_[pid];
             if (prev_times.app_jiffies > 0 && prev_times.total_jiffies > 0) {
                 long long app_delta = current_app_jiffies - prev_times.app_jiffies;
@@ -305,12 +313,10 @@ void SystemMonitor::update_cpu_usage() {
     std::stringstream ss(line);
     ss >> cpu_label >> current_times.user >> current_times.nice >> current_times.system >> current_times.idle
        >> current_times.iowait >> current_times.irq >> current_times.softirq >> current_times.steal;
-    
     if (cpu_label == "cpu") {
         long long prev_total = prev_total_cpu_times_.total();
         long long current_total = current_times.total();
         long long delta_total = current_total - prev_total;
-
         if (delta_total > 0) {
             long long delta_idle = current_times.idle_total() - prev_total_cpu_times_.idle_total();
             float cpu_usage = 100.0f * (static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total));
