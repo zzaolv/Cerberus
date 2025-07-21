@@ -10,7 +10,7 @@
 #include <sys/time.h>
 #include <climits> // For NAME_MAX
 
-#define LOG_TAG "cerberusd_monitor_v7_hotfix2"
+#define LOG_TAG "cerberusd_monitor_v7_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,41 +42,55 @@ void SystemMonitor::start_top_app_monitor() {
 
 void SystemMonitor::stop_top_app_monitor() {
     monitoring_active_ = false;
+    // This is a trick to unblock the blocking read() call
+    int fd = open(top_app_tasks_path_.c_str(), O_WRONLY | O_APPEND);
+    if (fd >= 0) {
+        write(fd, "\n", 1);
+        close(fd);
+    }
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
     }
 }
 
-// [V7-Hotfix 2] 这是一个简单的文件读取函数，供主循环直接调用
-std::set<int> SystemMonitor::read_top_app_pids() {
-    std::set<int> pids;
-    if (top_app_tasks_path_.empty()) return pids;
-    std::ifstream file(top_app_tasks_path_);
-    int pid;
-    while (file >> pid) {
-        pids.insert(pid);
-    }
-    return pids;
+std::set<int> SystemMonitor::get_current_top_pids() {
+    std::lock_guard<std::mutex> lock(top_pids_mutex_);
+    return current_top_pids_;
 }
 
-// [V7-Hotfix 2] 监控线程现在极其简单，只负责设置标志，不执行任何昂贵操作
 void SystemMonitor::top_app_monitor_thread() {
     int fd = inotify_init1(IN_CLOEXEC);
     if (fd < 0) { LOGE("inotify_init1 failed: %s", strerror(errno)); return; }
     
     int wd = inotify_add_watch(fd, top_app_tasks_path_.c_str(), IN_CLOSE_WRITE | IN_OPEN | IN_MODIFY);
-    if (wd < 0) { LOGE("inotify_add_watch failed: %s", strerror(errno)); close(fd); return; }
+    if (wd < 0) { LOGE("inotify_add_watch failed for %s: %s", top_app_tasks_path_.c_str(), strerror(errno)); close(fd); return; }
 
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
     while (monitoring_active_) {
         ssize_t len = read(fd, buf, sizeof(buf));
         if (!monitoring_active_) break;
+
         if (len < 0) {
             if (errno == EINTR) continue;
+            LOGE("read from inotify fd failed: %s", strerror(errno));
             break;
         }
+
+        {
+            std::lock_guard<std::mutex> lock(top_pids_mutex_);
+            std::ifstream file(top_app_tasks_path_);
+            int pid;
+            current_top_pids_.clear();
+            while (file >> pid) {
+                current_top_pids_.insert(pid);
+            }
+        }
         has_new_top_app_event = true; 
+
+        // [V7-Final CPU Fix] 物理节流阀: 处理完一次事件后，强制休眠250毫秒
+        // 这将把事件风暴的频率降低到最多每秒4次。
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     inotify_rm_watch(fd, wd);
     close(fd);
