@@ -137,6 +137,9 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+
+// --- [修复] 音频监控实现 ---
+
 void SystemMonitor::start_audio_monitor() {
     if (!fs::exists("/dev/snd")) {
         LOGW("Audio device path /dev/snd not found. Audio monitoring disabled.");
@@ -154,18 +157,49 @@ void SystemMonitor::stop_audio_monitor() {
     }
 }
 
-// [V8-Hotfix] 修改接口实现
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
     return uids_playing_audio_.count(uid) > 0;
 }
 
-bool SystemMonitor::is_pid_playing_audio(int pid) {
-    std::lock_guard<std::mutex> lock(audio_pids_mutex_);
-    return pids_playing_audio_.count(pid) > 0;
+int get_uid_from_pid(int pid) {
+    char path_buffer[64];
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+    struct stat st;
+    if (stat(path_buffer, &st) != 0) return -1;
+    return st.st_uid;
 }
 
-// [V8-Hotfix] 重写音频监控线程
+std::vector<int> get_pids_from_snd_device(const std::string& device_name) {
+    std::vector<int> pids;
+    std::string full_device_path = "/dev/snd/" + device_name;
+    try {
+        for (const auto& dir_entry : fs::directory_iterator("/proc")) {
+            if (!dir_entry.is_directory()) continue;
+            
+            int pid = 0;
+            try { pid = std::stoi(dir_entry.path().filename().string()); } catch(...) { continue; }
+            if (pid == 0) continue;
+
+            std::string fd_path = dir_entry.path().string() + "/fd";
+            if (!fs::exists(fd_path)) continue;
+
+            for (const auto& fd_entry : fs::directory_iterator(fd_path)) {
+                if (fs::is_symlink(fd_entry.symlink_status())) {
+                    try {
+                        if (fs::read_symlink(fd_entry.path()) == full_device_path) {
+                            pids.push_back(pid);
+                        }
+                    } catch (...) { continue; }
+                }
+            }
+        }
+    } catch(const fs::filesystem_error& e) {
+        LOGW("Filesystem error while scanning for audio PIDs: %s", e.what());
+    }
+    return pids;
+}
+
 void SystemMonitor::audio_monitor_thread() {
     int fd = inotify_init1(IN_CLOEXEC);
     if (fd < 0) { LOGE("Audio inotify_init1 failed: %s", strerror(errno)); return; }
@@ -198,15 +232,13 @@ void SystemMonitor::audio_monitor_thread() {
                         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
                         for (int pid : pids) {
                             int uid = get_uid_from_pid(pid);
-                            if (uid >= 10000) { // 只关心应用UID
+                            if (uid >= 10000) {
                                 uids_playing_audio_.insert(uid);
                                 LOGI("Audio started by UID: %d (from PID: %d)", uid, pid);
                             }
                         }
                     }
                 } else if (event->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)) {
-                    // 当任何一个音频流关闭时，为保险起见，我们重新评估所有音频状态
-                    // 一个更复杂的实现会跟踪每个设备的打开/关闭计数，但这个方法更简单可靠
                     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
                     if (!uids_playing_audio_.empty()) {
                         LOGI("An audio stream closed. Clearing audio UID list for re-evaluation.");
