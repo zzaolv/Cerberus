@@ -17,6 +17,7 @@
 #include <cctype>
 #include <ctime>
 #include <algorithm>
+#include <iterator>
 #include <string> // 包含 <string> 以使用 std::string::npos
 
 // 更新日志标签，便于跟踪
@@ -102,10 +103,10 @@ void SystemMonitor::top_app_monitor_thread() {
 
 // --- [核心修复] 终极版音频状态检测 ---
 void SystemMonitor::update_audio_state() {
-    std::set<int> active_uids;
-    std::array<char, 2048> buffer; // 进一步增加缓冲区大小
+    std::set<int> focus_uids;
+    std::set<int> started_player_uids;
+    std::array<char, 2048> buffer;
 
-    // [修复] 移除 stdbuf，因为它在Android环境中不可用
     FILE* pipe = popen("dumpsys audio", "r");
     if (!pipe) {
         LOGW("popen for 'dumpsys audio' failed: %s", strerror(errno));
@@ -117,85 +118,58 @@ void SystemMonitor::update_audio_state() {
 
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
-        // LOGD("Parsing line: %s", line.c_str()); // 打开此行可进行逐行调试
 
         if (line.find("Audio Focus stack entries") != std::string::npos) {
             current_section = ParseSection::FOCUS;
-            LOGD("Entered FOCUS section");
             continue;
         }
         if (line.find("  players:") != std::string::npos) {
             current_section = ParseSection::PLAYERS;
-            LOGD("Entered PLAYERS section");
             continue;
         }
         if (!line.empty() && !isspace(line[0])) {
-            if (current_section != ParseSection::NONE) {
-                LOGD("Exited section %d", static_cast<int>(current_section));
-                current_section = ParseSection::NONE;
-            }
+            current_section = ParseSection::NONE;
         }
 
-        if (current_section == ParseSection::NONE) {
-            continue;
-        }
+        if (current_section == ParseSection::NONE) continue;
         
         try {
             if (current_section == ParseSection::FOCUS) {
                 const std::string uid_marker = "-- uid: ";
                 size_t marker_pos = line.find(uid_marker);
                 if (marker_pos != std::string::npos) {
-                    std::string sub = line.substr(marker_pos + uid_marker.length());
-                    int uid = std::stoi(sub);
-                    if (uid >= 10000) {
-                        active_uids.insert(uid);
-                        LOGD("FOCUS: Found active UID %d", uid);
-                    }
+                    int uid = std::stoi(line.substr(marker_pos + uid_marker.length()));
+                    if (uid >= 10000) focus_uids.insert(uid);
                 }
             } else if (current_section == ParseSection::PLAYERS) {
-                const std::string state_marker = "state:started";
-                const std::string uid_marker = "u/pid:";
-                
-                size_t state_pos = line.find(state_marker);
-                if (state_pos == std::string::npos) {
-                    continue; // 如果不是 started 状态，直接跳过这一行
-                }
-                
-                size_t uid_marker_pos = line.find(uid_marker);
-                if (uid_marker_pos != std::string::npos) {
-                    std::string sub = line.substr(uid_marker_pos + uid_marker.length());
-                    // 安全地提取UID
-                    int uid = 0;
-                    std::stringstream ss(sub);
-                    ss >> uid;
-                    
-                    if (uid >= 10000) {
-                        active_uids.insert(uid);
-                        LOGD("PLAYERS: Found active UID %d with state:started", uid);
+                if (line.find("state:started") != std::string::npos) {
+                    const std::string uid_marker = "u/pid:";
+                    size_t uid_marker_pos = line.find(uid_marker);
+                    if (uid_marker_pos != std::string::npos) {
+                        int uid = 0;
+                        std::stringstream ss(line.substr(uid_marker_pos + uid_marker.length()));
+                        ss >> uid;
+                        if (uid >= 10000) started_player_uids.insert(uid);
                     }
                 }
             }
-        } catch (const std::invalid_argument& e) {
-            LOGW("Parsing error (invalid_argument): %s on line: %s", e.what(), line.c_str());
-        } catch (const std::out_of_range& e) {
-            LOGW("Parsing error (out_of_range): %s on line: %s", e.what(), line.c_str());
-        }
+        } catch (const std::exception& e) { /* ignore parsing errors */ }
     }
+    pclose(pipe);
 
-    int pclose_status = pclose(pipe);
-    if (pclose_status == -1) {
-        LOGE("pclose failed: %s", strerror(errno));
-    } else if (WIFEXITED(pclose_status) && WEXITSTATUS(pclose_status) != 0) {
-        // dumpsys 异常退出，通常不是致命错误
-        LOGW("dumpsys audio exited with status %d", WEXITSTATUS(pclose_status));
-    }
+    // [关键逻辑] 取两个集合的交集，得到真正播放音频的UID
+    std::set<int> active_uids;
+    std::set_intersection(focus_uids.begin(), focus_uids.end(),
+                          started_player_uids.begin(), started_player_uids.end(),
+                          std::inserter(active_uids, active_uids.begin()));
 
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_uids) {
             std::stringstream ss;
             for(int uid : active_uids) { ss << uid << " "; }
-            LOGI("Audio active UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
+            LOGI("Audio active UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+                 uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
     }

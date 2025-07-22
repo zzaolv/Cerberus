@@ -51,33 +51,44 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            val allApps = appInfoRepository.getAllApps(forceRefresh = true)
+            // 步骤 1: 主要数据源变为 Daemon
             val configPayload = daemonRepository.getAllPolicies()
-            val policyMap = configPayload?.policies
-                ?.associateBy { AppInstanceKey(it.packageName, it.userId) } ?: emptyMap()
+            val daemonPolicies = configPayload?.policies ?: emptyList()
+            val policyMap = daemonPolicies
+                .associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            val finalAppList = allApps.toMutableList()
-            val knownInstances = allApps.map { AppInstanceKey(it.packageName, it.userId) }.toSet()
-
-            policyMap.keys.forEach { key ->
+            // 步骤 2: 获取主空间应用作为元数据基础
+            // forceRefresh = false, 优先使用缓存
+            val mainUserApps = appInfoRepository.getAllApps(forceRefresh = false)
+            val finalAppList = mainUserApps.toMutableList()
+            
+            // 已知应用实例的集合，用于快速查找
+            val knownInstances = mainUserApps.map { AppInstanceKey(it.packageName, it.userId) }.toMutableSet()
+            
+            // 步骤 3: 遍历 Daemon 的策略，找出主空间没有的应用 (即分身应用)
+            daemonPolicies.forEach { policy ->
+                val key = AppInstanceKey(policy.packageName, policy.userId)
                 if (!knownInstances.contains(key)) {
-                    val baseApp = appInfoRepository.getAppInfo(key.packageName)
-                    finalAppList.add(
-                        AppInfo(
-                            packageName = key.packageName,
-                            appName = baseApp?.appName ?: key.packageName,
-                            icon = baseApp?.icon,
-                            isSystemApp = baseApp?.isSystemApp ?: false,
-                            userId = key.userId
-                        )
+                    // 这是一个分身应用，且主空间不存在，为它创建降级版 AppInfo
+                    val baseAppInfo = appInfoRepository.getAppInfo(policy.packageName) // 尝试获取主空间图标和名称
+                    
+                    val syntheticAppInfo = AppInfo(
+                        packageName = policy.packageName,
+                        userId = policy.userId,
+                        // 优先使用主空间的名称和图标，如果找不到则降级
+                        appName = baseAppInfo?.appName ?: policy.packageName,
+                        icon = baseAppInfo?.icon ?: ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher),
+                        isSystemApp = baseAppInfo?.isSystemApp ?: false // 沿用主空间应用的系统属性
                     )
+                    finalAppList.add(syntheticAppInfo)
+                    knownInstances.add(key) // 添加到已知集合，防止重复
                 }
             }
 
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    allInstalledApps = finalAppList.distinctBy { app -> AppInstanceKey(app.packageName, app.userId) },
+                    allInstalledApps = finalAppList,
                     policies = policyMap,
                     fullConfig = configPayload
                 )
