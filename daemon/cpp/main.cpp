@@ -29,7 +29,7 @@ static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
 static std::shared_ptr<SystemMonitor> g_sys_monitor;
 static std::atomic<bool> g_is_running = true;
-static std::atomic<int> g_probe_fd = -1;
+std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
 
