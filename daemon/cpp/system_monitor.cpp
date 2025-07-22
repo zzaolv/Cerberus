@@ -17,6 +17,7 @@
 #include <cctype>
 #include <ctime>
 #include <algorithm>
+#include <string> // 包含 <string> 以使用 std::string::npos
 
 // 更新日志标签，便于跟踪
 #define LOG_TAG "cerberusd_monitor_v12_final"
@@ -235,6 +236,83 @@ std::string SystemMonitor::get_current_ime_package() {
     return current_ime_package_;
 }
 
+// [核心新增] 实现定位状态检测
+void SystemMonitor::update_location_state() {
+    std::set<int> active_uids;
+    std::array<char, 2048> buffer;
+
+    FILE* pipe = popen("dumpsys location", "r");
+    if (!pipe) {
+        LOGW("popen for 'dumpsys location' failed: %s", strerror(errno));
+        return;
+    }
+
+    enum class ParseSection { NONE, ACTIVE_PROVIDER };
+    ParseSection current_section = ParseSection::NONE;
+
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        std::string line(buffer.data());
+        
+        // 状态机切换
+        if (line.find("gps provider:") != std::string::npos || line.find("network provider:") != std::string::npos) {
+            current_section = ParseSection::ACTIVE_PROVIDER;
+            continue;
+        }
+        
+        // 如果遇到不带缩进的行，意味着 provider 段落结束了
+        if (!line.empty() && !isspace(line[0])) {
+            current_section = ParseSection::NONE;
+        }
+
+        if (current_section != ParseSection::ACTIVE_PROVIDER) {
+            continue;
+        }
+        
+        // 解析监听者
+        // 格式: "    UID/PACKAGENAME/HASH Request[...]"
+        if (line.find("Request[") != std::string::npos) {
+            // 过滤掉被动请求
+            if (line.find("PASSIVE") != std::string::npos) {
+                continue;
+            }
+
+            try {
+                // 提取 UID
+                std::string trimmed_line = line;
+                trimmed_line.erase(0, trimmed_line.find_first_not_of(" \t"));
+                
+                std::stringstream ss(trimmed_line);
+                int uid = 0;
+                ss >> uid;
+
+                if (uid >= 10000) {
+                    active_uids.insert(uid);
+                    LOGD("LOCATION: Found active UID %d in request: %s", uid, trimmed_line.c_str());
+                }
+            } catch (const std::exception& e) {
+                LOGW("LOCATION: Parsing error on line: %s", line.c_str());
+            }
+        }
+    }
+
+    pclose(pipe);
+
+    {
+        std::lock_guard<std::mutex> lock(location_uids_mutex_);
+        if (uids_using_location_ != active_uids) {
+            std::stringstream ss;
+            for(int uid : active_uids) { ss << uid << " "; }
+            LOGI("Active location UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_using_location_.size(), active_uids.size(), ss.str().c_str());
+            uids_using_location_ = active_uids;
+        }
+    }
+}
+
+
+bool SystemMonitor::is_uid_using_location(int uid) {
+    std::lock_guard<std::mutex> lock(location_uids_mutex_);
+    return uids_using_location_.count(uid) > 0;
+}
 
 void SystemMonitor::update_global_stats() {
     update_cpu_usage();

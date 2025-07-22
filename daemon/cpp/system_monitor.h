@@ -40,12 +40,14 @@ public:
     void start_top_app_monitor();
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
-
-    // [核心修复] 采用新的轮询接口
+    
     void update_audio_state();
     bool is_uid_playing_audio(int uid);
     
-    // [核心修复] 新增接口，用于获取当前输入法
+    // [核心新增] 新增定位状态检测接口
+    void update_location_state();
+    bool is_uid_using_location(int uid);
+    
     std::string get_current_ime_package();
 
 private:
@@ -73,7 +75,10 @@ private:
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
     
-    // [核心修复] 用于缓存当前输入法包名
+    // [核心新增] 新增定位状态相关成员
+    mutable std::mutex location_uids_mutex_;
+    std::set<int> uids_using_location_;
+    
     mutable std::mutex ime_mutex_;
     std::string current_ime_package_;
     time_t last_ime_check_time_ = 0;

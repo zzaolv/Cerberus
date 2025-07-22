@@ -554,6 +554,14 @@ bool StateManager::check_timers() {
         }
         
         if (app.background_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
+
+            // [核心新增] 增加定位豁免检查
+            if (sys_monitor_->is_uid_using_location(app.uid)) {
+                LOGD("TICK: Deferring freeze for %s because it is using location.", app.package_name.c_str());
+                app.background_since = now; // 重置计时器
+                continue;
+            }            
+            
             if (is_app_playing_audio(app)) {
                 LOGD("TICK: Deferring freeze for %s because it has active audio.", app.package_name.c_str());
                 app.background_since = now;

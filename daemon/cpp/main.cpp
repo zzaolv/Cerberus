@@ -104,6 +104,7 @@ void worker_thread_func() {
     
     int deep_scan_countdown = 10;
     int audio_scan_countdown = 3;
+    int location_scan_countdown = 15;
 
     while (g_is_running) {
         bool needs_broadcast = false;
@@ -120,6 +121,13 @@ void worker_thread_func() {
             g_sys_monitor->update_audio_state();
             audio_scan_countdown = 3;
         }
+
+        // [核心新增] 调度定位状态更新
+        if (--location_scan_countdown <= 0) {
+            g_sys_monitor->update_location_state();
+            location_scan_countdown = 15; // 重置计时器
+        }
+
 
         if (g_state_manager->tick_state_machine()) {
             needs_broadcast = true;
