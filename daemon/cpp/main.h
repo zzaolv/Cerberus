@@ -9,7 +9,7 @@
 #include <string>
 #include <set>
 
-// [V9] 定义任务类型
+// 这个 Task 结构看起来是为更高级的事件驱动模型准备的，暂时保留
 struct ConfigChangeTask { nlohmann::json payload; };
 struct TopAppChangeTask { std::set<int> pids; };
 struct TickTask {};
@@ -30,10 +30,12 @@ using Task = std::variant<
     ProbeBgEventTask
 >;
 
-// 全局函数声明
+// --- 全局函数声明 ---
 void broadcast_dashboard_update();
 void notify_probe_of_config_change();
-void schedule_task(Task task);
+
+// 如果您暂时不使用 schedule_task，可以注释掉它以避免潜在的未定义引用错误
+// void schedule_task(Task task); 
 
 // [修复] 声明全局 probe fd
 extern std::atomic<int> g_probe_fd;

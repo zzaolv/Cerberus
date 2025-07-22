@@ -11,19 +11,18 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
-#include <filesystem>
+#include <filesystem> // [核心修复] 包含 <filesystem> 头文件
 #include <mutex>
 #include <unistd.h>
 
-// 更新日志标签
-#define LOG_TAG "cerberusd_main_v12_wakeup"
+#define LOG_TAG "cerberusd_main_v12_wakeup_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 using json = nlohmann::json;
-namespace fs = std.filesystem;
+namespace fs = std::filesystem; // [核心修复] 修正命名空间别名语法
 
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -41,7 +40,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        // [核心新增] 处理来自 Probe 的唤醒请求
         if (type == "event.app_wakeup_request") {
             if (g_state_manager && msg.contains("payload")) {
                 g_state_manager->on_wakeup_request(msg.at("payload"));
@@ -153,8 +151,10 @@ int main(int argc, char *argv[]) {
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
     
     try {
-        if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
-    } catch(const fs::filesystem_error& e) {
+        if (!fs::exists(DATA_DIR)) {
+            fs::create_directories(DATA_DIR);
+        }
+    } catch(const fs::filesystem_error& e) { // [核心修复] 明确使用 std::filesystem::filesystem_error
         LOGE("Failed to create data dir: %s", e.what());
         return 1;
     }

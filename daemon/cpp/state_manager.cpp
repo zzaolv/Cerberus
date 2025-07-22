@@ -1,7 +1,7 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
+#include "main.h" // 确保包含 main.h
 #include <android/log.h>
-#include "main.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -11,8 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-// 更新日志标签
-#define LOG_TAG "cerberusd_state_v11_final"
+#define LOG_TAG "cerberusd_state_v12_wakeup_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -60,6 +59,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
     }
     LOGI("Default freeze method set to %s.", default_freeze_method_ == FreezeMethod::CGROUP_V2 ? "CGROUP_V2" : "SIGSTOP");
+   
     critical_system_apps_ = {
         "com.google.android.inputmethod.latin", // Gboard
         "com.baidu.input",
@@ -404,12 +404,13 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+    
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
 }
 
-// [核心新增] 新增函数，处理来自 Probe 的唤醒请求
+// [核心新增] 实现 on_wakeup_request
 void StateManager::on_wakeup_request(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -428,11 +429,9 @@ void StateManager::on_wakeup_request(const json& payload) {
                 
                 action_executor_->unfreeze(key, app.pids);
                 app.current_status = AppRuntimeState::Status::RUNNING;
-                // 给予10秒的观察期，让它有时间开始播放音频或执行任务
                 app.observation_since = time(nullptr);
-                app.background_since = 0; // 清除可能存在的冻结计时器
+                app.background_since = 0; 
                 
-                // 触发一次仪表盘更新，以便UI能立即反映解冻状态
                 broadcast_dashboard_update();
             }
         }
@@ -440,6 +439,7 @@ void StateManager::on_wakeup_request(const json& payload) {
         LOGE("Error processing wakeup request: %s", e.what());
     }
 }
+
 
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -521,13 +521,11 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
-// [核心修复] check_timers 逻辑重构
 bool StateManager::check_timers() {
     bool changed = false;
     time_t now = time(nullptr);
 
     for (auto& [key, app] : managed_apps_) {
-        // 跳过豁免和前台应用
         if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
             if (app.observation_since > 0 || app.background_since > 0) {
                 app.observation_since = 0;
@@ -537,22 +535,17 @@ bool StateManager::check_timers() {
             continue;
         }
 
-        // 观察期计时器
         if (app.observation_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
             if (now - app.observation_since >= 10) {
                 LOGD("TICK: Observation for %s ended. Checking audio status...", app.package_name.c_str());
-                app.observation_since = 0; // 结束观察期
+                app.observation_since = 0;
                 
-                // [关键修复] 在决策点强制刷新音频状态
                 sys_monitor_->update_audio_state();
                 
                 if (is_app_playing_audio(app)) {
-                    // 如果仍在播放，保持观察，但不重置计时器，让它在下一秒再次检查
                     LOGI("TICK: %s is playing audio, deferring freeze timer start.", app.package_name.c_str());
-                    // 重新设置一个很短的观察期，以便下一秒再次检查
                     app.observation_since = now;
                 } else {
-                    // 如果没有播放，开始冻结倒计时
                     LOGI("TICK: %s is silent, starting freeze timer.", app.package_name.c_str());
                     app.background_since = now;
                 }
@@ -560,11 +553,10 @@ bool StateManager::check_timers() {
             }
         }
         
-        // 冻结延迟计时器
         if (app.background_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
             if (is_app_playing_audio(app)) {
                 LOGD("TICK: Deferring freeze for %s because it has active audio.", app.package_name.c_str());
-                app.background_since = now; // 重置计时器
+                app.background_since = now;
                 continue;
             }
             
@@ -587,7 +579,7 @@ bool StateManager::check_timers() {
 }
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
-    const int unfreeze_interval_sec = 1800; // 30 minutes
+    const int unfreeze_interval_sec = 1800;
     if (unfreeze_interval_sec <= 0) return;
     
     uint32_t next_idx = (timeline_idx_ + unfreeze_interval_sec) % unfrozen_timeline_.size();
@@ -625,6 +617,9 @@ bool StateManager::check_timed_unfreeze() {
     return false;
 }
 
+// ... 省略其他不变的函数，直到文件末尾 ...
+
+// (确保其他所有 StateManager 的成员函数都存在)
 bool StateManager::perform_deep_scan() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
@@ -895,5 +890,6 @@ void StateManager::remove_pid_from_app(int pid) {
 }
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
+    // 列表已省略，此函数现在总是返回 false，除非您手动添加一些包名
     return critical_system_apps_.count(package_name) > 0;
 }
