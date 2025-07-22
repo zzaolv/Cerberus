@@ -1,6 +1,7 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
 #include <android/log.h>
+#include "main.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -10,7 +11,8 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v10_final"
+// 更新日志标签
+#define LOG_TAG "cerberusd_state_v11_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -58,8 +60,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
     }
     LOGI("Default freeze method set to %s.", default_freeze_method_ == FreezeMethod::CGROUP_V2 ? "CGROUP_V2" : "SIGSTOP");
-
-    // [核心修复] 将输入法加入关键应用列表作为后备方案
     critical_system_apps_ = {
         "com.google.android.inputmethod.latin", // Gboard
         "com.baidu.input",
@@ -404,10 +404,41 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-   
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
+}
+
+// [核心新增] 新增函数，处理来自 Probe 的唤醒请求
+void StateManager::on_wakeup_request(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+
+        if (package_name.empty()) return;
+
+        AppInstanceKey key = {package_name, user_id};
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end()) {
+            AppRuntimeState& app = it->second;
+            if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                LOGI("WAKEUP_REQUEST: Unfreezing %s (user %d) due to external request from Probe.",
+                     package_name.c_str(), user_id);
+                
+                action_executor_->unfreeze(key, app.pids);
+                app.current_status = AppRuntimeState::Status::RUNNING;
+                // 给予10秒的观察期，让它有时间开始播放音频或执行任务
+                app.observation_since = time(nullptr);
+                app.background_since = 0; // 清除可能存在的冻结计时器
+                
+                // 触发一次仪表盘更新，以便UI能立即反映解冻状态
+                broadcast_dashboard_update();
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing wakeup request: %s", e.what());
+    }
 }
 
 void StateManager::update_master_config(const MasterConfig& config) {
@@ -417,7 +448,6 @@ void StateManager::update_master_config(const MasterConfig& config) {
     LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
 }
 
-// [核心修复] 重写前台判断逻辑
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (top_pids == last_known_top_pids_) {
@@ -427,10 +457,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     LOGD("Foreground PIDs changed. Old count: %zu, New count: %zu", last_known_top_pids_.size(), top_pids.size());
     last_known_top_pids_ = top_pids;
     
-    // 步骤 1: 获取当前输入法包名
     std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
-
-    // 步骤 2: 从 top_pids 找出所有非输入法的应用
     std::set<AppInstanceKey> non_ime_foreground_keys;
     std::set<AppInstanceKey> all_foreground_keys;
     
@@ -445,14 +472,11 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
         }
     }
 
-    // 步骤 3: 决定最终的前台应用集合
-    // 如果有非输入法的前台应用，就用它；否则（例如在桌面上调出输入法），就用全部集合
     std::set<AppInstanceKey>& final_foreground_keys = non_ime_foreground_keys.empty() ? all_foreground_keys : non_ime_foreground_keys;
     if (final_foreground_keys.size() > 1) {
         LOGD("Multiple foreground apps detected after filtering IME: %zu", final_foreground_keys.size());
     }
 
-    // 步骤 4: 更新应用状态
     bool state_has_changed = false;
     time_t now = time(nullptr);
     for (auto& [key, app] : managed_apps_) {
@@ -497,6 +521,7 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
+// [核心修复] check_timers 逻辑重构
 bool StateManager::check_timers() {
     bool changed = false;
     time_t now = time(nullptr);
@@ -504,7 +529,6 @@ bool StateManager::check_timers() {
     for (auto& [key, app] : managed_apps_) {
         // 跳过豁免和前台应用
         if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
-             // 如果它们有计时器，取消它们
             if (app.observation_since > 0 || app.background_since > 0) {
                 app.observation_since = 0;
                 app.background_since = 0;
@@ -516,9 +540,22 @@ bool StateManager::check_timers() {
         // 观察期计时器
         if (app.observation_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
             if (now - app.observation_since >= 10) {
-                LOGI("TICK: Observation for %s ended. Starting freeze timer.", app.package_name.c_str());
-                app.observation_since = 0;
-                app.background_since = now;
+                LOGD("TICK: Observation for %s ended. Checking audio status...", app.package_name.c_str());
+                app.observation_since = 0; // 结束观察期
+                
+                // [关键修复] 在决策点强制刷新音频状态
+                sys_monitor_->update_audio_state();
+                
+                if (is_app_playing_audio(app)) {
+                    // 如果仍在播放，保持观察，但不重置计时器，让它在下一秒再次检查
+                    LOGI("TICK: %s is playing audio, deferring freeze timer start.", app.package_name.c_str());
+                    // 重新设置一个很短的观察期，以便下一秒再次检查
+                    app.observation_since = now;
+                } else {
+                    // 如果没有播放，开始冻结倒计时
+                    LOGI("TICK: %s is silent, starting freeze timer.", app.package_name.c_str());
+                    app.background_since = now;
+                }
                 changed = true;
             }
         }
@@ -532,11 +569,8 @@ bool StateManager::check_timers() {
             }
             
             int timeout_sec = 0;
-            if(app.config.policy == AppPolicy::STRICT) {
-                timeout_sec = 15;
-            } else if(app.config.policy == AppPolicy::STANDARD) {
-                timeout_sec = master_config_.standard_timeout_sec;
-            }
+            if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
+            else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
 
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
@@ -545,7 +579,7 @@ bool StateManager::check_timers() {
                     changed = true;
                     schedule_timed_unfreeze(app);
                 }
-                app.background_since = 0; // 无论成功与否，计时器结束
+                app.background_since = 0;
             }
         }
     }
@@ -572,9 +606,7 @@ bool StateManager::check_timed_unfreeze() {
     timeline_idx_ = (timeline_idx_ + 1) % unfrozen_timeline_.size();
     int uid_to_unfreeze = unfrozen_timeline_[timeline_idx_];
     
-    if (uid_to_unfreeze == 0) {
-        return false;
-    }
+    if (uid_to_unfreeze == 0) return false;
     
     unfrozen_timeline_[timeline_idx_] = 0;
 
@@ -584,7 +616,6 @@ bool StateManager::check_timed_unfreeze() {
                 LOGI("TIMED UNFREEZE: Waking up %s.", app.package_name.c_str());
                 action_executor_->unfreeze(key, app.pids);
                 app.current_status = AppRuntimeState::Status::RUNNING;
-                // 解冻后直接进入观察期，而不是立即开始冻结倒计时
                 app.observation_since = time(nullptr);
                 return true;
             }
@@ -613,8 +644,6 @@ bool StateManager::perform_deep_scan() {
                 app.undetected_since = now;
             } else if (now - app.undetected_since >= 3) {
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                     // 如果一个应用被冻结，但我们检测不到它的进程了，这意味着它可能已经被系统杀死。
-                     // 此时应该重置它的状态为 STOPPED，而不是让它一直卡在 FROZEN。
                      LOGI("Frozen app %s no longer has active PIDs. Marking as STOPPED.", app.package_name.c_str());
                 }
                 app.current_status = AppRuntimeState::Status::STOPPED;
@@ -678,7 +707,6 @@ json StateManager::get_dashboard_payload() {
     };
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
-        // 不再显示没有进程且配置为豁免的应用，除非它是前台（几乎不可能）
         if (app.pids.empty() && app.config.policy == AppPolicy::EXEMPTED && !app.is_foreground) {
             continue;
         }
@@ -702,8 +730,6 @@ json StateManager::get_dashboard_payload() {
     payload["apps_runtime_state"] = apps_state;
     return payload;
 }
-
-// ... 剩余函数保持不变 ...
 
 json StateManager::get_full_config_for_ui() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -864,7 +890,6 @@ void StateManager::remove_pid_from_app(int pid) {
             app->background_since = 0;
             app->observation_since = 0;
             app->undetected_since = 0;
-            // 状态不在此时设置为 STOPPED，交由 deep_scan 统一处理
         }
     }
 }

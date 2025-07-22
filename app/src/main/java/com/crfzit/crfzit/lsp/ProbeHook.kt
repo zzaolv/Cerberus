@@ -25,14 +25,13 @@ class ProbeHook : IXposedHookLoadPackage {
     private var udsClient: UdsClient? = null
     private val gson = Gson()
 
-    // [V5修复] PowerManager实例现在是可空类型，并在更早的时机获取
     @Volatile
     private var powerManager: PowerManager? = null
 
     private val foregroundStatusCache = ConcurrentHashMap<Int, Boolean>()
 
     companion object {
-        private const val TAG = "CerberusProbe_v5_Universal"
+        private const val TAG = "CerberusProbe_v6_MediaWakeup"
         private const val PER_USER_RANGE = 100000
     }
 
@@ -45,21 +44,67 @@ class ProbeHook : IXposedHookLoadPackage {
                 setupPersistentUdsCommunication()
             }
             try {
-                // [V5修复] 采用全新的、更具兼容性的Hook策略
                 hookSystemServerForCoreObjects(lpparam.classLoader)
-                hookAMSForProcessStateChanges(lpparam.classLoader) // 终极Hook点
+                hookAMSForProcessStateChanges(lpparam.classLoader)
                 hookWakelocksAndAlarms(lpparam.classLoader)
+                // [核心新增] Hook媒体服务以实现唤醒
+                hookMediaSessionService(lpparam.classLoader)
             } catch (t: Throwable) {
                 logError("CRITICAL: Failed during hook placement: $t")
             }
         }
     }
 
-    // 策略1: 在系统服务启动的早期就Hook，以确保能捕获到PowerManager实例
+    // [核心新增] 策略4: Hook MediaSessionService 以捕获播放事件
+    private fun hookMediaSessionService(classLoader: ClassLoader) {
+        try {
+            val mssClass = XposedHelpers.findClass("com.android.server.media.MediaSessionService", classLoader)
+            // Hook dispatchMediaKeyEvent，这是处理媒体按键（播放/暂停/下一曲）的核心方法
+            // 这个方法的签名在不同安卓版本上可能略有不同，我们寻找一个通用模式
+            val dispatchMethod = mssClass.declaredMethods.find {
+                it.name == "dispatchMediaKeyEvent" && it.parameterTypes.size >= 3
+            }
+
+            if (dispatchMethod != null) {
+                XposedBridge.hookMethod(dispatchMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        // 目标应用的包名通常是第一个或第二个参数
+                        val packageName = param.args.find { it is String } as? String ?: return
+                        
+                        // 获取 UID 和 UserID
+                        // MediaSessionRecord 通常作为参数或在 this.mSessionRecords 中
+                        val callingUid = try {
+                            // 尝试从一个名为 SessionPlayer a2 的内部类中获取
+                             val sessionRecord = param.args.find { it?.javaClass?.name?.contains("SessionPlayer") == true }
+                             if (sessionRecord != null) {
+                                XposedHelpers.getIntField(sessionRecord, "mUid")
+                             } else -1
+                        } catch (t: Throwable) {
+                            -1
+                        }
+
+                        if (callingUid < Process.FIRST_APPLICATION_UID) return
+
+                        val userId = callingUid / PER_USER_RANGE
+
+                        log("WAKEUP: Media key event for $packageName (uid: $callingUid, user: $userId). Notifying daemon.")
+                        sendEventToDaemon("event.app_wakeup_request", mapOf("package_name" to packageName, "user_id" to userId))
+                    }
+                })
+                log("SUCCESS: Hook placed on MediaSessionService#${dispatchMethod.name} for media wakeup.")
+            } else {
+                logError("Hook on MediaSessionService failed, dispatchMediaKeyEvent method not found.")
+            }
+        } catch (t: Throwable) {
+            logError("Failed to hook MediaSessionService: $t")
+        }
+    }
+
+    // --- 其他已有函数保持不变 ---
+
     private fun hookSystemServerForCoreObjects(classLoader: ClassLoader) {
         try {
             val systemServerClass = XposedHelpers.findClass("com.android.server.SystemServer", classLoader)
-            // Hook startOtherServices，这是大多数服务（包括AMS）完成初始化的阶段
             XposedBridge.hookAllMethods(systemServerClass, "startOtherServices", object: XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (powerManager == null) {
@@ -69,7 +114,6 @@ class ProbeHook : IXposedHookLoadPackage {
                                 "getService", "power"
                             )
                             if (pm != null) {
-                                // 我们拿到的是Binder代理，需要找到实际的Service实例
                                 val pmsClass = XposedHelpers.findClass("com.android.server.power.PowerManagerService", classLoader)
                                 powerManager = XposedHelpers.findFirstFieldByExactType(pmsClass, PowerManager::class.java).get(null) as? PowerManager
                                 log("Successfully got PowerManager instance via ServiceManager.")
@@ -84,15 +128,13 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Failed to hook SystemServer for core objects: $t")
         }
     }
-
-    // 策略2: 终极进程状态Hook - 广撒网，Hook所有可能改变进程状态的方法
+    
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
             val processRecordClass = XposedHelpers.findClass("com.android.server.am.ProcessRecord", classLoader)
 
             var hookedMethodCount = 0
-            // 扫描AMS中所有第一个参数是ProcessRecord的方法
             amsClass.declaredMethods.filter {
                 it.parameterTypes.firstOrNull() == processRecordClass
             }.forEach { method ->
@@ -114,17 +156,13 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // 统一的状态处理逻辑
     private fun handleProcessStateChange(processRecord: Any) {
         val appInfo = XposedHelpers.getObjectField(processRecord, "info") as? ApplicationInfo ?: return
         val uid = appInfo.uid
         if (uid < Process.FIRST_APPLICATION_UID) return
 
-        // 核心判断逻辑保持不变，但现在由更可靠的Hook点触发
         val adj = XposedHelpers.getIntField(processRecord, "mCurAdj")
         val procState = XposedHelpers.getIntField(processRecord, "mCurProcState")
-
-        // 可感知的adj值通常<=200，进程状态为TOP是2
         val isForeground = adj <= 200 || procState == 2
 
         val lastStatus = foregroundStatusCache[uid]
@@ -143,7 +181,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // 策略3：唤醒拦截逻辑保持动态扫描，增强健壮性
     private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {
         try {
             val pmsClass = XposedHelpers.findClass("com.android.server.power.PowerManagerService", classLoader)
@@ -190,8 +227,7 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Failed to hook AlarmManagerService: $t")
         }
     }
-
-    // (UDS通信, ConfigManager等辅助代码保持不变)
+    
     private suspend fun setupPersistentUdsCommunication() {
         log("Persistent communication manager started.")
         while (scope.isActive) {

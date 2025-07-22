@@ -15,14 +15,15 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v8_final2"
+// 更新日志标签
+#define LOG_TAG "cerberusd_main_v12_wakeup"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;
+namespace fs = std.filesystem;
 
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -39,7 +40,13 @@ void handle_client_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
-        if (type == "cmd.set_policy") {
+
+        // [核心新增] 处理来自 Probe 的唤醒请求
+        if (type == "event.app_wakeup_request") {
+            if (g_state_manager && msg.contains("payload")) {
+                g_state_manager->on_wakeup_request(msg.at("payload"));
+            }
+        } else if (type == "cmd.set_policy") {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
@@ -94,7 +101,7 @@ void signal_handler(int signum) {
 }
 
 void worker_thread_func() {
-    LOGI("Worker thread started with final model.");
+    LOGI("Worker thread started.");
     g_top_app_refresh_tickets = 2; 
     
     int deep_scan_countdown = 10;
@@ -143,7 +150,7 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    LOGI("Project Cerberus Daemon v8 (Final) starting... (PID: %d)", getpid());
+    LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
