@@ -3,6 +3,7 @@
         "*.mmd": "markdown",
         "functional": "cpp",
         "filesystem": "cpp",
-        "xstring": "cpp"
+        "xstring": "cpp",
+        "set": "cpp"
     }
 }

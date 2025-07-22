@@ -41,9 +41,12 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
 
-    // [修复] 采用新的轮询接口
+    // [核心修复] 采用新的轮询接口
     void update_audio_state();
     bool is_uid_playing_audio(int uid);
+    
+    // [核心修复] 新增接口，用于获取当前输入法
+    std::string get_current_ime_package();
 
 private:
     void update_cpu_usage();
@@ -69,6 +72,11 @@ private:
 
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
+    
+    // [核心修复] 用于缓存当前输入法包名
+    mutable std::mutex ime_mutex_;
+    std::string current_ime_package_;
+    time_t last_ime_check_time_ = 0;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H

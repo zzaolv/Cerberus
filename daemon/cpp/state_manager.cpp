@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v8"
+#define LOG_TAG "cerberusd_state_v10_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -59,7 +59,13 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     }
     LOGI("Default freeze method set to %s.", default_freeze_method_ == FreezeMethod::CGROUP_V2 ? "CGROUP_V2" : "SIGSTOP");
 
-        critical_system_apps_ = {
+    // [核心修复] 将输入法加入关键应用列表作为后备方案
+    critical_system_apps_ = {
+        "com.google.android.inputmethod.latin", // Gboard
+        "com.baidu.input",
+        "com.sohu.inputmethod.sogou",
+        "com.iflytek.inputmethod",
+        "com.tencent.qqpinyin",
         "com.xiaomi.mibrain.speech",
         "com.xiaomi.scanner",
         "zygote",
@@ -122,7 +128,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.iqoo.packageinstaller",
         "com.vivo.packageinstaller",
         "com.google.android.packageinstaller",
-        "com.baidu.input",
         "com.baidu.input_huawei",
         "com.baidu.input_oppo",
         "com.baidu.input_vivo",
@@ -135,7 +140,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.sohu.inputmethod.sogou.zte",
         "com.sohu.inputmethod.sogou.samsung",
         "com.sohu.input_yijia",
-        "com.iflytek.inputmethod",
         "com.iflytek.inputmethod.miui",
         "com.iflytek.inputmethod.googleplay",
         "com.iflytek.inputmethod.smartisan",
@@ -144,7 +148,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.iflytek.inputmethod.custom",
         "com.iflytek.inputmethod.blackshark",
         "com.iflytek.inputmethod.zte",
-        "com.tencent.qqpinyin",
         "com.touchtype.swiftkey",
         "com.touchtype.swiftkey.beta",
         "im.weshine.keyboard",
@@ -414,6 +417,7 @@ void StateManager::update_master_config(const MasterConfig& config) {
     LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
 }
 
+// [核心修复] 重写前台判断逻辑
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (top_pids == last_known_top_pids_) {
@@ -423,37 +427,55 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     LOGD("Foreground PIDs changed. Old count: %zu, New count: %zu", last_known_top_pids_.size(), top_pids.size());
     last_known_top_pids_ = top_pids;
     
-    std::set<AppInstanceKey> current_foreground_keys;
+    // 步骤 1: 获取当前输入法包名
+    std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
+
+    // 步骤 2: 从 top_pids 找出所有非输入法的应用
+    std::set<AppInstanceKey> non_ime_foreground_keys;
+    std::set<AppInstanceKey> all_foreground_keys;
+    
     for (int pid : top_pids) {
         auto it = pid_to_app_map_.find(pid);
         if (it != pid_to_app_map_.end()) {
-            current_foreground_keys.insert({it->second->package_name, it->second->user_id});
+            AppInstanceKey key = {it->second->package_name, it->second->user_id};
+            all_foreground_keys.insert(key);
+            if (it->second->package_name != current_ime_pkg) {
+                non_ime_foreground_keys.insert(key);
+            }
         }
     }
-    
+
+    // 步骤 3: 决定最终的前台应用集合
+    // 如果有非输入法的前台应用，就用它；否则（例如在桌面上调出输入法），就用全部集合
+    std::set<AppInstanceKey>& final_foreground_keys = non_ime_foreground_keys.empty() ? all_foreground_keys : non_ime_foreground_keys;
+    if (final_foreground_keys.size() > 1) {
+        LOGD("Multiple foreground apps detected after filtering IME: %zu", final_foreground_keys.size());
+    }
+
+    // 步骤 4: 更新应用状态
     bool state_has_changed = false;
     time_t now = time(nullptr);
     for (auto& [key, app] : managed_apps_) {
-        bool is_now_foreground = current_foreground_keys.count(key);
+        bool is_now_foreground = final_foreground_keys.count(key);
         if (app.is_foreground != is_now_foreground) {
             state_has_changed = true;
             app.is_foreground = is_now_foreground;
             if (is_now_foreground) {
                 if (app.observation_since > 0 || app.background_since > 0) {
-                    LOGI("State: Timers cancelled for %s (foreground).", key.first.c_str());
+                    LOGI("State: Timers cancelled for %s (became foreground).", key.first.c_str());
                 }
                 app.observation_since = 0;
                 app.background_since = 0;
 
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    LOGI("State: Unfreezing %s (foreground).", key.first.c_str());
+                    LOGI("State: Unfreezing %s (became foreground).", key.first.c_str());
                     action_executor_->unfreeze(key, app.pids);
                     app.current_status = AppRuntimeState::Status::RUNNING;
                 }
             } else {
                 app.background_since = 0;
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
-                    LOGI("State: Observation period started for %s.", key.first.c_str());
+                    LOGI("State: Observation period started for %s (became background).", key.first.c_str());
                     app.observation_since = now;
                 } else {
                     app.observation_since = 0;
@@ -480,7 +502,19 @@ bool StateManager::check_timers() {
     time_t now = time(nullptr);
 
     for (auto& [key, app] : managed_apps_) {
-        if (app.observation_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
+        // 跳过豁免和前台应用
+        if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
+             // 如果它们有计时器，取消它们
+            if (app.observation_since > 0 || app.background_since > 0) {
+                app.observation_since = 0;
+                app.background_since = 0;
+                changed = true;
+            }
+            continue;
+        }
+
+        // 观察期计时器
+        if (app.observation_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
             if (now - app.observation_since >= 10) {
                 LOGI("TICK: Observation for %s ended. Starting freeze timer.", app.package_name.c_str());
                 app.observation_since = 0;
@@ -489,19 +523,21 @@ bool StateManager::check_timers() {
             }
         }
         
-        if (app.background_since > 0 && !app.is_foreground && app.current_status == AppRuntimeState::Status::RUNNING) {
-            // [V8-Hotfix] 这里的豁免检查现在是基于UID的，将正确工作
+        // 冻结延迟计时器
+        if (app.background_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
             if (is_app_playing_audio(app)) {
-                LOGD("TICK: Deferring freeze for %s because it is playing audio.", app.package_name.c_str());
-                app.background_since = now;
+                LOGD("TICK: Deferring freeze for %s because it has active audio.", app.package_name.c_str());
+                app.background_since = now; // 重置计时器
                 continue;
             }
+            
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) {
                 timeout_sec = 15;
             } else if(app.config.policy == AppPolicy::STANDARD) {
                 timeout_sec = master_config_.standard_timeout_sec;
             }
+
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
@@ -509,7 +545,7 @@ bool StateManager::check_timers() {
                     changed = true;
                     schedule_timed_unfreeze(app);
                 }
-                app.background_since = 0;
+                app.background_since = 0; // 无论成功与否，计时器结束
             }
         }
     }
@@ -548,6 +584,7 @@ bool StateManager::check_timed_unfreeze() {
                 LOGI("TIMED UNFREEZE: Waking up %s.", app.package_name.c_str());
                 action_executor_->unfreeze(key, app.pids);
                 app.current_status = AppRuntimeState::Status::RUNNING;
+                // 解冻后直接进入观察期，而不是立即开始冻结倒计时
                 app.observation_since = time(nullptr);
                 return true;
             }
@@ -575,6 +612,11 @@ bool StateManager::perform_deep_scan() {
             if (app.undetected_since == 0) {
                 app.undetected_since = now;
             } else if (now - app.undetected_since >= 3) {
+                if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                     // 如果一个应用被冻结，但我们检测不到它的进程了，这意味着它可能已经被系统杀死。
+                     // 此时应该重置它的状态为 STOPPED，而不是让它一直卡在 FROZEN。
+                     LOGI("Frozen app %s no longer has active PIDs. Marking as STOPPED.", app.package_name.c_str());
+                }
                 app.current_status = AppRuntimeState::Status::STOPPED;
                 app.is_foreground = false;
                 app.background_since = 0;
@@ -597,6 +639,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
     LOGI("Applying new configuration from UI...");
     db_manager_->clear_all_policies();
     
+    bool state_changed = false;
     for (const auto& policy_item : payload["policies"]) {
         AppConfig new_config;
         new_config.package_name = policy_item.value("package_name", "");
@@ -608,16 +651,19 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
         
         AppRuntimeState* app = get_or_create_app_state(new_config.package_name, new_config.user_id);
         if (app) {
-            if (app->config.policy != new_config.policy && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
+            bool policy_changed = app->config.policy != new_config.policy;
+            app->config = new_config;
+
+            if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
                  LOGI("Policy for frozen app %s changed to exempt. Unfreezing.", app->package_name.c_str());
                  action_executor_->unfreeze({app->package_name, app->user_id}, app->pids);
                  app->current_status = AppRuntimeState::Status::RUNNING;
+                 state_changed = true;
             }
-            app->config = new_config;
         }
     }
     LOGI("New configuration applied.");
-    return true; 
+    return state_changed;
 }
 
 json StateManager::get_dashboard_payload() {
@@ -632,6 +678,10 @@ json StateManager::get_dashboard_payload() {
     };
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
+        // 不再显示没有进程且配置为豁免的应用，除非它是前台（几乎不可能）
+        if (app.pids.empty() && app.config.policy == AppPolicy::EXEMPTED && !app.is_foreground) {
+            continue;
+        }
         json app_json;
         app_json["package_name"] = app.package_name;
         app_json["app_name"] = app.app_name;
@@ -652,6 +702,8 @@ json StateManager::get_dashboard_payload() {
     payload["apps_runtime_state"] = apps_state;
     return payload;
 }
+
+// ... 剩余函数保持不变 ...
 
 json StateManager::get_full_config_for_ui() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -805,7 +857,6 @@ void StateManager::remove_pid_from_app(int pid) {
         auto& pids = app->pids;
         pids.erase(std::remove(pids.begin(), pids.end(), pid), pids.end());
         if (pids.empty()) {
-            app->current_status = AppRuntimeState::Status::STOPPED;
             app->mem_usage_kb = 0;
             app->swap_usage_kb = 0;
             app->cpu_usage_percent = 0.0f;
@@ -813,6 +864,7 @@ void StateManager::remove_pid_from_app(int pid) {
             app->background_since = 0;
             app->observation_since = 0;
             app->undetected_since = 0;
+            // 状态不在此时设置为 STOPPED，交由 deep_scan 统一处理
         }
     }
 }

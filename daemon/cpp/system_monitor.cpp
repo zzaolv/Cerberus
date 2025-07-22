@@ -12,13 +12,13 @@
 #include <fcntl.h>
 #include <climits>
 #include <vector>
-// [新增] 必要的头文件
 #include <cstdio>
 #include <array>
 #include <cctype>
+#include <ctime>
+#include <algorithm>
 
-// [修改] 更新日志TAG以反映新的修复
-#define LOG_TAG "cerberusd_monitor_v9_audiofix"
+#define LOG_TAG "cerberusd_monitor_v11_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -98,60 +98,86 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// --- [核心修复] 使用 `dumpsys audio` 全面重写音频状态检测 ---
+// --- [核心修复] 再次重写音频状态检测，增加对 player state 的精确判断 ---
 void SystemMonitor::update_audio_state() {
     std::set<int> active_uids;
-    std::array<char, 512> buffer;
+    std::array<char, 1024> buffer;
 
-    FILE* pipe = popen("dumpsys audio", "r");
+    // 使用 stdbuf -oL 确保行缓冲，减少 broken pipe 的概率
+    FILE* pipe = popen("stdbuf -oL dumpsys audio", "r");
     if (!pipe) {
         LOGW("popen for 'dumpsys audio' failed: %s", strerror(errno));
         return;
     }
 
-    bool in_focus_stack = false;
+    enum class ParseSection { NONE, FOCUS, PLAYERS };
+    ParseSection current_section = ParseSection::NONE;
+
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
-        if (!in_focus_stack) {
-            if (line.find("Audio Focus stack entries") != std::string::npos) {
-                in_focus_stack = true;
-            }
+        // 状态机切换
+        if (line.find("Audio Focus stack entries") != std::string::npos) {
+            current_section = ParseSection::FOCUS;
             continue;
         }
-
-        // 焦点栈开始后，如果遇到非空格开头的行或空行，说明栈结束了
-        if (line.length() <= 1 || !isspace(line[0])) {
-            break;
+        // "players:" 是 PlaybackActivityMonitor 的开始标志
+        if (line.find("  players:") != std::string::npos) {
+            current_section = ParseSection::PLAYERS;
+            continue;
+        }
+        // 如果遇到非缩进的行，通常意味着一个段落的结束
+        if (!line.empty() && !isspace(line[0])) {
+            current_section = ParseSection::NONE;
         }
 
-        const std::string uid_marker = " -- uid: ";
-        size_t uid_pos = line.find(uid_marker);
-        if (uid_pos != std::string::npos) {
-            try {
-                std::string uid_str = line.substr(uid_pos + uid_marker.length());
-                int uid = std::stoi(uid_str);
-                if (uid >= 10000) { // 只关心应用UID
-                    active_uids.insert(uid);
+        if (current_section == ParseSection::NONE) {
+            continue;
+        }
+        
+        try {
+            if (current_section == ParseSection::FOCUS) {
+                const std::string uid_marker = "-- uid: ";
+                size_t uid_pos = line.find(uid_marker);
+                if (uid_pos != std::string::npos) {
+                    int uid = std::stoi(line.substr(uid_pos + uid_marker.length()));
+                    if (uid >= 10000) {
+                        active_uids.insert(uid);
+                    }
                 }
-            } catch (...) {
-                // 忽略解析错误，继续处理下一行
+            } else if (current_section == ParseSection::PLAYERS) {
+                // [关键修复] 必须同时找到 uid 和 'state:started'
+                const std::string state_marker = "state:started";
+                const std::string uid_marker = "u/pid:";
+                
+                size_t state_pos = line.find(state_marker);
+                size_t uid_pos = line.find(uid_marker);
+
+                if (state_pos != std::string::npos && uid_pos != std::string::npos) {
+                    // 找到了一个正在播放的播放器
+                    std::string uid_pid_str = line.substr(uid_pos + uid_marker.length());
+                    int uid = std::stoi(uid_pid_str); // stoi会读取到第一个非数字字符为止，也就是'/'
+                    if (uid >= 10000) {
+                        active_uids.insert(uid);
+                    }
+                }
             }
+        } catch (const std::exception& e) {
+            // 忽略解析错误
         }
     }
 
     pclose(pipe);
 
-    // 在锁内更新全局状态
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_uids) {
-            if (!active_uids.empty() && uids_playing_audio_.empty()) {
-                LOGI("Audio focus acquired by one or more UIDs. Count: %zu", active_uids.size());
-            } else if (active_uids.empty() && !uids_playing_audio_.empty()) {
-                LOGI("All audio focus has been released.");
-            } else {
-                 LOGD("Audio focus UIDs changed. New count: %zu", active_uids.size());
+            if (active_uids.empty() && !uids_playing_audio_.empty()) {
+                LOGI("Audio activity ceased. Previously active UIDs count: %zu", uids_playing_audio_.size());
+            } else if (!active_uids.empty()) {
+                 std::stringstream ss;
+                 for(int uid : active_uids) { ss << uid << " "; }
+                 LOGI("Audio active UIDs updated. New count: %zu, UIDs: [ %s]", active_uids.size(), ss.str().c_str());
             }
             uids_playing_audio_ = active_uids;
         }
@@ -163,8 +189,37 @@ bool SystemMonitor::is_uid_playing_audio(int uid) {
     return uids_playing_audio_.count(uid) > 0;
 }
 
+std::string SystemMonitor::get_current_ime_package() {
+    std::lock_guard<std::mutex> lock(ime_mutex_);
+    time_t now = time(nullptr);
+    
+    if (now - last_ime_check_time_ > 60 || current_ime_package_.empty()) {
+        std::array<char, 256> buffer;
+        std::string result = "";
+        FILE* pipe = popen("settings get secure default_input_method", "r");
+        if (pipe) {
+            if (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+                result = buffer.data();
+            }
+            pclose(pipe);
+        }
 
-// --- Global & App Stats Functions (保持完整) ---
+        size_t slash_pos = result.find('/');
+        if (slash_pos != std::string::npos) {
+            current_ime_package_ = result.substr(0, slash_pos);
+        } else {
+            result.erase(std::remove(result.begin(), result.end(), '\n'), result.end());
+            current_ime_package_ = result;
+        }
+        
+        last_ime_check_time_ = now;
+        LOGD("Checked default IME: '%s'", current_ime_package_.c_str());
+    }
+    
+    return current_ime_package_;
+}
+
+
 void SystemMonitor::update_global_stats() {
     update_cpu_usage();
     update_mem_info();
