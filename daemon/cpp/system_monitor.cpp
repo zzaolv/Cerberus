@@ -18,6 +18,7 @@
 #include <ctime>
 #include <algorithm>
 #include <iterator>
+#include <chrono> // 新增
 #include <string> // 包含 <string> 以使用 std::string::npos
 
 // 更新日志标签，便于跟踪
@@ -178,6 +179,146 @@ void SystemMonitor::update_audio_state() {
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
     return uids_playing_audio_.count(uid) > 0;
+}
+
+// [核心新增] 启动和停止网络快照线程
+void SystemMonitor::start_network_snapshot_thread() {
+    if (network_monitoring_active_) return;
+    network_monitoring_active_ = true;
+    // 首次运行时，先获取一次基准快照
+    {
+        std::lock_guard<std::mutex> lock(traffic_mutex_);
+        last_traffic_snapshot_ = read_current_traffic();
+        last_snapshot_time_ = std::chrono::steady_clock::now();
+    }
+    network_thread_ = std::thread(&SystemMonitor::network_snapshot_thread_func, this);
+    LOGI("Network snapshot thread started.");
+}
+
+void SystemMonitor::stop_network_snapshot_thread() {
+    network_monitoring_active_ = false;
+    if (network_thread_.joinable()) {
+        network_thread_.join();
+    }
+}
+
+// [核心新增] 后台线程，仅负责定时更新快照
+void SystemMonitor::network_snapshot_thread_func() {
+    while (network_monitoring_active_) {
+        std::this_thread::sleep_for(std::chrono::seconds(5)); // 每5秒采集一次
+        if (!network_monitoring_active_) break;
+
+        auto current_traffic = read_current_traffic();
+        {
+            std::lock_guard<std::mutex> lock(traffic_mutex_);
+            last_traffic_snapshot_ = current_traffic;
+            last_snapshot_time_ = std::chrono::steady_clock::now();
+        }
+        LOGD("Network traffic snapshot updated.");
+    }
+    LOGI("Network snapshot thread stopped.");
+}
+
+// 辅助函数，执行shell命令并返回结果
+static std::string exec_shell_pipe(const char* cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) {
+        LOGE("popen() failed!");
+        return "";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
+// [核心新增] 封装数据源读取逻辑，实现优雅降级
+std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
+    std::map<int, TrafficStats> snapshot;
+    const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
+
+    std::ifstream qtaguid_file(qtaguid_path);
+    if (qtaguid_file.is_open()) {
+        // 方案A: 读取内核文件 (高效)
+        std::string line;
+        std::getline(qtaguid_file, line); // 跳过表头
+        while (std::getline(qtaguid_file, line)) {
+            std::stringstream ss(line);
+            std::string idx, iface, acct_tag, set;
+            int uid, cnt_set, protocol;
+            long long rx_bytes, rx_packets, tx_bytes, tx_packets;
+            ss >> idx >> iface >> acct_tag >> uid >> cnt_set >> set >> protocol >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
+            if (uid >= 10000) {
+                snapshot[uid].rx_bytes += rx_bytes;
+                snapshot[uid].tx_bytes += tx_bytes;
+            }
+        }
+    } else {
+        // 方案B: dumpsys netstats (兼容)
+        std::string result = exec_shell_pipe("dumpsys netstats");
+        std::stringstream ss(result);
+        std::string line;
+        bool in_map_section = false;
+
+        while (std::getline(ss, line)) {
+            if (line.find("mAppUidStatsMap:") != std::string::npos) {
+                in_map_section = true;
+                std::getline(ss, line); // 跳过表头
+                continue;
+            }
+            if (in_map_section) {
+                if(line.empty() || !isspace(line[0])) break;
+                
+                std::stringstream line_ss(line);
+                int uid;
+                long long rx_bytes, tx_bytes, rx_packets, tx_packets;
+                line_ss >> uid >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
+                
+                if (uid >= 10000) {
+                    snapshot[uid].rx_bytes += rx_bytes;
+                    snapshot[uid].tx_bytes += tx_bytes;
+                }
+            }
+        }
+    }
+    return snapshot;
+}
+
+// [核心新增] 按需计算指定UID的瞬时网速
+NetworkSpeed SystemMonitor::get_instant_network_speed(int uid) {
+    auto current_traffic = read_current_traffic();
+    auto current_time = std::chrono::steady_clock::now();
+
+    std::map<int, TrafficStats> last_snapshot;
+    std::chrono::steady_clock::time_point last_time;
+
+    {
+        std::lock_guard<std::mutex> lock(traffic_mutex_);
+        last_snapshot = last_traffic_snapshot_;
+        last_time = last_snapshot_time_;
+    }
+
+    NetworkSpeed speed;
+    auto last_it = last_snapshot.find(uid);
+    auto current_it = current_traffic.find(uid);
+
+    if (last_it != last_snapshot.end() && current_it != current_traffic.end()) {
+        double time_delta_sec = std::chrono::duration_cast<std::chrono::duration<double>>(current_time - last_time).count();
+        if (time_delta_sec > 0.1) { // 避免除以0
+            long long rx_delta = current_it->second.rx_bytes - last_it->second.rx_bytes;
+            long long tx_delta = current_it->second.tx_bytes - last_it->second.tx_bytes;
+
+            if (rx_delta > 0) {
+                speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
+            }
+            if (tx_delta > 0) {
+                speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
+            }
+        }
+    }
+    return speed;
 }
 
 std::string SystemMonitor::get_current_ime_package() {

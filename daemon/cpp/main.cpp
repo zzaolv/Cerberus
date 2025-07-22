@@ -179,6 +179,7 @@ int main(int argc, char *argv[]) {
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor);
     
     g_sys_monitor->start_top_app_monitor();
+    g_sys_monitor->start_network_snapshot_thread(); // [核心新增] 启动网络快照线
     g_worker_thread = std::thread(worker_thread_func);
     
     g_server = std::make_unique<UdsServer>("cerberus_socket");
@@ -190,6 +191,7 @@ int main(int argc, char *argv[]) {
     if(g_worker_thread.joinable()) g_worker_thread.join();
     
     g_sys_monitor->stop_top_app_monitor();
+    g_sys_monitor->stop_network_snapshot_thread(); // [核心新增] 停止网络快照线程
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;

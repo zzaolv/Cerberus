@@ -579,6 +579,7 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
 bool StateManager::check_timers() {
     bool changed = false;
     time_t now = time(nullptr);
+    const double NETWORK_THRESHOLD_KBPS = 100.0; // 定义一个阈值，例如 100 KB/s
 
     for (auto& [key, app] : managed_apps_) {
         if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
@@ -609,7 +610,15 @@ bool StateManager::check_timers() {
         }
         
         if (app.background_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
-
+            // [核心新增] 增加网速豁免检查
+            NetworkSpeed speed = sys_monitor_->get_instant_network_speed(app.uid);
+            if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
+                LOGD("TICK: Deferring freeze for %s due to network activity (DL: %.1f KB/s, UL: %.1f KB/s).",
+                     app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
+                app.background_since = now; // 重置计时器
+                continue;
+            }
+            
             // [核心新增] 增加定位豁免检查
             if (sys_monitor_->is_uid_using_location(app.uid)) {
                 LOGD("TICK: Deferring freeze for %s because it is using location.", app.package_name.c_str());
