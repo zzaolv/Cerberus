@@ -490,29 +490,48 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
         return false;
     }
     
-    LOGD("Foreground PIDs changed. Old count: %zu, New count: %zu", last_known_top_pids_.size(), top_pids.size());
+    LOGD("Foreground PIDs changed. Raw count: %zu", top_pids.size());
     last_known_top_pids_ = top_pids;
     
-    std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
-    std::set<AppInstanceKey> non_ime_foreground_keys;
-    std::set<AppInstanceKey> all_foreground_keys;
-    
+    // 步骤 1: 将所有 top PIDs 转换为 AppInstanceKey
+    std::set<AppInstanceKey> top_apps;
     for (int pid : top_pids) {
         auto it = pid_to_app_map_.find(pid);
         if (it != pid_to_app_map_.end()) {
-            AppInstanceKey key = {it->second->package_name, it->second->user_id};
-            all_foreground_keys.insert(key);
-            if (it->second->package_name != current_ime_pkg) {
-                non_ime_foreground_keys.insert(key);
-            }
+            top_apps.insert({it->second->package_name, it->second->user_id});
         }
     }
 
-    std::set<AppInstanceKey>& final_foreground_keys = non_ime_foreground_keys.empty() ? all_foreground_keys : non_ime_foreground_keys;
-    if (final_foreground_keys.size() > 1) {
-        LOGD("Multiple foreground apps detected after filtering IME: %zu", final_foreground_keys.size());
+    std::set<AppInstanceKey> final_foreground_keys;
+
+    // 步骤 2 & 3: 场景判断与决策
+    if (top_apps.size() <= 1) {
+        // 场景: 0个或1个应用在前台，无需处理输入法问题
+        final_foreground_keys = top_apps;
+    } else {
+        // 场景: 多个应用在前台 (可能是 "应用+输入法" 或 "应用A+应用B小窗")
+        std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
+        
+        std::set<AppInstanceKey> non_ime_top_apps;
+        for (const auto& key : top_apps) {
+            if (key.first != current_ime_pkg) {
+                non_ime_top_apps.insert(key);
+            }
+        }
+
+        if (!non_ime_top_apps.empty()) {
+            // 如果存在非输入法的前台应用，那么它们就是真正的前台
+            // 这会正确处理 "应用+输入法" 和 "应用A+应用B小窗[+输入法]" 的情况
+            final_foreground_keys = non_ime_top_apps;
+            LOGD("IME filtered. Final foreground count: %zu", final_foreground_keys.size());
+        } else {
+            // 如果所有前台应用都是输入法相关 (罕见但可能)，则保留它们
+            final_foreground_keys = top_apps;
+            LOGD("Only IME is in foreground. Final foreground count: %zu", final_foreground_keys.size());
+        }
     }
 
+    // 步骤 4: 更新所有应用的状态
     bool state_has_changed = false;
     time_t now = time(nullptr);
     for (auto& [key, app] : managed_apps_) {
