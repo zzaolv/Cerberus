@@ -12,8 +12,13 @@
 #include <fcntl.h>
 #include <climits>
 #include <vector>
+// [新增] 必要的头文件
+#include <cstdio>
+#include <array>
+#include <cctype>
 
-#define LOG_TAG "cerberusd_monitor_v8_final"
+// [修改] 更新日志TAG以反映新的修复
+#define LOG_TAG "cerberusd_monitor_v9_audiofix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,7 +26,6 @@
 
 namespace fs = std::filesystem;
 
-// --- 辅助函数 ---
 int get_uid_from_pid(int pid) {
     char path_buffer[64];
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
@@ -30,7 +34,7 @@ int get_uid_from_pid(int pid) {
     return st.st_uid;
 }
 
-// --- Constructor, Destructor, Top App Monitor ---
+
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
         top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
@@ -94,47 +98,60 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// --- [修复] 恢复音频监控的完整实现 ---
+// --- [核心修复] 使用 `dumpsys audio` 全面重写音频状态检测 ---
 void SystemMonitor::update_audio_state() {
     std::set<int> active_uids;
-    try {
-        for (const auto& dir_entry : fs::directory_iterator("/proc")) {
-            if (!dir_entry.is_directory()) continue;
-            
-            int pid = 0;
-            try { pid = std::stoi(dir_entry.path().filename().string()); } catch(...) { continue; }
-            if (pid == 0) continue;
+    std::array<char, 512> buffer;
 
-            std::string fdinfo_path = dir_entry.path().string() + "/fdinfo";
-            if (!fs::exists(fdinfo_path)) continue;
-
-            for (const auto& fd_entry : fs::directory_iterator(fdinfo_path)) {
-                std::ifstream fdinfo_file(fd_entry.path());
-                if(!fdinfo_file.is_open()) continue;
-                std::string line;
-                while (std::getline(fdinfo_file, line)) {
-                    if (line.find("pcm") != std::string::npos || line.find("/dev/snd/") != std::string::npos) {
-                        int uid = get_uid_from_pid(pid);
-                        if (uid >= 10000) {
-                            active_uids.insert(uid);
-                        }
-                        goto next_proc_in_audio_scan; 
-                    }
-                }
-            }
-            next_proc_in_audio_scan:;
-        }
-    } catch(const fs::filesystem_error& e) {
-        LOGW("Filesystem error while scanning for audio UIDs: %s", e.what());
+    FILE* pipe = popen("dumpsys audio", "r");
+    if (!pipe) {
+        LOGW("popen for 'dumpsys audio' failed: %s", strerror(errno));
+        return;
     }
 
+    bool in_focus_stack = false;
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        std::string line(buffer.data());
+
+        if (!in_focus_stack) {
+            if (line.find("Audio Focus stack entries") != std::string::npos) {
+                in_focus_stack = true;
+            }
+            continue;
+        }
+
+        // 焦点栈开始后，如果遇到非空格开头的行或空行，说明栈结束了
+        if (line.length() <= 1 || !isspace(line[0])) {
+            break;
+        }
+
+        const std::string uid_marker = " -- uid: ";
+        size_t uid_pos = line.find(uid_marker);
+        if (uid_pos != std::string::npos) {
+            try {
+                std::string uid_str = line.substr(uid_pos + uid_marker.length());
+                int uid = std::stoi(uid_str);
+                if (uid >= 10000) { // 只关心应用UID
+                    active_uids.insert(uid);
+                }
+            } catch (...) {
+                // 忽略解析错误，继续处理下一行
+            }
+        }
+    }
+
+    pclose(pipe);
+
+    // 在锁内更新全局状态
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
-        if(uids_playing_audio_ != active_uids) {
+        if (uids_playing_audio_ != active_uids) {
             if (!active_uids.empty() && uids_playing_audio_.empty()) {
-                 LOGI("Audio playback detected. UIDs count: %zu", active_uids.size());
-            } else if (active_uids.empty() && !uids_playing_audio_.empty()){
-                 LOGI("Audio playback stopped.");
+                LOGI("Audio focus acquired by one or more UIDs. Count: %zu", active_uids.size());
+            } else if (active_uids.empty() && !uids_playing_audio_.empty()) {
+                LOGI("All audio focus has been released.");
+            } else {
+                 LOGD("Audio focus UIDs changed. New count: %zu", active_uids.size());
             }
             uids_playing_audio_ = active_uids;
         }
