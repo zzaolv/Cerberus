@@ -4,6 +4,7 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
+#include "main.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
 #include <csignal>
@@ -11,18 +12,18 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
-#include <filesystem> // [核心修复] 包含 <filesystem> 头文件
+#include <filesystem>
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v12_wakeup_fix"
+#define LOG_TAG "cerberusd_main_v14_fcm"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 using json = nlohmann::json;
-namespace fs = std::filesystem; // [核心修复] 修正命名空间别名语法
+namespace fs = std::filesystem;
 
 static std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -31,9 +32,6 @@ static std::atomic<bool> g_is_running = true;
 static std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
-
-void broadcast_dashboard_update();
-void notify_probe_of_config_change();
 
 void handle_client_message(int client_fd, const std::string& message_str) {
     try {
@@ -44,7 +42,14 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager && msg.contains("payload")) {
                 g_state_manager->on_wakeup_request(msg.at("payload"));
             }
-        } else if (type == "cmd.set_policy") {
+        } 
+        // [核心新增] 处理来自 Probe 的 FCM 临时解冻请求
+        else if (type == "cmd.request_temp_unfreeze_pkg") {
+            if (g_state_manager && msg.contains("payload")) {
+                g_state_manager->on_temp_unfreeze_request(msg.at("payload"));
+            }
+        }
+        else if (type == "cmd.set_policy") {
             if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
@@ -68,6 +73,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
+
 
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);

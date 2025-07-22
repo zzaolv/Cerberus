@@ -55,6 +55,8 @@ public:
 
     // [核心修复] 将 on_wakeup_request 函数声明为 public 成员
     void on_wakeup_request(const json& payload);
+    // [核心新增] 声明 FCM 临时解冻请求的处理函数
+    void on_temp_unfreeze_request(const json& payload);
 
 private:
     bool reconcile_process_state_full(); 

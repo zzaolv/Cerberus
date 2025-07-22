@@ -448,6 +448,42 @@ void StateManager::update_master_config(const MasterConfig& config) {
     LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
 }
 
+// [核心新增] 实现 FCM 临时解冻请求的处理逻辑
+void StateManager::on_temp_unfreeze_request(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string package_name = payload.value("package_name", "");
+        if (package_name.empty()) {
+            return;
+        }
+
+        // 遍历所有用户空间下的该应用实例
+        for (auto& [key, app] : managed_apps_) {
+            if (key.first == package_name) {
+                // 只有当应用确实处于冻结状态时才操作
+                if (app.current_status == AppRuntimeState::Status::FROZEN) {
+                    LOGI("FCM: Temp unfreezing %s (user %d) for push message.",
+                         package_name.c_str(), app.user_id);
+                    
+                    action_executor_->unfreeze(key, app.pids);
+                    app.current_status = AppRuntimeState::Status::RUNNING;
+                    
+                    // 关键：利用现有的观察期机制实现“自动重冻结”
+                    // 应用解冻后，会立即进入10秒观察期，之后再进入15/90秒的冻结倒计时。
+                    // 这给了应用总计 25 ~ 100 秒的时间来处理消息。
+                    app.observation_since = time(nullptr);
+                    app.background_since = 0; // 确保清除旧的冻结计时器
+                    
+                    // 触发一次UI更新
+                    broadcast_dashboard_update();
+                }
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing temp unfreeze request: %s", e.what());
+    }
+}
+
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (top_pids == last_known_top_pids_) {
