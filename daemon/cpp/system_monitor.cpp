@@ -18,7 +18,8 @@
 #include <ctime>
 #include <algorithm>
 
-#define LOG_TAG "cerberusd_monitor_v11_final"
+// 更新日志标签，便于跟踪
+#define LOG_TAG "cerberusd_monitor_v12_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -98,13 +99,13 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// --- [核心修复] 再次重写音频状态检测，增加对 player state 的精确判断 ---
+// --- [核心修复] 终极版音频状态检测 ---
 void SystemMonitor::update_audio_state() {
     std::set<int> active_uids;
-    std::array<char, 1024> buffer;
+    std::array<char, 2048> buffer; // 进一步增加缓冲区大小
 
-    // 使用 stdbuf -oL 确保行缓冲，减少 broken pipe 的概率
-    FILE* pipe = popen("stdbuf -oL dumpsys audio", "r");
+    // [修复] 移除 stdbuf，因为它在Android环境中不可用
+    FILE* pipe = popen("dumpsys audio", "r");
     if (!pipe) {
         LOGW("popen for 'dumpsys audio' failed: %s", strerror(errno));
         return;
@@ -115,20 +116,23 @@ void SystemMonitor::update_audio_state() {
 
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
+        // LOGD("Parsing line: %s", line.c_str()); // 打开此行可进行逐行调试
 
-        // 状态机切换
         if (line.find("Audio Focus stack entries") != std::string::npos) {
             current_section = ParseSection::FOCUS;
+            LOGD("Entered FOCUS section");
             continue;
         }
-        // "players:" 是 PlaybackActivityMonitor 的开始标志
         if (line.find("  players:") != std::string::npos) {
             current_section = ParseSection::PLAYERS;
+            LOGD("Entered PLAYERS section");
             continue;
         }
-        // 如果遇到非缩进的行，通常意味着一个段落的结束
         if (!line.empty() && !isspace(line[0])) {
-            current_section = ParseSection::NONE;
+            if (current_section != ParseSection::NONE) {
+                LOGD("Exited section %d", static_cast<int>(current_section));
+                current_section = ParseSection::NONE;
+            }
         }
 
         if (current_section == ParseSection::NONE) {
@@ -138,47 +142,59 @@ void SystemMonitor::update_audio_state() {
         try {
             if (current_section == ParseSection::FOCUS) {
                 const std::string uid_marker = "-- uid: ";
-                size_t uid_pos = line.find(uid_marker);
-                if (uid_pos != std::string::npos) {
-                    int uid = std::stoi(line.substr(uid_pos + uid_marker.length()));
+                size_t marker_pos = line.find(uid_marker);
+                if (marker_pos != std::string::npos) {
+                    std::string sub = line.substr(marker_pos + uid_marker.length());
+                    int uid = std::stoi(sub);
                     if (uid >= 10000) {
                         active_uids.insert(uid);
+                        LOGD("FOCUS: Found active UID %d", uid);
                     }
                 }
             } else if (current_section == ParseSection::PLAYERS) {
-                // [关键修复] 必须同时找到 uid 和 'state:started'
                 const std::string state_marker = "state:started";
                 const std::string uid_marker = "u/pid:";
                 
                 size_t state_pos = line.find(state_marker);
-                size_t uid_pos = line.find(uid_marker);
-
-                if (state_pos != std::string::npos && uid_pos != std::string::npos) {
-                    // 找到了一个正在播放的播放器
-                    std::string uid_pid_str = line.substr(uid_pos + uid_marker.length());
-                    int uid = std::stoi(uid_pid_str); // stoi会读取到第一个非数字字符为止，也就是'/'
+                if (state_pos == std::string::npos) {
+                    continue; // 如果不是 started 状态，直接跳过这一行
+                }
+                
+                size_t uid_marker_pos = line.find(uid_marker);
+                if (uid_marker_pos != std::string::npos) {
+                    std::string sub = line.substr(uid_marker_pos + uid_marker.length());
+                    // 安全地提取UID
+                    int uid = 0;
+                    std::stringstream ss(sub);
+                    ss >> uid;
+                    
                     if (uid >= 10000) {
                         active_uids.insert(uid);
+                        LOGD("PLAYERS: Found active UID %d with state:started", uid);
                     }
                 }
             }
-        } catch (const std::exception& e) {
-            // 忽略解析错误
+        } catch (const std::invalid_argument& e) {
+            LOGW("Parsing error (invalid_argument): %s on line: %s", e.what(), line.c_str());
+        } catch (const std::out_of_range& e) {
+            LOGW("Parsing error (out_of_range): %s on line: %s", e.what(), line.c_str());
         }
     }
 
-    pclose(pipe);
+    int pclose_status = pclose(pipe);
+    if (pclose_status == -1) {
+        LOGE("pclose failed: %s", strerror(errno));
+    } else if (WIFEXITED(pclose_status) && WEXITSTATUS(pclose_status) != 0) {
+        // dumpsys 异常退出，通常不是致命错误
+        LOGW("dumpsys audio exited with status %d", WEXITSTATUS(pclose_status));
+    }
 
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_uids) {
-            if (active_uids.empty() && !uids_playing_audio_.empty()) {
-                LOGI("Audio activity ceased. Previously active UIDs count: %zu", uids_playing_audio_.size());
-            } else if (!active_uids.empty()) {
-                 std::stringstream ss;
-                 for(int uid : active_uids) { ss << uid << " "; }
-                 LOGI("Audio active UIDs updated. New count: %zu, UIDs: [ %s]", active_uids.size(), ss.str().c_str());
-            }
+            std::stringstream ss;
+            for(int uid : active_uids) { ss << uid << " "; }
+            LOGI("Audio active UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
     }
