@@ -616,7 +616,7 @@ bool StateManager::check_timers() {
             }
 
             // 检查网速
-            NetworkSpeed speed = sys_monitor_->get_instant_network_speed(app.uid);
+            NetworkSpeed speed = sys_monitor_->get_cached_network_speed(app.uid);
             if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
                 LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), deferring freeze.",
                      app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);

@@ -65,7 +65,7 @@ public:
     // [核心新增] 网速监控相关接口
     void start_network_snapshot_thread();
     void stop_network_snapshot_thread();
-    NetworkSpeed get_instant_network_speed(int uid);
+    NetworkSpeed get_cached_network_speed(int uid);
 
 private:
     void update_cpu_usage();
@@ -110,6 +110,9 @@ private:
     mutable std::mutex traffic_mutex_;
     std::map<int, TrafficStats> last_traffic_snapshot_;
     std::chrono::steady_clock::time_point last_snapshot_time_;
+    // [核心修改] 新增一个map用于存储计算好的速率
+    mutable std::mutex speed_mutex_;
+    std::map<int, NetworkSpeed> uid_network_speed_;
 
 };
 

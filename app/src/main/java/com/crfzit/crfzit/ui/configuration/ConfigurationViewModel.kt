@@ -53,25 +53,23 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. 获取主空间所有应用，作为元数据字典
-            val mainUserAppsMap = appInfoRepository.getAllApps(forceRefresh = true)
+            // 1. 获取主空间所有应用信息，作为元数据字典
+            val mainUserAppMetaMap = appInfoRepository.getAllApps(forceRefresh = true)
                 .associateBy { it.packageName }
 
-            // 2. 从 Daemon 获取所有已知策略，这是最权威的列表
+            // 2. 从 Daemon 获取所有已知策略，这是权威列表
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicies = configPayload?.policies ?: emptyList()
             val policyMap = daemonPolicies.associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            // 3. 构建一个包含所有已知应用实例的集合
-            val allKnownInstances = mutableSetOf<AppInstanceKey>()
-            // 添加所有 daemon 里的实例
-            daemonPolicies.forEach { allKnownInstances.add(AppInstanceKey(it.packageName, it.userId)) }
-            // 添加所有主空间的应用实例 (确保即使没配置过的应用也显示)
-            mainUserAppsMap.values.forEach { allKnownInstances.add(AppInstanceKey(it.packageName, 0)) }
+            // 3. 构建一个所有已知应用实例的集合 (Key: AppInstanceKey)
+            val allKnownInstances = mutableMapOf<AppInstanceKey, Unit>()
+            daemonPolicies.forEach { allKnownInstances[AppInstanceKey(it.packageName, it.userId)] = Unit }
+            mainUserAppMetaMap.values.forEach { allKnownInstances[AppInstanceKey(it.packageName, 0)] = Unit }
 
             // 4. 基于这个完整的集合，构建最终的 AppInfo 列表
-            val finalAppList = allKnownInstances.map { key ->
-                val baseAppInfo = mainUserAppsMap[key.packageName]
+            val finalAppList = allKnownInstances.keys.map { key ->
+                val baseAppInfo = mainUserAppMetaMap[key.packageName]
                 AppInfo(
                     packageName = key.packageName,
                     userId = key.userId,
@@ -84,7 +82,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    allInstalledApps = finalAppList.distinctBy { app -> AppInstanceKey(app.packageName, app.userId) },
+                    allInstalledApps = finalAppList,
                     policies = policyMap,
                     fullConfig = configPayload
                 )

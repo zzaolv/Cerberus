@@ -202,21 +202,72 @@ void SystemMonitor::stop_network_snapshot_thread() {
     }
 }
 
-// [核心新增] 后台线程，仅负责定时更新快照
 void SystemMonitor::network_snapshot_thread_func() {
     while (network_monitoring_active_) {
-        std::this_thread::sleep_for(std::chrono::seconds(5)); // 每5秒采集一次
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         if (!network_monitoring_active_) break;
 
-        auto current_traffic = read_current_traffic();
+        // 步骤1: 获取新旧快照和时间
+        auto current_snapshot = read_current_traffic();
+        auto current_time = std::chrono::steady_clock::now();
+        std::map<int, TrafficStats> last_snapshot;
+        std::chrono::steady_clock::time_point last_time;
         {
             std::lock_guard<std::mutex> lock(traffic_mutex_);
-            last_traffic_snapshot_ = current_traffic;
-            last_snapshot_time_ = std::chrono::steady_clock::now();
+            last_snapshot = last_traffic_snapshot_;
+            last_time = last_snapshot_time_;
         }
-        LOGD("Network traffic snapshot updated.");
+
+        // 步骤2: 计算时间差
+        double time_delta_sec = std::chrono::duration_cast<std::chrono::duration<double>>(current_time - last_time).count();
+        if (time_delta_sec < 0.1) continue; // 时间太短，跳过本次计算
+
+        // 步骤3: 遍历当前快照，为所有应用计算速率
+        std::map<int, NetworkSpeed> new_speeds;
+        for (const auto& [uid, current_stats] : current_snapshot) {
+            auto last_it = last_snapshot.find(uid);
+            if (last_it != last_snapshot.end()) {
+                long long rx_delta = current_stats.rx_bytes - last_it->second.rx_bytes;
+                long long tx_delta = current_stats.tx_bytes - last_it->second.tx_bytes;
+                
+                NetworkSpeed speed;
+                if (rx_delta > 0) {
+                    speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
+                }
+                if (tx_delta > 0) {
+                    speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
+                }
+                
+                // 只有速率大于0才记录
+                if (speed.download_kbps > 0.1 || speed.upload_kbps > 0.1) {
+                    new_speeds[uid] = speed;
+                }
+            }
+        }
+        
+        // 步骤4: 线程安全地更新全局速率缓存和基准快照
+        {
+            std::lock_guard<std::mutex> lock(speed_mutex_);
+            uid_network_speed_ = new_speeds;
+        }
+        {
+            std::lock_guard<std::mutex> lock(traffic_mutex_);
+            last_traffic_snapshot_ = current_snapshot;
+            last_snapshot_time_ = current_time;
+        }
+        LOGD("Network speed cache updated for %zu UIDs.", new_speeds.size());
     }
     LOGI("Network snapshot thread stopped.");
+}
+
+// [核心重构] 这个函数现在只是一个简单的缓存读取器
+NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
+    std::lock_guard<std::mutex> lock(speed_mutex_);
+    auto it = uid_network_speed_.find(uid);
+    if (it != uid_network_speed_.end()) {
+        return it->second;
+    }
+    return NetworkSpeed(); // 返回一个速度为0的对象
 }
 
 // 辅助函数，执行shell命令并返回结果
