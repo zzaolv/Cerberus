@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v15_ultimate" // 版本号更新
+#define LOG_TAG "cerberusd_state_v15_ultimate"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -404,7 +404,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-   
     
     load_all_configs();
     reconcile_process_state_full();
@@ -554,7 +553,6 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                 app.observation_since = 0;
                 app.background_since = 0;
                 unfreeze_and_observe(app, "BECAME_FOREGROUND");
-
             } else {
                 app.background_since = 0;
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
@@ -804,6 +802,28 @@ json StateManager::get_full_config_for_ui() {
     }
     response["policies"] = policies;
     return response;
+}
+
+// **[已修复]** 确保 get_probe_config_payload 函数实现存在且正确
+json StateManager::get_probe_config_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    json payload = get_full_config_for_ui();
+    json frozen_uids = json::array();
+    json frozen_pids = json::array();
+
+    for (const auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            if (app.uid != -1) {
+                frozen_uids.push_back(app.uid);
+            }
+            for (int pid : app.pids) {
+                frozen_pids.push_back(pid);
+            }
+        }
+    }
+    payload["frozen_uids"] = frozen_uids;
+    payload["frozen_pids"] = frozen_pids;
+    return payload;
 }
 
 bool StateManager::reconcile_process_state_full() {
