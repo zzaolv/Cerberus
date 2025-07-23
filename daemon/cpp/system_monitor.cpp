@@ -207,7 +207,6 @@ void SystemMonitor::network_snapshot_thread_func() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         if (!network_monitoring_active_) break;
 
-        // 步骤1: 获取新旧快照和时间
         auto current_snapshot = read_current_traffic();
         auto current_time = std::chrono::steady_clock::now();
         std::map<int, TrafficStats> last_snapshot;
@@ -218,34 +217,34 @@ void SystemMonitor::network_snapshot_thread_func() {
             last_time = last_snapshot_time_;
         }
 
-        // 步骤2: 计算时间差
         double time_delta_sec = std::chrono::duration_cast<std::chrono::duration<double>>(current_time - last_time).count();
-        if (time_delta_sec < 0.1) continue; // 时间太短，跳过本次计算
+        if (time_delta_sec < 0.1) continue;
 
-        // 步骤3: 遍历当前快照，为所有应用计算速率
         std::map<int, NetworkSpeed> new_speeds;
         for (const auto& [uid, current_stats] : current_snapshot) {
             auto last_it = last_snapshot.find(uid);
             if (last_it != last_snapshot.end()) {
-                long long rx_delta = current_stats.rx_bytes - last_it->second.rx_bytes;
-                long long tx_delta = current_stats.tx_bytes - last_it->second.tx_bytes;
                 
-                NetworkSpeed speed;
-                if (rx_delta > 0) {
+                // [关键修复] 只有当流量增加时才计算，避免计数器重置导致的负数
+                long long rx_delta = 0;
+                if (current_stats.rx_bytes > last_it->second.rx_bytes) {
+                    rx_delta = current_stats.rx_bytes - last_it->second.rx_bytes;
+                }
+
+                long long tx_delta = 0;
+                if (current_stats.tx_bytes > last_it->second.tx_bytes) {
+                    tx_delta = current_stats.tx_bytes - last_it->second.tx_bytes;
+                }
+                
+                if (rx_delta > 0 || tx_delta > 0) {
+                    NetworkSpeed speed;
                     speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
-                }
-                if (tx_delta > 0) {
                     speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
-                }
-                
-                // 只有速率大于0才记录
-                if (speed.download_kbps > 0.1 || speed.upload_kbps > 0.1) {
                     new_speeds[uid] = speed;
                 }
             }
         }
         
-        // 步骤4: 线程安全地更新全局速率缓存和基准快照
         {
             std::lock_guard<std::mutex> lock(speed_mutex_);
             uid_network_speed_ = new_speeds;

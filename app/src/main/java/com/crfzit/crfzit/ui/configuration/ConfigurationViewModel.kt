@@ -53,31 +53,37 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. 获取主空间所有应用信息，作为元数据字典
+            // 1. 获取主空间所有应用，作为元数据字典
             val mainUserAppMetaMap = appInfoRepository.getAllApps(forceRefresh = true)
                 .associateBy { it.packageName }
 
-            // 2. 从 Daemon 获取所有已知策略，这是权威列表
+            // 2. 从 Daemon 获取所有已知策略
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicies = configPayload?.policies ?: emptyList()
             val policyMap = daemonPolicies.associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            // 3. 构建一个所有已知应用实例的集合 (Key: AppInstanceKey)
-            val allKnownInstances = mutableMapOf<AppInstanceKey, Unit>()
-            daemonPolicies.forEach { allKnownInstances[AppInstanceKey(it.packageName, it.userId)] = Unit }
-            mainUserAppMetaMap.values.forEach { allKnownInstances[AppInstanceKey(it.packageName, 0)] = Unit }
+            // 3. 构建一个粗糙的、可能重复的 AppInfo 列表
+            val roughList = mutableListOf<AppInfo>()
 
-            // 4. 基于这个完整的集合，构建最终的 AppInfo 列表
-            val finalAppList = allKnownInstances.keys.map { key ->
-                val baseAppInfo = mainUserAppMetaMap[key.packageName]
-                AppInfo(
-                    packageName = key.packageName,
-                    userId = key.userId,
-                    appName = baseAppInfo?.appName ?: key.packageName,
+            // 3a. 添加所有 Daemon 里的应用实例
+            daemonPolicies.forEach { policy ->
+                val baseAppInfo = mainUserAppMetaMap[policy.packageName]
+                roughList.add(AppInfo(
+                    packageName = policy.packageName,
+                    userId = policy.userId,
+                    appName = baseAppInfo?.appName ?: policy.packageName,
                     icon = baseAppInfo?.icon ?: ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher),
                     isSystemApp = baseAppInfo?.isSystemApp ?: false
-                )
+                ))
             }
+
+            // 3b. 添加所有主空间的应用实例
+            mainUserAppMetaMap.values.forEach { mainApp ->
+                roughList.add(mainApp) // mainApp 自身就是 AppInfo
+            }
+
+            // 4. 使用 distinctBy 进行最终去重，确保每个 (packageName, userId) 只出现一次
+            val finalAppList = roughList.distinctBy { AppInstanceKey(it.packageName, it.userId) }
 
             _uiState.update {
                 it.copy(
