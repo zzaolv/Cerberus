@@ -260,15 +260,19 @@ void SystemMonitor::network_snapshot_thread_func() {
     LOGI("Network snapshot thread stopped.");
 }
 
-// [核心重构] 这个函数现在只是一个简单的缓存读取器
+// 这是唯一的、正确的函数定义
 NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     std::lock_guard<std::mutex> lock(speed_mutex_);
     auto it = uid_network_speed_.find(uid);
     if (it != uid_network_speed_.end()) {
+        LOGD("NETWORK_CACHE: Hit for UID %d -> DL: %.1f KB/s, UL: %.1f KB/s",
+             uid, it->second.download_kbps, it->second.upload_kbps);
         return it->second;
     }
-    return NetworkSpeed(); // 返回一个速度为0的对象
+    LOGD("NETWORK_CACHE: Miss for UID %d", uid);
+    return NetworkSpeed();
 }
+
 
 // 辅助函数，执行shell命令并返回结果
 static std::string exec_shell_pipe(const char* cmd) {
