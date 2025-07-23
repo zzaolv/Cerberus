@@ -338,7 +338,7 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
 }
 
 // [核心新增] 按需计算指定UID的瞬时网速
-NetworkSpeed SystemMonitor::get_instant_network_speed(int uid) {
+NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     // 步骤1：获取当前快照和时间
     auto current_snapshot = read_current_traffic();
     auto current_time = std::chrono::steady_clock::now();
