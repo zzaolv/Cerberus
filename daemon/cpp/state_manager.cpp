@@ -417,27 +417,37 @@ void StateManager::on_wakeup_request(const json& payload) {
         int user_id = payload.value("user_id", 0);
 
         if (package_name.empty()) return;
+        LOGD("Received wakeup request for %s (user %d)", package_name.c_str(), user_id);
 
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
             unfreeze_and_observe(it->second, "WAKEUP_REQUEST");
+        } else {
+            LOGW("Wakeup request for unknown app: %s", package_name.c_str());
         }
     } catch (const json::exception& e) {
         LOGE("Error processing wakeup request: %s", e.what());
     }
 }
 
+
 void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
         std::string package_name = payload.value("package_name", "");
         if (package_name.empty()) return;
-
+        
+        LOGD("Received temp unfreeze request by package: %s", package_name.c_str());
+        bool app_found = false;
         for (auto& [key, app] : managed_apps_) {
             if (key.first == package_name) {
+                app_found = true;
                 unfreeze_and_observe(app, "FCM");
             }
+        }
+        if (!app_found) {
+            LOGW("Temp unfreeze request for unknown package: %s", package_name.c_str());
         }
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by pkg: %s", e.what());
@@ -449,12 +459,18 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
     try {
         int uid = payload.value("uid", -1);
         if (uid < 0) return;
-
+        
+        LOGD("Received temp unfreeze request by UID: %d", uid);
+        bool app_found = false;
         for (auto& [key, app] : managed_apps_) {
             if (app.uid == uid) {
+                app_found = true;
                 unfreeze_and_observe(app, "AUDIO_FOCUS");
                 break; 
             }
+        }
+        if(!app_found) {
+            LOGW("Temp unfreeze request for unknown UID: %d", uid);
         }
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by uid: %s", e.what());
@@ -466,10 +482,13 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     try {
         int pid = payload.value("pid", -1);
         if (pid < 0) return;
-        
+
+        LOGD("Received temp unfreeze request by PID: %d", pid);
         auto it = pid_to_app_map_.find(pid);
         if (it != pid_to_app_map_.end()) {
             unfreeze_and_observe(*(it->second), "SIGKILL_PROTECT");
+        } else {
+            LOGW("Temp unfreeze request for unknown PID: %d", pid);
         }
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by pid: %s", e.what());
@@ -489,8 +508,13 @@ void StateManager::unfreeze_and_observe(AppRuntimeState& app, const std::string&
         
         broadcast_dashboard_update();
         notify_probe_of_config_change();
+    } else {
+        // 新增日志：记录为什么没有执行解冻
+        LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
+            reason.c_str(), app.package_name.c_str(), static_cast<int>(app.current_status));
     }
 }
+
 
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
