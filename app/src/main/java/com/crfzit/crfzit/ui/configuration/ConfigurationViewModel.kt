@@ -53,37 +53,45 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. 获取主空间所有应用，作为元数据字典
-            val mainUserAppMetaMap = appInfoRepository.getAllApps(forceRefresh = true)
-                .associateBy { it.packageName }
+            // 1. 并行启动两个数据加载任务
+            val mainUserAppsDeferred = async { 
+                appInfoRepository.getAllApps(forceRefresh = true).associateBy { it.packageName } 
+            }
+            val configPayloadDeferred = async { daemonRepository.getAllPolicies() }
 
-            // 2. 从 Daemon 获取所有已知策略
-            val configPayload = daemonRepository.getAllPolicies()
+            // 2. 等待两个任务全部完成
+            val mainUserAppMetaMap = mainUserAppsDeferred.await()
+            val configPayload = configPayloadDeferred.await()
+
+            // --- 从这里开始，两个数据源都已准备就绪，可以安全合并 ---
+
             val daemonPolicies = configPayload?.policies ?: emptyList()
             val policyMap = daemonPolicies.associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            // 3. 构建一个粗糙的、可能重复的 AppInfo 列表
-            val roughList = mutableListOf<AppInfo>()
+            // 3. 手动构建最终的 AppInfo Map
+            val finalAppInfoMap = mutableMapOf<AppInstanceKey, AppInfo>()
 
-            // 3a. 添加所有 Daemon 里的应用实例
-            daemonPolicies.forEach { policy ->
-                val baseAppInfo = mainUserAppMetaMap[policy.packageName]
-                roughList.add(AppInfo(
-                    packageName = policy.packageName,
-                    userId = policy.userId,
-                    appName = baseAppInfo?.appName ?: policy.packageName,
-                    icon = baseAppInfo?.icon ?: ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher),
-                    isSystemApp = baseAppInfo?.isSystemApp ?: false
-                ))
-            }
-
-            // 3b. 添加所有主空间的应用实例
+            // 3a. 添加所有主空间的应用
             mainUserAppMetaMap.values.forEach { mainApp ->
-                roughList.add(mainApp) // mainApp 自身就是 AppInfo
+                finalAppInfoMap[AppInstanceKey(mainApp.packageName, 0)] = mainApp
             }
 
-            // 4. 使用 distinctBy 进行最终去重，确保每个 (packageName, userId) 只出现一次
-            val finalAppList = roughList.distinctBy { AppInstanceKey(it.packageName, it.userId) }
+            // 3b. 用 Daemon 的数据进行覆盖或补充
+            daemonPolicies.forEach { policy ->
+                val key = AppInstanceKey(policy.packageName, policy.userId)
+                if (!finalAppInfoMap.containsKey(key)) {
+                    val baseAppInfo = mainUserAppMetaMap[key.packageName]
+                    finalAppInfoMap[key] = AppInfo(
+                        packageName = key.packageName,
+                        userId = key.userId,
+                        appName = baseAppInfo?.appName ?: key.packageName,
+                        icon = baseAppInfo?.icon ?: ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher),
+                        isSystemApp = baseAppInfo?.isSystemApp ?: false
+                    )
+                }
+            }
+            
+            val finalAppList = finalAppInfoMap.values.toList()
 
             _uiState.update {
                 it.copy(
@@ -95,7 +103,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
         }
     }
-
+    
     fun setAppPolicy(packageName: String, userId: Int, newPolicyValue: Int) {
         val currentConfig = _uiState.value.fullConfig ?: return
         val currentPolicies = _uiState.value.policies.toMutableMap()

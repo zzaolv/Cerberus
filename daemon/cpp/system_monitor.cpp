@@ -295,7 +295,7 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
 
     std::ifstream qtaguid_file(qtaguid_path);
     if (qtaguid_file.is_open()) {
-        // 方案A: 读取内核文件 (高效)
+        // 方案A: 优先使用内核文件，效率最高
         std::string line;
         std::getline(qtaguid_file, line); // 跳过表头
         while (std::getline(qtaguid_file, line)) {
@@ -310,30 +310,37 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
             }
         }
     } else {
-        // 方案B: dumpsys netstats (兼容)
+        // 方案B: 兼容模式，精确解析 dumpsys netstats 中的 BPF 部分
         std::string result = exec_shell_pipe("dumpsys netstats");
         std::stringstream ss(result);
         std::string line;
-        bool in_map_section = false;
+        bool in_bpf_section = false;
 
         while (std::getline(ss, line)) {
-            if (line.find("mAppUidStatsMap:") != std::string::npos) {
-                in_map_section = true;
-                std::getline(ss, line); // 跳过表头
+            // 1. 寻找唯一的入口点 "BPF map content:"
+            if (line.find("BPF map content:") != std::string::npos) {
+                in_bpf_section = true;
                 continue;
             }
-            if (in_map_section) {
-                if(line.empty() || !isspace(line[0])) break;
+            
+            // 2. 在 BPF 区域内，寻找我们的目标表格 "mAppUidStatsMap:"
+            if (in_bpf_section && line.find("mAppUidStatsMap:") != std::string::npos) {
+                std::getline(ss, line); // 跳过表头
                 
-                std::stringstream line_ss(line);
-                int uid;
-                long long rx_bytes, tx_bytes, rx_packets, tx_packets;
-                line_ss >> uid >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
-                
-                if (uid >= 10000) {
-                    snapshot[uid].rx_bytes += rx_bytes;
-                    snapshot[uid].tx_bytes += tx_bytes;
+                // 3. 开始解析数据行，直到表格结束
+                while (std::getline(ss, line) && !line.empty() && isspace(line[0])) {
+                    std::stringstream line_ss(line);
+                    int uid;
+                    long long rx_bytes, tx_bytes, rx_packets, tx_packets;
+                    line_ss >> uid >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
+                    
+                    if (uid >= 10000) {
+                        snapshot[uid].rx_bytes += rx_bytes;
+                        snapshot[uid].tx_bytes += tx_bytes;
+                    }
                 }
+                // 找到并解析完后，可以直接退出
+                break; 
             }
         }
     }
