@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v12_wakeup_fix"
+#define LOG_TAG "cerberusd_state_v13_persist_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -404,13 +404,13 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+   
     
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
 }
 
-// [核心新增] 实现 on_wakeup_request
 void StateManager::on_wakeup_request(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -448,7 +448,6 @@ void StateManager::update_master_config(const MasterConfig& config) {
     LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
 }
 
-// [核心新增] 实现 FCM 临时解冻请求的处理逻辑
 void StateManager::on_temp_unfreeze_request(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -457,10 +456,8 @@ void StateManager::on_temp_unfreeze_request(const json& payload) {
             return;
         }
 
-        // 遍历所有用户空间下的该应用实例
         for (auto& [key, app] : managed_apps_) {
             if (key.first == package_name) {
-                // 只有当应用确实处于冻结状态时才操作
                 if (app.current_status == AppRuntimeState::Status::FROZEN) {
                     LOGI("FCM: Temp unfreezing %s (user %d) for push message.",
                          package_name.c_str(), app.user_id);
@@ -468,13 +465,9 @@ void StateManager::on_temp_unfreeze_request(const json& payload) {
                     action_executor_->unfreeze(key, app.pids);
                     app.current_status = AppRuntimeState::Status::RUNNING;
                     
-                    // 关键：利用现有的观察期机制实现“自动重冻结”
-                    // 应用解冻后，会立即进入10秒观察期，之后再进入15/90秒的冻结倒计时。
-                    // 这给了应用总计 25 ~ 100 秒的时间来处理消息。
                     app.observation_since = time(nullptr);
-                    app.background_since = 0; // 确保清除旧的冻结计时器
+                    app.background_since = 0;
                     
-                    // 触发一次UI更新
                     broadcast_dashboard_update();
                 }
             }
@@ -493,7 +486,6 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     LOGD("Foreground PIDs changed. Raw count: %zu", top_pids.size());
     last_known_top_pids_ = top_pids;
     
-    // 步骤 1: 将所有 top PIDs 转换为 AppInstanceKey
     std::set<AppInstanceKey> top_apps;
     for (int pid : top_pids) {
         auto it = pid_to_app_map_.find(pid);
@@ -504,12 +496,9 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
 
     std::set<AppInstanceKey> final_foreground_keys;
 
-    // 步骤 2 & 3: 场景判断与决策
     if (top_apps.size() <= 1) {
-        // 场景: 0个或1个应用在前台，无需处理输入法问题
         final_foreground_keys = top_apps;
     } else {
-        // 场景: 多个应用在前台 (可能是 "应用+输入法" 或 "应用A+应用B小窗")
         std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
         
         std::set<AppInstanceKey> non_ime_top_apps;
@@ -520,18 +509,14 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
         }
 
         if (!non_ime_top_apps.empty()) {
-            // 如果存在非输入法的前台应用，那么它们就是真正的前台
-            // 这会正确处理 "应用+输入法" 和 "应用A+应用B小窗[+输入法]" 的情况
             final_foreground_keys = non_ime_top_apps;
             LOGD("IME filtered. Final foreground count: %zu", final_foreground_keys.size());
         } else {
-            // 如果所有前台应用都是输入法相关 (罕见但可能)，则保留它们
             final_foreground_keys = top_apps;
             LOGD("Only IME is in foreground. Final foreground count: %zu", final_foreground_keys.size());
         }
     }
 
-    // 步骤 4: 更新所有应用的状态
     bool state_has_changed = false;
     time_t now = time(nullptr);
     for (auto& [key, app] : managed_apps_) {
@@ -579,7 +564,7 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
 bool StateManager::check_timers() {
     bool changed = false;
     time_t now = time(nullptr);
-    const double NETWORK_THRESHOLD_KBPS = 100.0; // 定义一个阈值，例如 100 KB/s
+    const double NETWORK_THRESHOLD_KBPS = 100.0;
 
     for (auto& [key, app] : managed_apps_) {
         if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
@@ -591,47 +576,39 @@ bool StateManager::check_timers() {
             continue;
         }
 
-        // --- 观察期结束后的决策点 ---
         if (app.observation_since > 0 && now - app.observation_since >= 10) {
             LOGD("TICK: Observation for %s ended. Checking all exemption conditions...", app.package_name.c_str());
-            app.observation_since = 0; // 结束观察期
+            app.observation_since = 0;
 
-            // [关键] 在此决策点，一次性检查所有豁免条件
-            
-            // 检查音频
-            sys_monitor_->update_audio_state(); // 强制刷新
+            sys_monitor_->update_audio_state();
             if (is_app_playing_audio(app)) {
                 LOGI("TICK: %s is playing audio, deferring freeze.", app.package_name.c_str());
-                app.observation_since = now; // 重置观察期
-                changed = true;
-                continue; // 跳过此应用的后续处理
-            }
-
-            // 检查定位
-            if (sys_monitor_->is_uid_using_location(app.uid)) {
-                LOGI("TICK: %s is using location, deferring freeze.", app.package_name.c_str());
-                app.observation_since = now; // 重置观察期
+                app.observation_since = now;
                 changed = true;
                 continue;
             }
 
-            // 检查网速
+            if (sys_monitor_->is_uid_using_location(app.uid)) {
+                LOGI("TICK: %s is using location, deferring freeze.", app.package_name.c_str());
+                app.observation_since = now;
+                changed = true;
+                continue;
+            }
+
             NetworkSpeed speed = sys_monitor_->get_cached_network_speed(app.uid);
             if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
                 LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), deferring freeze.",
                      app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
-                app.observation_since = now; // 重置观察期
+                app.observation_since = now;
                 changed = true;
                 continue;
             }
 
-            // 如果所有豁免条件都不满足，则启动冻结倒计时
             LOGI("TICK: %s is silent and inactive, starting freeze timer.", app.package_name.c_str());
             app.background_since = now;
             changed = true;
         }
         
-        // --- 冻结倒计时 ---
         if (app.background_since > 0) {
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
@@ -690,9 +667,6 @@ bool StateManager::check_timed_unfreeze() {
     return false;
 }
 
-// ... 省略其他不变的函数，直到文件末尾 ...
-
-// (确保其他所有 StateManager 的成员函数都存在)
 bool StateManager::perform_deep_scan() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
@@ -911,16 +885,32 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
     if (it != managed_apps_.end()) return &it->second;
+
+    // --- 核心修复点 ---
+    // 如果应用状态在内存中不存在，意味着它可能是一个新发现的应用
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name;
+    new_state.app_name = package_name; // 临时名称，后续会被更新
+
+    // 尝试从数据库加载配置
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
-    if (is_critical_system_app(package_name)) {
-        new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
+    if (config_opt) {
+        // 如果数据库中有配置，直接使用
+        new_state.config = *config_opt;
     } else {
-        new_state.config = config_opt.value_or(AppConfig{package_name, user_id, AppPolicy::EXEMPTED});
+        // 如果数据库中没有，创建一个默认配置，并【立即写回数据库】
+        LOGI("New app instance discovered: %s (user %d). Creating default DB entry.", package_name.c_str(), user_id);
+        if (is_critical_system_app(package_name)) {
+            new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
+        } else {
+            // 默认给豁免策略，让用户手动配置，避免误杀
+            new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
+        }
+        // 这就是关键的修复步骤！
+        db_manager_->set_app_config(new_state.config);
     }
+    
     new_state.current_status = AppRuntimeState::Status::STOPPED;
     auto [map_iterator, success] = managed_apps_.emplace(key, new_state);
     return &map_iterator->second;
@@ -963,6 +953,5 @@ void StateManager::remove_pid_from_app(int pid) {
 }
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
-    // 列表已省略，此函数现在总是返回 false，除非您手动添加一些包名
     return critical_system_apps_.count(package_name) > 0;
 }

@@ -18,11 +18,11 @@
 #include <ctime>
 #include <algorithm>
 #include <iterator>
-#include <chrono> // 新增
-#include <string> // 包含 <string> 以使用 std::string::npos
+#include <chrono>
+#include <string>
+#include <memory> // For std::unique_ptr
 
-// 更新日志标签，便于跟踪
-#define LOG_TAG "cerberusd_monitor_v12_final"
+#define LOG_TAG "cerberusd_monitor_v13_netfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -102,7 +102,6 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// --- [核心修复] 终极版音频状态检测 ---
 void SystemMonitor::update_audio_state() {
     std::set<int> focus_uids;
     std::set<int> started_player_uids;
@@ -158,7 +157,6 @@ void SystemMonitor::update_audio_state() {
     }
     pclose(pipe);
 
-    // [关键逻辑] 取两个集合的交集，得到真正播放音频的UID
     std::set<int> active_uids;
     std::set_intersection(focus_uids.begin(), focus_uids.end(),
                           started_player_uids.begin(), started_player_uids.end(),
@@ -181,11 +179,9 @@ bool SystemMonitor::is_uid_playing_audio(int uid) {
     return uids_playing_audio_.count(uid) > 0;
 }
 
-// [核心新增] 启动和停止网络快照线程
 void SystemMonitor::start_network_snapshot_thread() {
     if (network_monitoring_active_) return;
     network_monitoring_active_ = true;
-    // 首次运行时，先获取一次基准快照
     {
         std::lock_guard<std::mutex> lock(traffic_mutex_);
         last_traffic_snapshot_ = read_current_traffic();
@@ -209,6 +205,7 @@ void SystemMonitor::network_snapshot_thread_func() {
 
         auto current_snapshot = read_current_traffic();
         auto current_time = std::chrono::steady_clock::now();
+        
         std::map<int, TrafficStats> last_snapshot;
         std::chrono::steady_clock::time_point last_time;
         {
@@ -221,32 +218,33 @@ void SystemMonitor::network_snapshot_thread_func() {
         if (time_delta_sec < 0.1) continue;
 
         std::map<int, NetworkSpeed> new_speeds;
+        
+        // --- 核心修复逻辑 ---
+        // 遍历当前快照中的所有UID
         for (const auto& [uid, current_stats] : current_snapshot) {
             auto last_it = last_snapshot.find(uid);
-            if (last_it != last_snapshot.end()) {
-                
-                // [关键修复] 只有当流量增加时才计算，避免计数器重置导致的负数
-                long long rx_delta = 0;
-                if (current_stats.rx_bytes > last_it->second.rx_bytes) {
-                    rx_delta = current_stats.rx_bytes - last_it->second.rx_bytes;
-                }
+            
+            NetworkSpeed speed; // 默认速度为0
 
-                long long tx_delta = 0;
-                if (current_stats.tx_bytes > last_it->second.tx_bytes) {
-                    tx_delta = current_stats.tx_bytes - last_it->second.tx_bytes;
-                }
+            if (last_it != last_snapshot.end()) {
+                // 如果在上个快照中也找到了这个UID，则计算速率
+                long long rx_delta = (current_stats.rx_bytes > last_it->second.rx_bytes) ? (current_stats.rx_bytes - last_it->second.rx_bytes) : 0;
+                long long tx_delta = (current_stats.tx_bytes > last_it->second.tx_bytes) ? (current_stats.tx_bytes - last_it->second.tx_bytes) : 0;
                 
                 if (rx_delta > 0 || tx_delta > 0) {
-                    NetworkSpeed speed;
                     speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
                     speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
-                    new_speeds[uid] = speed;
                 }
             }
+            // 无论速率是否大于0，都将此UID的速率（可能为0）放入新的速率表中。
+            // 这可以防止因应用暂时空闲而导致其速率缓存被清除。
+            new_speeds[uid] = speed;
         }
         
         {
             std::lock_guard<std::mutex> lock(speed_mutex_);
+            // 用新计算的速率表覆盖旧表。
+            // 消失的UID（已卸载或长期无网络活动）会自然地被清除。
             uid_network_speed_ = new_speeds;
         }
         {
@@ -259,21 +257,16 @@ void SystemMonitor::network_snapshot_thread_func() {
     LOGI("Network snapshot thread stopped.");
 }
 
-// 这是唯一的、正确的函数定义
 NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     std::lock_guard<std::mutex> lock(speed_mutex_);
     auto it = uid_network_speed_.find(uid);
     if (it != uid_network_speed_.end()) {
-        LOGD("NETWORK_CACHE: Hit for UID %d -> DL: %.1f KB/s, UL: %.1f KB/s",
-             uid, it->second.download_kbps, it->second.upload_kbps);
         return it->second;
     }
-    LOGD("NETWORK_CACHE: Miss for UID %d", uid);
-    return NetworkSpeed();
+    return NetworkSpeed(); // 返回默认的0速率
 }
 
 
-// 辅助函数，执行shell命令并返回结果
 static std::string exec_shell_pipe(const char* cmd) {
     std::array<char, 128> buffer;
     std::string result;
@@ -288,16 +281,14 @@ static std::string exec_shell_pipe(const char* cmd) {
     return result;
 }
 
-// [核心新增] 封装数据源读取逻辑，实现优雅降级
 std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
     std::map<int, TrafficStats> snapshot;
     const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
 
     std::ifstream qtaguid_file(qtaguid_path);
     if (qtaguid_file.is_open()) {
-        // 方案A: 优先使用内核文件，效率最高
         std::string line;
-        std::getline(qtaguid_file, line); // 跳过表头
+        std::getline(qtaguid_file, line);
         while (std::getline(qtaguid_file, line)) {
             std::stringstream ss(line);
             std::string idx, iface, acct_tag, set;
@@ -310,24 +301,20 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
             }
         }
     } else {
-        // 方案B: 兼容模式，精确解析 dumpsys netstats 中的 BPF 部分
         std::string result = exec_shell_pipe("dumpsys netstats");
         std::stringstream ss(result);
         std::string line;
         bool in_bpf_section = false;
 
         while (std::getline(ss, line)) {
-            // 1. 寻找唯一的入口点 "BPF map content:"
             if (line.find("BPF map content:") != std::string::npos) {
                 in_bpf_section = true;
                 continue;
             }
             
-            // 2. 在 BPF 区域内，寻找我们的目标表格 "mAppUidStatsMap:"
             if (in_bpf_section && line.find("mAppUidStatsMap:") != std::string::npos) {
-                std::getline(ss, line); // 跳过表头
+                std::getline(ss, line);
                 
-                // 3. 开始解析数据行，直到表格结束
                 while (std::getline(ss, line) && !line.empty() && isspace(line[0])) {
                     std::stringstream line_ss(line);
                     int uid;
@@ -339,7 +326,6 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
                         snapshot[uid].tx_bytes += tx_bytes;
                     }
                 }
-                // 找到并解析完后，可以直接退出
                 break; 
             }
         }
@@ -377,7 +363,6 @@ std::string SystemMonitor::get_current_ime_package() {
     return current_ime_package_;
 }
 
-// [核心新增] 实现定位状态检测
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
     std::array<char, 2048> buffer;
@@ -394,13 +379,11 @@ void SystemMonitor::update_location_state() {
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
         
-        // 状态机切换
         if (line.find("gps provider:") != std::string::npos || line.find("network provider:") != std::string::npos) {
             current_section = ParseSection::ACTIVE_PROVIDER;
             continue;
         }
         
-        // 如果遇到不带缩进的行，意味着 provider 段落结束了
         if (!line.empty() && !isspace(line[0])) {
             current_section = ParseSection::NONE;
         }
@@ -409,16 +392,12 @@ void SystemMonitor::update_location_state() {
             continue;
         }
         
-        // 解析监听者
-        // 格式: "    UID/PACKAGENAME/HASH Request[...]"
         if (line.find("Request[") != std::string::npos) {
-            // 过滤掉被动请求
             if (line.find("PASSIVE") != std::string::npos) {
                 continue;
             }
 
             try {
-                // 提取 UID
                 std::string trimmed_line = line;
                 trimmed_line.erase(0, trimmed_line.find_first_not_of(" \t"));
                 
