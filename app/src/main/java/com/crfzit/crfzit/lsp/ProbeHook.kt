@@ -60,7 +60,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
-    
+
     private fun findAndHookMethod(
         clazz: Class<*>?,
         methodName: String,
@@ -91,21 +91,22 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader) ?: return
             // setCurProcState 是更新进程adj/state后最终调用的核心方法，非常稳定
+            // [**已修复**] 将 Int::class.javaPrimitiveType 强制转换为 Any
             findAndHookMethod(processRecordClass, "setCurProcState", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     handleProcessStateChange(param.thisObject)
                 }
-            }, Int::class.javaPrimitiveType)
+            }, Int::class.javaPrimitiveType as Any)
         } catch (t: Throwable) {
             logError("Failed to place process state hook: $t")
         }
     }
-    
+
     private fun handleProcessStateChange(processRecord: Any) {
         val appInfo = XposedHelpers.getObjectField(processRecord, "info") as? ApplicationInfo ?: return
         val uid = appInfo.uid
         if (uid < Process.FIRST_APPLICATION_UID) return
-        
+
         val adj = XposedHelpers.getIntField(processRecord, "mCurAdj")
         val procState = XposedHelpers.getIntField(processRecord, "mCurProcState")
         // PERCEPTIBLE_APP_ADJ = 200, PROCESS_STATE_TOP = 2
@@ -172,8 +173,8 @@ class ProbeHook : IXposedHookLoadPackage {
                     val pkg = param.args.find { it is String } as? String ?: "unknown"
                     val notification = param.args.find { it is Notification } as? Notification
                     if (notification != null && notification.group?.startsWith("gcm.notification") != true) {
-                         log("DEFENSE: Blocked notification for frozen app: $pkg")
-                         param.result = null
+                        log("DEFENSE: Blocked notification for frozen app: $pkg")
+                        param.result = null
                     }
                 }
             }
@@ -201,7 +202,7 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Failed to hook Process#sendSignal: $t")
         }
     }
-    
+
     private fun hookAnrHelper(classLoader: ClassLoader) {
         findClass("com.android.server.am.AnrHelper", classLoader)?.let { clazz ->
             val anrHook = object: XC_MethodHook() {
@@ -214,7 +215,7 @@ class ProbeHook : IXposedHookLoadPackage {
                     }
                 }
             }
-            clazz.declaredMethods.filter { it.name.contains("appNotResponding") }.forEach { 
+            clazz.declaredMethods.filter { it.name.contains("appNotResponding") }.forEach {
                 XposedBridge.hookMethod(it, anrHook)
             }
             log("SUCCESS: Hooked all ANR methods in AnrHelper.")
@@ -233,7 +234,7 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             }
         })
-        
+
         // FCM (通过修改广播Intent)
         findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { amsClass ->
             amsClass.declaredMethods.find {
@@ -255,7 +256,7 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         }
     }
-    
+
     // --- 辅助与通信 ---
     private fun isGcmOrFcmIntent(intent: Intent): Boolean {
         val action = intent.action ?: return false
@@ -273,7 +274,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun requestTempUnfreezeForUid(uid: Int) {
         sendEventToDaemon("cmd.request_temp_unfreeze_uid", mapOf("uid" to uid))
     }
-    
+
     private fun requestTempUnfreezeForPid(pid: Int) {
         sendEventToDaemon("cmd.request_temp_unfreeze_pid", mapOf("pid" to pid))
     }
@@ -315,14 +316,13 @@ class ProbeHook : IXposedHookLoadPackage {
 
         fun updateConfig(jsonString: String) {
             try {
-                // [修复] 使用 GSON 的 JsonParser
                 val payload = JsonParser.parseString(jsonString).asJsonObject.getAsJsonObject("payload")
                 if (payload.has("frozen_uids")) {
                     frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
                 }
                 if (payload.has("frozen_pids")) {
                     frozenPids = payload.getAsJsonArray("frozen_pids").map { it.asInt }.toSet()
-                    if (frozenPids.isNotEmpty()) {
+                    if (frozenPids.isNotEmpty() || frozenUids.isNotEmpty()) {
                         XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs and ${frozenPids.size} PIDs.")
                     }
                 }

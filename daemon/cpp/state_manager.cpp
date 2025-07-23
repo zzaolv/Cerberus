@@ -1,6 +1,6 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
-#include "main.h" // 确保包含 main.h
+#include "main.h"
 #include <android/log.h>
 #include <filesystem>
 #include <fstream>
@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v13_persist_fix"
+#define LOG_TAG "cerberusd_state_v15_ultimate" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -429,8 +429,6 @@ void StateManager::on_wakeup_request(const json& payload) {
     }
 }
 
-// --- [新增] 新的IPC接口实现 ---
-
 void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -456,7 +454,6 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
         for (auto& [key, app] : managed_apps_) {
             if (app.uid == uid) {
                 unfreeze_and_observe(app, "AUDIO_FOCUS");
-                // 通常一个UID只对应一个实例，找到后即可退出
                 break; 
             }
         }
@@ -480,7 +477,6 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     }
 }
 
-// --- [新增] 内部通用解冻逻辑 ---
 void StateManager::unfreeze_and_observe(AppRuntimeState& app, const std::string& reason) {
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         LOGI("UNFREEZE [%s]: Unfreezing %s (user %d).", 
@@ -489,72 +485,19 @@ void StateManager::unfreeze_and_observe(AppRuntimeState& app, const std::string&
         action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
         app.current_status = AppRuntimeState::Status::RUNNING;
         
-        // 关键：利用现有的观察期机制实现“自动重冻结”
         app.observation_since = time(nullptr);
-        app.background_since = 0; // 确保清除旧的冻结计时器
+        app.background_since = 0;
         
         broadcast_dashboard_update();
-        notify_probe_of_config_change(); // 解冻后状态变化，通知Probe
+        notify_probe_of_config_change();
     }
 }
-
-
-// --- [修改] get_probe_config_payload ---
-json StateManager::get_probe_config_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    json payload = get_full_config_for_ui();
-    json frozen_uids = json::array();
-    json frozen_pids = json::array(); // 新增
-
-    for (const auto& [key, app] : managed_apps_) {
-        if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            frozen_uids.push_back(app.uid);
-            // 将该应用的所有PID添加到列表中
-            for (int pid : app.pids) {
-                frozen_pids.push_back(pid);
-            }
-        }
-    }
-    payload["frozen_uids"] = frozen_uids;
-    payload["frozen_pids"] = frozen_pids; // 新增
-    return payload;
-}
-
 
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     master_config_ = config;
     db_manager_->set_master_config(config);
     LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
-}
-
-void StateManager::on_temp_unfreeze_request(const json& payload) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    try {
-        std::string package_name = payload.value("package_name", "");
-        if (package_name.empty()) {
-            return;
-        }
-
-        for (auto& [key, app] : managed_apps_) {
-            if (key.first == package_name) {
-                if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    LOGI("FCM: Temp unfreezing %s (user %d) for push message.",
-                         package_name.c_str(), app.user_id);
-                    
-                    action_executor_->unfreeze(key, app.pids);
-                    app.current_status = AppRuntimeState::Status::RUNNING;
-                    
-                    app.observation_since = time(nullptr);
-                    app.background_since = 0;
-                    
-                    broadcast_dashboard_update();
-                }
-            }
-        }
-    } catch (const json::exception& e) {
-        LOGE("Error processing temp unfreeze request: %s", e.what());
-    }
 }
 
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
@@ -610,12 +553,8 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                 }
                 app.observation_since = 0;
                 app.background_since = 0;
+                unfreeze_and_observe(app, "BECAME_FOREGROUND");
 
-                if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                    LOGI("State: Unfreezing %s (became foreground).", key.first.c_str());
-                    action_executor_->unfreeze(key, app.pids);
-                    app.current_status = AppRuntimeState::Status::RUNNING;
-                }
             } else {
                 app.background_since = 0;
                 if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
@@ -699,6 +638,7 @@ bool StateManager::check_timers() {
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
                     app.current_status = AppRuntimeState::Status::FROZEN;
                     schedule_timed_unfreeze(app);
+                    notify_probe_of_config_change();
                 }
                 app.background_since = 0;
                 changed = true;
@@ -735,10 +675,7 @@ bool StateManager::check_timed_unfreeze() {
     for (auto& [key, app] : managed_apps_) {
         if (app.uid == uid_to_unfreeze) {
             if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
-                LOGI("TIMED UNFREEZE: Waking up %s.", app.package_name.c_str());
-                action_executor_->unfreeze(key, app.pids);
-                app.current_status = AppRuntimeState::Status::RUNNING;
-                app.observation_since = time(nullptr);
+                unfreeze_and_observe(app, "TIMED_UNFREEZE");
                 return true;
             }
             break;
@@ -806,9 +743,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
             app->config = new_config;
 
             if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
-                 LOGI("Policy for frozen app %s changed to exempt. Unfreezing.", app->package_name.c_str());
-                 action_executor_->unfreeze({app->package_name, app->user_id}, app->pids);
-                 app->current_status = AppRuntimeState::Status::RUNNING;
+                 unfreeze_and_observe(*app, "POLICY_CHANGED");
                  state_changed = true;
             }
         }
@@ -869,19 +804,6 @@ json StateManager::get_full_config_for_ui() {
     }
     response["policies"] = policies;
     return response;
-}
-
-json StateManager::get_probe_config_payload() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    json payload = get_full_config_for_ui();
-    json frozen_uids = json::array();
-    for (const auto& [key, app] : managed_apps_) {
-        if (app.current_status == AppRuntimeState::Status::FROZEN) {
-            frozen_uids.push_back(app.uid);
-        }
-    }
-    payload["frozen_uids"] = frozen_uids;
-    return payload;
 }
 
 bool StateManager::reconcile_process_state_full() {
@@ -966,28 +888,21 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     auto it = managed_apps_.find(key);
     if (it != managed_apps_.end()) return &it->second;
 
-    // --- 核心修复点 ---
-    // 如果应用状态在内存中不存在，意味着它可能是一个新发现的应用
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name; // 临时名称，后续会被更新
+    new_state.app_name = package_name;
 
-    // 尝试从数据库加载配置
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
     if (config_opt) {
-        // 如果数据库中有配置，直接使用
         new_state.config = *config_opt;
     } else {
-        // 如果数据库中没有，创建一个默认配置，并【立即写回数据库】
         LOGI("New app instance discovered: %s (user %d). Creating default DB entry.", package_name.c_str(), user_id);
         if (is_critical_system_app(package_name)) {
             new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
         } else {
-            // 默认给豁免策略，让用户手动配置，避免误杀
             new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
         }
-        // 这就是关键的修复步骤！
         db_manager_->set_app_config(new_state.config);
     }
     
