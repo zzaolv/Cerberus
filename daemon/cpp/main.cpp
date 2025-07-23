@@ -16,7 +16,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v14_fcm"
+#define LOG_TAG "cerberusd_main_v15_ultimate"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -38,35 +38,33 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        if (type == "event.app_wakeup_request") {
-            if (g_state_manager && msg.contains("payload")) {
-                g_state_manager->on_wakeup_request(msg.at("payload"));
-            }
-        } 
-        // [核心新增] 处理来自 Probe 的 FCM 临时解冻请求
-        else if (type == "cmd.request_temp_unfreeze_pkg") {
-            if (g_state_manager && msg.contains("payload")) {
-                g_state_manager->on_temp_unfreeze_request(msg.at("payload"));
-            }
+        if (!g_state_manager) return;
+
+        // --- 新增的IPC指令处理 ---
+        if (type == "cmd.request_temp_unfreeze_pkg") {
+            g_state_manager->on_temp_unfreeze_request_by_pkg(msg.at("payload"));
+        } else if (type == "cmd.request_temp_unfreeze_uid") {
+            g_state_manager->on_temp_unfreeze_request_by_uid(msg.at("payload"));
+        } else if (type == "cmd.request_temp_unfreeze_pid") {
+            g_state_manager->on_temp_unfreeze_request_by_pid(msg.at("payload"));
         }
-        else if (type == "cmd.set_policy") {
-            if (g_state_manager && g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
+        // --- 旧指令处理保持不变 ---
+        else if (type == "event.app_wakeup_request") {
+            g_state_manager->on_wakeup_request(msg.at("payload"));
+        } else if (type == "cmd.set_policy") {
+            if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
             g_top_app_refresh_tickets = 1; 
         } else if (type == "cmd.set_master_config") {
-            if (g_state_manager) {
-                MasterConfig cfg;
-                cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
-                g_state_manager->update_master_config(cfg);
-            }
+            MasterConfig cfg;
+            cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+            g_state_manager->update_master_config(cfg);
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
-            if (g_state_manager) {
-                json payload = g_state_manager->get_full_config_for_ui();
-                g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
-            }
+            json payload = g_state_manager->get_full_config_for_ui();
+            g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
         } else if (type == "event.probe_hello") {
             g_probe_fd = client_fd;
             notify_probe_of_config_change();
@@ -128,10 +126,9 @@ void worker_thread_func() {
             audio_scan_countdown = 3;
         }
 
-        // [核心新增] 调度定位状态更新
         if (--location_scan_countdown <= 0) {
             g_sys_monitor->update_location_state();
-            location_scan_countdown = 15; // 重置计时器
+            location_scan_countdown = 15;
         }
 
 
@@ -168,7 +165,7 @@ int main(int argc, char *argv[]) {
         if (!fs::exists(DATA_DIR)) {
             fs::create_directories(DATA_DIR);
         }
-    } catch(const fs::filesystem_error& e) { // [核心修复] 明确使用 std::filesystem::filesystem_error
+    } catch(const fs::filesystem_error& e) {
         LOGE("Failed to create data dir: %s", e.what());
         return 1;
     }
@@ -179,7 +176,7 @@ int main(int argc, char *argv[]) {
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor);
     
     g_sys_monitor->start_top_app_monitor();
-    g_sys_monitor->start_network_snapshot_thread(); // [核心新增] 启动网络快照线
+    g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
     
     g_server = std::make_unique<UdsServer>("cerberus_socket");
@@ -191,7 +188,7 @@ int main(int argc, char *argv[]) {
     if(g_worker_thread.joinable()) g_worker_thread.join();
     
     g_sys_monitor->stop_top_app_monitor();
-    g_sys_monitor->stop_network_snapshot_thread(); // [核心新增] 停止网络快照线程
+    g_sys_monitor->stop_network_snapshot_thread();
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;

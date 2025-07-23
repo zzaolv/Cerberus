@@ -53,10 +53,14 @@ public:
     json get_full_config_for_ui();
     json get_probe_config_payload();
 
-    // [核心修复] 将 on_wakeup_request 函数声明为 public 成员
+    // [旧接口，保持不变]
     void on_wakeup_request(const json& payload);
-    // [核心新增] 声明 FCM 临时解冻请求的处理函数
-    void on_temp_unfreeze_request(const json& payload);
+    
+    // --- [新接口] ---
+    void on_temp_unfreeze_request_by_pkg(const json& payload);
+    void on_temp_unfreeze_request_by_uid(const json& payload);
+    void on_temp_unfreeze_request_by_pid(const json& payload);
+
 
 private:
     bool reconcile_process_state_full(); 
@@ -67,6 +71,9 @@ private:
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
     
+    // 内部通用解冻逻辑
+    void unfreeze_and_observe(AppRuntimeState& app, const std::string& reason);
+
     bool is_app_playing_audio(const AppRuntimeState& app);
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();

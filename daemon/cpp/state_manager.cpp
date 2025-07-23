@@ -422,22 +422,102 @@ void StateManager::on_wakeup_request(const json& payload) {
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
-            AppRuntimeState& app = it->second;
-            if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                LOGI("WAKEUP_REQUEST: Unfreezing %s (user %d) due to external request from Probe.",
-                     package_name.c_str(), user_id);
-                
-                action_executor_->unfreeze(key, app.pids);
-                app.current_status = AppRuntimeState::Status::RUNNING;
-                app.observation_since = time(nullptr);
-                app.background_since = 0; 
-                
-                broadcast_dashboard_update();
-            }
+            unfreeze_and_observe(it->second, "WAKEUP_REQUEST");
         }
     } catch (const json::exception& e) {
         LOGE("Error processing wakeup request: %s", e.what());
     }
+}
+
+// --- [新增] 新的IPC接口实现 ---
+
+void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        std::string package_name = payload.value("package_name", "");
+        if (package_name.empty()) return;
+
+        for (auto& [key, app] : managed_apps_) {
+            if (key.first == package_name) {
+                unfreeze_and_observe(app, "FCM");
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing temp unfreeze by pkg: %s", e.what());
+    }
+}
+
+void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        int uid = payload.value("uid", -1);
+        if (uid < 0) return;
+
+        for (auto& [key, app] : managed_apps_) {
+            if (app.uid == uid) {
+                unfreeze_and_observe(app, "AUDIO_FOCUS");
+                // 通常一个UID只对应一个实例，找到后即可退出
+                break; 
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing temp unfreeze by uid: %s", e.what());
+    }
+}
+
+void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+        int pid = payload.value("pid", -1);
+        if (pid < 0) return;
+        
+        auto it = pid_to_app_map_.find(pid);
+        if (it != pid_to_app_map_.end()) {
+            unfreeze_and_observe(*(it->second), "SIGKILL_PROTECT");
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing temp unfreeze by pid: %s", e.what());
+    }
+}
+
+// --- [新增] 内部通用解冻逻辑 ---
+void StateManager::unfreeze_and_observe(AppRuntimeState& app, const std::string& reason) {
+    if (app.current_status == AppRuntimeState::Status::FROZEN) {
+        LOGI("UNFREEZE [%s]: Unfreezing %s (user %d).", 
+             reason.c_str(), app.package_name.c_str(), app.user_id);
+        
+        action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
+        app.current_status = AppRuntimeState::Status::RUNNING;
+        
+        // 关键：利用现有的观察期机制实现“自动重冻结”
+        app.observation_since = time(nullptr);
+        app.background_since = 0; // 确保清除旧的冻结计时器
+        
+        broadcast_dashboard_update();
+        notify_probe_of_config_change(); // 解冻后状态变化，通知Probe
+    }
+}
+
+
+// --- [修改] get_probe_config_payload ---
+json StateManager::get_probe_config_payload() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    json payload = get_full_config_for_ui();
+    json frozen_uids = json::array();
+    json frozen_pids = json::array(); // 新增
+
+    for (const auto& [key, app] : managed_apps_) {
+        if (app.current_status == AppRuntimeState::Status::FROZEN) {
+            frozen_uids.push_back(app.uid);
+            // 将该应用的所有PID添加到列表中
+            for (int pid : app.pids) {
+                frozen_pids.push_back(pid);
+            }
+        }
+    }
+    payload["frozen_uids"] = frozen_uids;
+    payload["frozen_pids"] = frozen_pids; // 新增
+    return payload;
 }
 
 
