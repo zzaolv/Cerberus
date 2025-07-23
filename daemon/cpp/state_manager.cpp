@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v15_ultimate"
+#define LOG_TAG "cerberusd_state_v16_final" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -52,7 +52,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     
     master_config_ = db_manager_->get_master_config().value_or(MasterConfig{});
     LOGI("Loaded master config: standard_timeout=%ds, timed_unfreeze=%ds", 
-        master_config_.standard_timeout_sec, master_config_.timed_unfreeze_interval_sec);
+         master_config_.standard_timeout_sec, master_config_.timed_unfreeze_interval_sec);
     
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
         default_freeze_method_ = FreezeMethod::CGROUP_V2;
@@ -405,7 +405,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-    
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
@@ -431,7 +430,6 @@ void StateManager::on_wakeup_request(const json& payload) {
         LOGE("Error processing wakeup request: %s", e.what());
     }
 }
-
 
 void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -510,18 +508,22 @@ void StateManager::unfreeze_and_observe(AppRuntimeState& app, const std::string&
         broadcast_dashboard_update();
         notify_probe_of_config_change();
     } else {
-        // 新增日志：记录为什么没有执行解冻
         LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
             reason.c_str(), app.package_name.c_str(), static_cast<int>(app.current_status));
     }
 }
 
-
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     master_config_ = config;
     db_manager_->set_master_config(config);
-    LOGI("Master config updated: standard_timeout=%ds", master_config_.standard_timeout_sec);
+    LOGI("Master config updated: standard_timeout=%ds, timed_unfreeze=%ds", 
+         master_config_.standard_timeout_sec, master_config_.timed_unfreeze_interval_sec);
+}
+
+MasterConfig StateManager::get_master_config() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return master_config_;
 }
 
 bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
@@ -595,10 +597,9 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
 bool StateManager::tick_state_machine() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     bool changed1 = check_timers();
-    bool changed2 = check_timed_unfreeze(); // 添加调用
+    bool changed2 = check_timed_unfreeze();
     return changed1 || changed2;
 }
-
 
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
@@ -660,7 +661,7 @@ bool StateManager::check_timers() {
             if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
-                    app.current_status = AppRuntimeState::Status::FROZEN;                
+                    app.current_status = AppRuntimeState::Status::FROZEN;
                     schedule_timed_unfreeze(app);
                     notify_probe_of_config_change();
                 }
@@ -673,26 +674,33 @@ bool StateManager::check_timers() {
 }
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
-    const int unfreeze_interval_sec = 1800;
-    if (unfreeze_interval_sec <= 0) return;
+    if (master_config_.timed_unfreeze_interval_sec <= 0) {
+        return;
+    }
     
-    uint32_t next_idx = (timeline_idx_ + unfreeze_interval_sec) % unfrozen_timeline_.size();
+    uint32_t future_index = (timeline_idx_ + master_config_.timed_unfreeze_interval_sec) % unfrozen_timeline_.size();
+    
     for (size_t i = 0; i < unfrozen_timeline_.size(); ++i) {
-        if (unfrozen_timeline_[next_idx] == 0) {
-            unfrozen_timeline_[next_idx] = app.uid;
-            LOGD("Scheduled timed unfreeze for %s at timeline index %u.", app.package_name.c_str(), next_idx);
+        uint32_t check_idx = (future_index + i) % unfrozen_timeline_.size();
+        if (unfrozen_timeline_[check_idx] == 0) {
+            unfrozen_timeline_[check_idx] = app.uid;
+            LOGD("Scheduled timed unfreeze for %s (uid:%d) at timeline index %u.", 
+                 app.package_name.c_str(), app.uid, check_idx);
             return;
         }
-        next_idx = (next_idx + 1) % unfrozen_timeline_.size();
     }
+
     LOGW("Unfreeze timeline is full! Cannot schedule for %s.", app.package_name.c_str());
 }
 
 bool StateManager::check_timed_unfreeze() {
     timeline_idx_ = (timeline_idx_ + 1) % unfrozen_timeline_.size();
+    
     int uid_to_unfreeze = unfrozen_timeline_[timeline_idx_];
     
-    if (uid_to_unfreeze == 0) return false;
+    if (uid_to_unfreeze == 0) {
+        return false;
+    }
     
     unfrozen_timeline_[timeline_idx_] = 0;
 
@@ -830,7 +838,6 @@ json StateManager::get_full_config_for_ui() {
     return response;
 }
 
-// **[已修复]** 确保 get_probe_config_payload 函数实现存在且正确
 json StateManager::get_probe_config_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     json payload = get_full_config_for_ui();
@@ -995,52 +1002,4 @@ void StateManager::remove_pid_from_app(int pid) {
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
     return critical_system_apps_.count(package_name) > 0;
-}
-
-void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
-    if (master_config_.timed_unfreeze_interval_sec <= 0) {
-        return; // 功能被禁用
-    }
-    
-    // 计算未来时间点的索引
-    uint32_t future_index = (timeline_idx_ + master_config_.timed_unfreeze_interval_sec) % unfrozen_timeline_.size();
-    
-    // 寻找一个空槽来放置任务
-    for (size_t i = 0; i < unfrozen_timeline_.size(); ++i) {
-        uint32_t check_idx = (future_index + i) % unfrozen_timeline_.size();
-        if (unfrozen_timeline_[check_idx] == 0) {
-            unfrozen_timeline_[check_idx] = app.uid;
-            LOGD("Scheduled timed unfreeze for %s (uid:%d) at timeline index %u.", 
-                 app.package_name.c_str(), app.uid, check_idx);
-            return;
-        }
-    }
-
-    LOGW("Unfreeze timeline is full! Cannot schedule for %s.", app.package_name.c_str());
-}
-
-bool StateManager::check_timed_unfreeze() {
-    // 时针向前走一格
-    timeline_idx_ = (timeline_idx_ + 1) % unfrozen_timeline_.size();
-    
-    int uid_to_unfreeze = unfrozen_timeline_[timeline_idx_];
-    
-    if (uid_to_unfreeze == 0) {
-        return false; // 当前时间点没有任务
-    }
-    
-    // 取出任务并清空槽位
-    unfrozen_timeline_[timeline_idx_] = 0;
-
-    // 查找并执行解冻
-    for (auto& [key, app] : managed_apps_) {
-        if (app.uid == uid_to_unfreeze) {
-            if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
-                unfreeze_and_observe(app, "TIMED_UNFREEZE");
-                return true; // 状态已改变
-            }
-            break; // 找到了对应的app，无论是否解冻都可退出循环
-        }
-    }
-    return false;
 }
