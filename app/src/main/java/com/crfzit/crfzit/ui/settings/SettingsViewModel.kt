@@ -10,7 +10,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class SettingsUiState(
-    val standardTimeoutSec: Int = 90
+    val standardTimeoutSec: Int = 90,
+    val timedUnfreezeIntervalSec: Int = 1800 // [新增]
 )
 
 class SettingsViewModel : ViewModel() {
@@ -28,6 +29,16 @@ class SettingsViewModel : ViewModel() {
         }
     }
     
+    // [新增] 新的设置函数
+    fun setTimedUnfreezeInterval(seconds: Int) {
+        _uiState.update { it.copy(timedUnfreezeIntervalSec = seconds) }
+        viewModelScope.launch {
+            val payload = mapOf("timed_unfreeze_interval_sec" to seconds)
+            daemonRepository.setMasterConfig(payload)
+        }
+    }
+    
+
     // TODO: Add a method in init to load the current config from daemon.
     // For now, it will just show the default.
     

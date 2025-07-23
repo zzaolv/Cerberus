@@ -57,8 +57,14 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             }
             g_top_app_refresh_tickets = 1; 
         } else if (type == "cmd.set_master_config") {
-            MasterConfig cfg;
-            cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+            // [修改] 以支持多个配置项
+            MasterConfig cfg = g_state_manager->get_master_config(); // 获取当前配置作为基础
+            if(msg.at("payload").contains("standard_timeout_sec")) {
+                cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+            }
+            if(msg.at("payload").contains("timed_unfreeze_interval_sec")) {
+                cfg.timed_unfreeze_interval_sec = msg.at("payload").at("timed_unfreeze_interval_sec").get<int>();
+            }
             g_state_manager->update_master_config(cfg);
         } else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();

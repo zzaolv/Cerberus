@@ -29,6 +29,7 @@ struct AppConfig {
 // [新] 全局配置结构体
 struct MasterConfig {
     int standard_timeout_sec = 90; // 智能模式默认超时90秒
+    int timed_unfreeze_interval_sec = 1800; // [新增] 定时解冻间隔，默认30分钟
 };
 
 

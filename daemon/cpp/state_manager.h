@@ -60,6 +60,7 @@ public:
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
+    MasterConfig get_master_config();
 
 
 private:
@@ -92,7 +93,7 @@ private:
 
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
-    
+
     using AppInstanceKey = std::pair<std::string, int>; 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;

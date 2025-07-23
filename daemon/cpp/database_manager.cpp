@@ -40,6 +40,10 @@ void DatabaseManager::initialize_database() {
                 )
             )");
             db_.exec("INSERT OR IGNORE INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', 90)");
+            db_.exec("INSERT OR IGNORE INTO master_config_v1 (key, value) VALUES ('timed_unfreeze_interval_sec', 1800)"); // [新增]
+        } else {
+            // [新增] 对已存在的表，确保新字段有默认值
+            db_.exec("INSERT OR IGNORE INTO master_config_v1 (key, value) VALUES ('timed_unfreeze_interval_sec', 1800)");
         }
     } catch (const std::exception& e) {
         LOGE("Database initialization failed: %s", e.what());
@@ -49,11 +53,18 @@ void DatabaseManager::initialize_database() {
 std::optional<MasterConfig> DatabaseManager::get_master_config() {
     try {
         MasterConfig config;
-        SQLite::Statement query(db_, "SELECT value FROM master_config_v1 WHERE key = 'standard_timeout_sec'");
-        if (query.executeStep()) {
-            config.standard_timeout_sec = query.getColumn(0).getInt();
-            return config;
+        // [修改] 一次性查询所有配置项
+        SQLite::Statement query(db_, "SELECT key, value FROM master_config_v1");
+        while (query.executeStep()) {
+            std::string key = query.getColumn(0).getString();
+            int value = query.getColumn(1).getInt();
+            if (key == "standard_timeout_sec") {
+                config.standard_timeout_sec = value;
+            } else if (key == "timed_unfreeze_interval_sec") {
+                config.timed_unfreeze_interval_sec = value;
+            }
         }
+        return config;
     } catch (const std::exception& e) {
         LOGE("Failed to get master config: %s", e.what());
     }
@@ -62,12 +73,25 @@ std::optional<MasterConfig> DatabaseManager::get_master_config() {
 
 bool DatabaseManager::set_master_config(const MasterConfig& config) {
     try {
+        SQLite::Transaction transaction(db_);
+        
         SQLite::Statement query(db_, R"(
-            INSERT INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', ?)
+            INSERT INTO master_config_v1 (key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         )");
-        query.bind(1, config.standard_timeout_sec);
-        return query.exec() > 0;
+
+        // [修改] 分别绑定并执行两个配置项
+        query.bind(1, "standard_timeout_sec");
+        query.bind(2, config.standard_timeout_sec);
+        query.exec();
+        query.reset();
+
+        query.bind(1, "timed_unfreeze_interval_sec");
+        query.bind(2, config.timed_unfreeze_interval_sec);
+        query.exec();
+
+        transaction.commit();
+        return true;
     } catch (const std::exception& e) {
         LOGE("Failed to set master config: %s", e.what());
         return false;
