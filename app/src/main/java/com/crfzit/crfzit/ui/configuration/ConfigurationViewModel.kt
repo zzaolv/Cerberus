@@ -2,15 +2,19 @@
 package com.crfzit.crfzit.ui.configuration
 
 import android.app.Application
-import androidx.core.content.ContextCompat // 确保这个 import 存在
+import android.content.Intent
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.*
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import com.crfzit.crfzit.R // 确保 R 文件的 import 存在
+import kotlinx.coroutines.withContext
 
 data class ConfigurationUiState(
     val isLoading: Boolean = true,
@@ -25,6 +29,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
     private val daemonRepository = DaemonRepository(viewModelScope)
     private val appInfoRepository = AppInfoRepository.getInstance(application)
+    private val packageManager: PackageManager = application.packageManager
 
     private val _uiState = MutableStateFlow(ConfigurationUiState())
     val uiState: StateFlow<ConfigurationUiState> = _uiState.asStateFlow()
@@ -53,34 +58,30 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. 并行启动两个数据加载任务
-            val mainUserAppsDeferred = async { 
-                appInfoRepository.getAllApps(forceRefresh = true).associateBy { it.packageName } 
-            }
-            val configPayloadDeferred = async { daemonRepository.getAllPolicies() }
+            // 1. 获取守护进程的完整配置，这包含了所有被监控的应用实例
+            val configPayload = daemonRepository.getAllPolicies()
+            // 2. 获取主空间(User 0)所有可启动的应用包名列表
+            val launchablePackages = getLaunchablePackages()
 
-            // 2. 等待两个任务全部完成
-            val mainUserAppMetaMap = mainUserAppsDeferred.await()
-            val configPayload = configPayloadDeferred.await()
+            // 3. 获取主空间(User 0)所有应用的基础元数据（图标、名称等）
+            val mainUserAppMetaMap = appInfoRepository.getAllApps(forceRefresh = true)
+                .associateBy { it.packageName }
 
-            // --- 从这里开始，两个数据源都已准备就绪，可以安全合并 ---
+            // --- 数据准备完毕，开始安全合并与过滤 ---
 
             val daemonPolicies = configPayload?.policies ?: emptyList()
             val policyMap = daemonPolicies.associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            // 3. 手动构建最终的 AppInfo Map
             val finalAppInfoMap = mutableMapOf<AppInstanceKey, AppInfo>()
 
-            // 3a. 添加所有主空间的应用
-            mainUserAppMetaMap.values.forEach { mainApp ->
-                finalAppInfoMap[AppInstanceKey(mainApp.packageName, 0)] = mainApp
-            }
-
-            // 3b. 用 Daemon 的数据进行覆盖或补充
+            // 4. 遍历守护进程上报的所有应用策略
             daemonPolicies.forEach { policy ->
-                val key = AppInstanceKey(policy.packageName, policy.userId)
-                if (!finalAppInfoMap.containsKey(key)) {
-                    val baseAppInfo = mainUserAppMetaMap[key.packageName]
+                // [核心过滤逻辑] 只有当一个应用是可启动的，我们才考虑将它显示在配置页
+                if (launchablePackages.contains(policy.packageName)) {
+                    val key = AppInstanceKey(policy.packageName, policy.userId)
+                    val baseAppInfo = mainUserAppMetaMap[policy.packageName]
+
+                    // 为这个可启动的应用实例（可能是主应用或分身）创建或更新 AppInfo
                     finalAppInfoMap[key] = AppInfo(
                         packageName = key.packageName,
                         userId = key.userId,
@@ -90,7 +91,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                     )
                 }
             }
-            
+
             val finalAppList = finalAppInfoMap.values.toList()
 
             _uiState.update {
@@ -103,7 +104,21 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
         }
     }
-    
+
+    /**
+     * [新增辅助函数] 获取系统中所有具有 LAUNCHER 入口的应用包名。
+     * 这是一个耗时操作，因此在IO线程中执行。
+     */
+    private suspend fun getLaunchablePackages(): Set<String> = withContext(Dispatchers.IO) {
+        val intent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+            .map { it.activityInfo.packageName }
+            .toSet()
+    }
+
+
     fun setAppPolicy(packageName: String, userId: Int, newPolicyValue: Int) {
         val currentConfig = _uiState.value.fullConfig ?: return
         val currentPolicies = _uiState.value.policies.toMutableMap()

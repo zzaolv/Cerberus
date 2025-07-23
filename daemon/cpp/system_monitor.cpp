@@ -20,15 +20,17 @@
 #include <iterator>
 #include <chrono>
 #include <string>
-#include <memory> // For std::unique_ptr
+#include <memory>
 
-#define LOG_TAG "cerberusd_monitor_v13_netfix"
+#define LOG_TAG "cerberusd_monitor_v14_net_rework"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// (其他函数保持不变，从文件顶部开始)
 
 int get_uid_from_pid(int pid) {
     char path_buffer[64];
@@ -219,15 +221,12 @@ void SystemMonitor::network_snapshot_thread_func() {
 
         std::map<int, NetworkSpeed> new_speeds;
         
-        // --- 核心修复逻辑 ---
-        // 遍历当前快照中的所有UID
         for (const auto& [uid, current_stats] : current_snapshot) {
             auto last_it = last_snapshot.find(uid);
             
-            NetworkSpeed speed; // 默认速度为0
+            NetworkSpeed speed;
 
             if (last_it != last_snapshot.end()) {
-                // 如果在上个快照中也找到了这个UID，则计算速率
                 long long rx_delta = (current_stats.rx_bytes > last_it->second.rx_bytes) ? (current_stats.rx_bytes - last_it->second.rx_bytes) : 0;
                 long long tx_delta = (current_stats.tx_bytes > last_it->second.tx_bytes) ? (current_stats.tx_bytes - last_it->second.tx_bytes) : 0;
                 
@@ -236,15 +235,11 @@ void SystemMonitor::network_snapshot_thread_func() {
                     speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
                 }
             }
-            // 无论速率是否大于0，都将此UID的速率（可能为0）放入新的速率表中。
-            // 这可以防止因应用暂时空闲而导致其速率缓存被清除。
             new_speeds[uid] = speed;
         }
         
         {
             std::lock_guard<std::mutex> lock(speed_mutex_);
-            // 用新计算的速率表覆盖旧表。
-            // 消失的UID（已卸载或长期无网络活动）会自然地被清除。
             uid_network_speed_ = new_speeds;
         }
         {
@@ -252,7 +247,11 @@ void SystemMonitor::network_snapshot_thread_func() {
             last_traffic_snapshot_ = current_snapshot;
             last_snapshot_time_ = current_time;
         }
-        LOGD("Network speed cache updated for %zu UIDs.", new_speeds.size());
+        if (new_speeds.empty() && !current_snapshot.empty()) {
+            LOGD("Network speed cache updated, but all UIDs had 0 speed.");
+        } else {
+            LOGD("Network speed cache updated for %zu UIDs.", new_speeds.size());
+        }
     }
     LOGI("Network snapshot thread stopped.");
 }
@@ -263,7 +262,7 @@ NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     if (it != uid_network_speed_.end()) {
         return it->second;
     }
-    return NetworkSpeed(); // 返回默认的0速率
+    return NetworkSpeed();
 }
 
 
@@ -281,14 +280,16 @@ static std::string exec_shell_pipe(const char* cmd) {
     return result;
 }
 
+// --- 核心修复：重写网络流量解析函数 ---
 std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
     std::map<int, TrafficStats> snapshot;
     const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
 
     std::ifstream qtaguid_file(qtaguid_path);
     if (qtaguid_file.is_open()) {
+        // 方案A: 优先使用内核文件，效率最高
         std::string line;
-        std::getline(qtaguid_file, line);
+        std::getline(qtaguid_file, line); // 跳过表头
         while (std::getline(qtaguid_file, line)) {
             std::stringstream ss(line);
             std::string idx, iface, acct_tag, set;
@@ -300,36 +301,71 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
                 snapshot[uid].tx_bytes += tx_bytes;
             }
         }
-    } else {
-        std::string result = exec_shell_pipe("dumpsys netstats");
-        std::stringstream ss(result);
-        std::string line;
-        bool in_bpf_section = false;
+        if (!snapshot.empty()) {
+            return snapshot; // 成功从proc文件读取，直接返回
+        }
+    }
+    
+    // 方案B: 兼容模式，健壮地解析 dumpsys netstats
+    // LOGI("Falling back to 'dumpsys netstats' for traffic data.");
+    std::string result = exec_shell_pipe("dumpsys netstats");
+    std::stringstream ss(result);
+    std::string line;
+    enum class ParseState { searching, in_mTun, in_mStatsFactory };
+    ParseState state = ParseState::searching;
 
-        while (std::getline(ss, line)) {
-            if (line.find("BPF map content:") != std::string::npos) {
-                in_bpf_section = true;
+    while (std::getline(ss, line)) {
+        // 状态机：寻找正确的解析区域
+        if (state == ParseState::searching) {
+            if (line.find("mTunAnd464xlatAdjustedStats ") != std::string::npos) {
+                state = ParseState::in_mTun;
+                // LOGD("NET_PARSE: Found mTunAnd464xlatAdjustedStats section.");
+                continue;
+            } else if (line.find("mStatsFactory:") != std::string::npos) {
+                state = ParseState::in_mStatsFactory;
+                // LOGD("NET_PARSE: Found mStatsFactory section.");
                 continue;
             }
-            
-            if (in_bpf_section && line.find("mAppUidStatsMap:") != std::string::npos) {
-                std::getline(ss, line);
-                
-                while (std::getline(ss, line) && !line.empty() && isspace(line[0])) {
+        }
+
+        if (state == ParseState::in_mStatsFactory || state == ParseState::in_mTun) {
+            // 格式: mPersistSnapshot [index] iface=... uid=10334 ... rxBytes=... txBytes=...
+            //       mTunAnd464xlatAdjustedStats [index] iface=... uid=10334 ... rxBytes=... txBytes=...
+            if (line.find(" uid=") != std::string::npos && line.find(" rxBytes=") != std::string::npos) {
+                try {
+                    int uid = -1;
+                    long long rx = -1, tx = -1;
+                    std::string part;
                     std::stringstream line_ss(line);
-                    int uid;
-                    long long rx_bytes, tx_bytes, rx_packets, tx_packets;
-                    line_ss >> uid >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
                     
-                    if (uid >= 10000) {
-                        snapshot[uid].rx_bytes += rx_bytes;
-                        snapshot[uid].tx_bytes += tx_bytes;
+                    // 跳过前面的 "[index] iface=..." 等部分
+                    while (line_ss >> part && part.find("uid=") == std::string::npos);
+
+                    if (part.find("uid=") == 0) {
+                        uid = std::stoi(part.substr(4));
+                        
+                        while (line_ss >> part && part.find("rxBytes=") == std::string::npos);
+                        if(part.find("rxBytes=") == 0) rx = std::stoll(part.substr(8));
+
+                        while (line_ss >> part && part.find("txBytes=") == std::string::npos);
+                        if(part.find("txBytes=") == 0) tx = std::stoll(part.substr(8));
+
+                        if (uid >= 10000 && rx != -1 && tx != -1) {
+                            snapshot[uid].rx_bytes += rx;
+                            snapshot[uid].tx_bytes += tx;
+                        }
                     }
+                } catch (const std::exception& e) {
+                    // 忽略解析失败的行
                 }
-                break; 
             }
         }
     }
+    
+    if (snapshot.empty()) {
+        LOGW("Both /proc and dumpsys netstats parsing failed to get any traffic data.");
+    }
+
     return snapshot;
 }
 
@@ -407,7 +443,7 @@ void SystemMonitor::update_location_state() {
 
                 if (uid >= 10000) {
                     active_uids.insert(uid);
-                    LOGD("LOCATION: Found active UID %d in request: %s", uid, trimmed_line.c_str());
+                    // LOGD("LOCATION: Found active UID %d in request: %s", uid, trimmed_line.c_str());
                 }
             } catch (const std::exception& e) {
                 LOGW("LOCATION: Parsing error on line: %s", line.c_str());
