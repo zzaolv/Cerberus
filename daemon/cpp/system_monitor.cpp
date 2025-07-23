@@ -288,9 +288,11 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
 
 // [核心新增] 按需计算指定UID的瞬时网速
 NetworkSpeed SystemMonitor::get_instant_network_speed(int uid) {
-    auto current_traffic = read_current_traffic();
+    // 步骤1：获取当前快照和时间
+    auto current_snapshot = read_current_traffic();
     auto current_time = std::chrono::steady_clock::now();
 
+    // 步骤2：获取上一次的快照和时间
     std::map<int, TrafficStats> last_snapshot;
     std::chrono::steady_clock::time_point last_time;
 
@@ -302,22 +304,37 @@ NetworkSpeed SystemMonitor::get_instant_network_speed(int uid) {
 
     NetworkSpeed speed;
     auto last_it = last_snapshot.find(uid);
-    auto current_it = current_traffic.find(uid);
+    auto current_it = current_snapshot.find(uid);
 
-    if (last_it != last_snapshot.end() && current_it != current_traffic.end()) {
+    // 步骤3：进行计算（只有当新旧快照都存在该UID时）
+    if (last_it != last_snapshot.end() && current_it != current_snapshot.end()) {
         double time_delta_sec = std::chrono::duration_cast<std::chrono::duration<double>>(current_time - last_time).count();
-        if (time_delta_sec > 0.1) { // 避免除以0
-            long long rx_delta = current_it->second.rx_bytes - last_it->second.rx_bytes;
-            long long tx_delta = current_it->second.tx_bytes - last_it->second.tx_bytes;
-
-            if (rx_delta > 0) {
-                speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
-            }
-            if (tx_delta > 0) {
-                speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
-            }
+        
+        // 增加安全检查和日志
+        if (time_delta_sec < 0.1) {
+            LOGD("NETWORK: Time delta too small (%.2fs) for UID %d, skipping calculation.", time_delta_sec, uid);
+            return speed;
         }
+
+        long long rx_delta = current_it->second.rx_bytes - last_it->second.rx_bytes;
+        long long tx_delta = current_it->second.tx_bytes - last_it->second.tx_bytes;
+
+        // 只有当流量增加了才计算速率
+        if (rx_delta > 0) {
+            speed.download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec;
+        }
+        if (tx_delta > 0) {
+            speed.upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec;
+        }
+        
+        // 增加详细日志，便于调试
+        LOGD("NETWORK: UID %d | RX_Delta: %lld B | TX_Delta: %lld B | Time_Delta: %.2fs | DL_Speed: %.1f KB/s | UL_Speed: %.1f KB/s",
+             uid, rx_delta, tx_delta, time_delta_sec, speed.download_kbps, speed.upload_kbps);
+
+    } else {
+        LOGD("NETWORK: UID %d not found in both snapshots, cannot calculate speed.", uid);
     }
+    
     return speed;
 }
 
