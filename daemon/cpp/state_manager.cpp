@@ -591,47 +591,48 @@ bool StateManager::check_timers() {
             continue;
         }
 
-        if (app.observation_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
-            if (now - app.observation_since >= 10) {
-                LOGD("TICK: Observation for %s ended. Checking audio status...", app.package_name.c_str());
-                app.observation_since = 0;
-                
-                sys_monitor_->update_audio_state();
-                
-                if (is_app_playing_audio(app)) {
-                    LOGI("TICK: %s is playing audio, deferring freeze timer start.", app.package_name.c_str());
-                    app.observation_since = now;
-                } else {
-                    LOGI("TICK: %s is silent, starting freeze timer.", app.package_name.c_str());
-                    app.background_since = now;
-                }
+        // --- 观察期结束后的决策点 ---
+        if (app.observation_since > 0 && now - app.observation_since >= 10) {
+            LOGD("TICK: Observation for %s ended. Checking all exemption conditions...", app.package_name.c_str());
+            app.observation_since = 0; // 结束观察期
+
+            // [关键] 在此决策点，一次性检查所有豁免条件
+            
+            // 检查音频
+            sys_monitor_->update_audio_state(); // 强制刷新
+            if (is_app_playing_audio(app)) {
+                LOGI("TICK: %s is playing audio, deferring freeze.", app.package_name.c_str());
+                app.observation_since = now; // 重置观察期
                 changed = true;
+                continue; // 跳过此应用的后续处理
             }
-        }
-        
-        if (app.background_since > 0 && app.current_status == AppRuntimeState::Status::RUNNING) {
-            // [核心新增] 增加网速豁免检查
+
+            // 检查定位
+            if (sys_monitor_->is_uid_using_location(app.uid)) {
+                LOGI("TICK: %s is using location, deferring freeze.", app.package_name.c_str());
+                app.observation_since = now; // 重置观察期
+                changed = true;
+                continue;
+            }
+
+            // 检查网速
             NetworkSpeed speed = sys_monitor_->get_instant_network_speed(app.uid);
             if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
-                LOGD("TICK: Deferring freeze for %s due to network activity (DL: %.1f KB/s, UL: %.1f KB/s).",
+                LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), deferring freeze.",
                      app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
-                app.background_since = now; // 重置计时器
+                app.observation_since = now; // 重置观察期
+                changed = true;
                 continue;
             }
-            
-            // [核心新增] 增加定位豁免检查
-            if (sys_monitor_->is_uid_using_location(app.uid)) {
-                LOGD("TICK: Deferring freeze for %s because it is using location.", app.package_name.c_str());
-                app.background_since = now; // 重置计时器
-                continue;
-            }            
-            
-            if (is_app_playing_audio(app)) {
-                LOGD("TICK: Deferring freeze for %s because it has active audio.", app.package_name.c_str());
-                app.background_since = now;
-                continue;
-            }
-            
+
+            // 如果所有豁免条件都不满足，则启动冻结倒计时
+            LOGI("TICK: %s is silent and inactive, starting freeze timer.", app.package_name.c_str());
+            app.background_since = now;
+            changed = true;
+        }
+        
+        // --- 冻结倒计时 ---
+        if (app.background_since > 0) {
             int timeout_sec = 0;
             if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
             else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
@@ -640,10 +641,10 @@ bool StateManager::check_timers() {
                 LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
                 if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
                     app.current_status = AppRuntimeState::Status::FROZEN;
-                    changed = true;
                     schedule_timed_unfreeze(app);
                 }
                 app.background_since = 0;
+                changed = true;
             }
         }
     }

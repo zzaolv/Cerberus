@@ -53,40 +53,44 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
+            // 1. 从 Daemon 获取所有已知策略，这是最全的数据源
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicies = configPayload?.policies ?: emptyList()
-            val policyMap = daemonPolicies
-                .associateBy { AppInstanceKey(it.packageName, it.userId) }
+            val policyMap = daemonPolicies.associateBy { AppInstanceKey(it.packageName, it.userId) }
 
-            val mainUserApps = appInfoRepository.getAllApps(forceRefresh = false)
-            val finalAppList = mainUserApps.toMutableList()
+            // 2. 预加载主空间应用信息，作为元数据字典
+            val mainUserAppMap = appInfoRepository.getAllApps(forceRefresh = false)
+                .associateBy { it.packageName }
 
-            val knownInstances = mainUserApps.map { AppInstanceKey(it.packageName, it.userId) }.toMutableSet()
+            // 3. 基于 Daemon 的策略列表，构建最终的应用列表
+            val finalAppList = daemonPolicies.map { policy ->
+                val baseAppInfo = mainUserAppMap[policy.packageName]
+                AppInfo(
+                    packageName = policy.packageName,
+                    userId = policy.userId,
+                    appName = baseAppInfo?.appName ?: policy.packageName,
+                    icon = baseAppInfo?.icon ?: ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher),
+                    isSystemApp = baseAppInfo?.isSystemApp ?: false
+                )
+            }.toMutableList()
 
-            daemonPolicies.forEach { policy ->
-                val key = AppInstanceKey(policy.packageName, policy.userId)
-                if (!knownInstances.contains(key)) {
-                    val baseAppInfo = appInfoRepository.getAppInfo(policy.packageName)
-
-                    // [核心修复] 使用 getApplication() 来获取 Context
-                    val defaultIcon = ContextCompat.getDrawable(getApplication(), R.mipmap.ic_launcher)
-
-                    val syntheticAppInfo = AppInfo(
-                        packageName = policy.packageName,
-                        userId = policy.userId,
-                        appName = baseAppInfo?.appName ?: policy.packageName,
-                        icon = baseAppInfo?.icon ?: defaultIcon,
-                        isSystemApp = baseAppInfo?.isSystemApp ?: false
-                    )
-                    finalAppList.add(syntheticAppInfo)
-                    knownInstances.add(key)
+            // 4. 添加那些在主空间存在，但在 Daemon 策略中还未配置的应用
+            val daemonPackages = daemonPolicies.map { it.packageName }.toSet()
+            mainUserAppMap.values.forEach { mainApp ->
+                if (!daemonPackages.contains(mainApp.packageName)) {
+                    // 确保列表中至少有主空间的应用实例
+                    val key = AppInstanceKey(mainApp.packageName, 0)
+                    if (finalAppList.none { AppInstanceKey(it.packageName, it.userId) == key }) {
+                        finalAppList.add(mainApp)
+                    }
                 }
             }
 
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    allInstalledApps = finalAppList,
+                    // 使用 distinctBy 确保最终列表的唯一性
+                    allInstalledApps = finalAppList.distinctBy { app -> AppInstanceKey(app.packageName, app.userId) },
                     policies = policyMap,
                     fullConfig = configPayload
                 )
