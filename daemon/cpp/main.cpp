@@ -188,11 +188,24 @@ int main(int argc, char *argv[]) {
     g_server = std::make_unique<UdsServer>("cerberus_socket");
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
+    
+    // [修复] 启动服务器，它将在自己的线程中运行
     g_server->run();
     
-    g_is_running = false;
-    if(g_worker_thread.joinable()) g_worker_thread.join();
+    // [修复] 主线程进入等待循环，直到收到信号
+    // signal_handler 会将 g_is_running 置为 false 来终止循环
+    while (g_is_running) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // --- 关停逻辑 ---
+    // g_is_running 已经是 false, worker_thread 将会退出
+    if(g_worker_thread.joinable()) {
+        g_worker_thread.join();
+    }
     
+    // UDS 服务器已经在 signal_handler 中通过 g_server->stop() 停止
+    // 其他监视器线程也需要停止
     g_sys_monitor->stop_top_app_monitor();
     g_sys_monitor->stop_network_snapshot_thread();
 
