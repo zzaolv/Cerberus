@@ -8,6 +8,12 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <thread>
+
+// [新] 用于管理每个客户端连接状态的结构体
+struct ClientState {
+    std::string read_buffer;
+};
 
 class UdsServer {
 public:
@@ -28,20 +34,25 @@ public:
     void set_disconnect_handler(std::function<void(int client_fd)> handler);
 
 private:
+    void server_loop();
     void add_client(int client_fd);
     void remove_client(int client_fd);
     void handle_client_data(int client_fd);
+    void set_socket_non_blocking(int fd);
 
     std::string socket_name_;
-    int server_fd_;
+    int server_fd_ = -1;
+    int epoll_fd_ = -1;  // [新] epoll 文件描述符
+    int event_fd_ = -1;  // [新] 用于优雅停机的 eventfd
+
     std::atomic<bool> is_running_;
+    std::thread server_thread_;
     
-    std::vector<int> client_fds_;
     mutable std::mutex client_mutex_;
+    std::map<int, ClientState> clients_; // [修改] 使用map管理客户端状态
 
     std::function<void(int, const std::string&)> on_message_received_;
     std::function<void(int)> on_disconnect_;
-    std::map<int, std::string> client_buffers_;
 };
 
 #endif //CERBERUSD_UDS_SERVER_H
