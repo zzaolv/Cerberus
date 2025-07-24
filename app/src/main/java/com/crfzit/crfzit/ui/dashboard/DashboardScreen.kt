@@ -28,6 +28,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import coil.size.Size
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.GlobalStats
@@ -91,7 +92,6 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
     }
 }
 
-// ... DashboardContent and other composables remain unchanged ...
 @Composable
 fun DashboardContent(
     globalStats: GlobalStats,
@@ -124,19 +124,17 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
         (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
     } else 0f
-    
+
     val swapUsedPercent = if (stats.swapTotalKb > 0) {
         (stats.swapTotalKb - stats.swapFreeKb).toFloat() / stats.swapTotalKb
     } else 0f
-    
+
     val cpuUsedPercent = stats.totalCpuUsagePercent / 100f
-    
+
     val downSpeed = formatSpeed(speed.downloadSpeedBps)
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
     Column(modifier = Modifier.padding(bottom = 8.dp)) {
-        // [FIX] Removed activeProfileName as it's no longer in the model
-        // You can add a static or dynamic title here if needed
         Text(
             text = "系统状态",
             style = MaterialTheme.typography.titleMedium,
@@ -145,7 +143,7 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                 .align(Alignment.CenterHorizontally)
                 .padding(bottom = 12.dp)
         )
-        
+
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
             modifier = Modifier.height(180.dp),
@@ -170,7 +168,7 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
                 )
             }
             item {
-                 StatusGridItem(
+                StatusGridItem(
                     label = "交换 (SWAP)",
                     value = formatMemory(stats.swapTotalKb - stats.swapFreeKb),
                     progress = swapUsedPercent,
@@ -209,8 +207,8 @@ fun StatusGridItem(
             }
             Spacer(Modifier.weight(1f))
             if (subValue != null) {
-                 Text(value, style = MaterialTheme.typography.titleMedium)
-                 Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(value, style = MaterialTheme.typography.titleMedium)
+                Text(subValue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 Text(value, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
             }
@@ -237,15 +235,24 @@ fun AppRuntimeCard(app: UiAppRuntime) {
             Image(
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
-                        .placeholder(android.R.drawable.sym_def_app_icon)
-                        .error(android.R.drawable.sym_def_app_icon)
-                        .crossfade(true).build()
+                        .data(app.applicationInfo)
+                        // [OPT] 使用我们创建的轻量级矢量占位图
+                        .placeholder(R.drawable.ic_placeholder_icon)
+                        .error(R.drawable.ic_placeholder_icon)
+                        // [OPT] 核心优化1: 降低分辨率
+                        // 请求一个144x144像素的图片。Coil会在解码时直接创建这个尺寸的Bitmap。
+                        // 这会极大地降低内存占用。
+                        .size(Size(23, 23))
+                        // [OPT] 核心优化2: 降低颜色质量
+                        // 允许Coil在图片没有Alpha通道时使用RGB_565格式，内存占用减半。
+                        .allowRgb565(true)
+                        .crossfade(true)
+                        .build()
                 ),
                 contentDescription = app.appName,
-                modifier = Modifier.size(48.dp)
+                modifier = Modifier.size(48.dp) // UI显示尺寸保持不变
             )
-            
+
             Column(
                 modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -270,7 +277,7 @@ fun AppRuntimeCard(app: UiAppRuntime) {
                     Spacer(Modifier.weight(1f))
                     AppStatusIcons(state = state)
                 }
-                
+
                 val resourceText = buildAnnotatedString {
                     append("MEM: ${formatMemory(state.memUsageKb)}")
                     if (state.swapUsageKb > 1024) {
@@ -305,7 +312,6 @@ fun AppStatusIcons(state: AppRuntimeState) {
         if (state.isForeground) Text("▶️", iconModifier)
         if (state.isWhitelisted) Text("🛡️", iconModifier)
 
-        // [FIX] Removed hasPlayback etc. as they are no longer in the model
         if (state.displayStatus.uppercase() == "FROZEN") {
             Text("❄️", iconModifier)
         }
@@ -348,8 +354,7 @@ private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
 
 private fun formatStatus(state: AppRuntimeState): String {
     val status = state.displayStatus.uppercase()
-    
-    // [修复] 新的状态处理
+
     return when {
         status.startsWith("PENDING_FREEZE") -> {
             val time = status.substringAfter("(").substringBefore("s")

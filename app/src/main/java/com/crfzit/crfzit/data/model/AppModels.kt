@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
 package com.crfzit.crfzit.data.model
 
+import android.content.pm.ApplicationInfo
 import android.graphics.drawable.Drawable
 
 enum class Policy(val value: Int) {
@@ -17,10 +18,12 @@ enum class Policy(val value: Int) {
 data class AppInfo(
     val packageName: String,
     val appName: String,
-    val icon: Drawable?,
+    // [MEM_OPT] 不再直接持有Drawable对象，这是内存优化的核心。
+    // 我们持有轻量级的ApplicationInfo，让Coil按需加载图标。
+    val applicationInfo: ApplicationInfo?,
     val isSystemApp: Boolean,
     val userId: Int = 0,
-    
+
     var policy: Policy = Policy.EXEMPTED,
     var forcePlaybackExemption: Boolean = false,
     var forceNetworkExemption: Boolean = false
@@ -31,7 +34,7 @@ enum class LogLevel {
     SUCCESS,
     WARNING,
     ERROR,
-    EVENT 
+    EVENT
 }
 
 data class LogEntry(

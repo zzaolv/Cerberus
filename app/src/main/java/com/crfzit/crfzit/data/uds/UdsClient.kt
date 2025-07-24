@@ -16,7 +16,7 @@ class UdsClient(private val scope: CoroutineScope) {
     private var socket: LocalSocket? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
-    private val _incomingMessages = MutableSharedFlow<String>(replay = 10, extraBufferCapacity = 64) // 增加缓冲区
+    private val _incomingMessages = MutableSharedFlow<String>(replay = 3, extraBufferCapacity = 64) // 增加缓冲区
     val incomingMessages = _incomingMessages.asSharedFlow()
 
     companion object {

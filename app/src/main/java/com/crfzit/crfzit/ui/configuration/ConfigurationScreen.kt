@@ -20,12 +20,12 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import coil.size.Size
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.AppPolicyPayload
 
-// [修复] 将此枚举移至此文件，以解决之前因文件内容错误导致的引用失败
 enum class Policy(val value: Int, val displayName: String) {
     EXEMPTED(0, "豁免"),
     STANDARD(2, "智能"),
@@ -44,7 +44,6 @@ fun ConfigurationScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
 
-    // 筛选和排序逻辑现在从ViewModel中获取，保持UI的整洁
     val filteredApps = remember(uiState.searchQuery, uiState.showSystemApps, uiState.policies) {
         viewModel.getFilteredAndSortedApps()
     }
@@ -87,7 +86,6 @@ fun ConfigurationScreen(
                 ) {
                     items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
                         val key = AppInstanceKey(appInfo.packageName, appInfo.userId)
-                        // 从state中获取最新的策略，如果不存在则使用默认值
                         val policyPayload = uiState.policies[key]
                             ?: AppPolicyPayload(appInfo.packageName, appInfo.userId, Policy.EXEMPTED.value)
 
@@ -112,7 +110,6 @@ fun AppPolicyItem(
     onPolicyChange: (Policy) -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
-    // 豁免的应用半透明显示，以示区别
     val itemAlpha = if (policy == Policy.EXEMPTED) 0.7f else 1.0f
 
     Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
@@ -125,13 +122,19 @@ fun AppPolicyItem(
             Image(
                 painter = rememberAsyncImagePainter(
                     ImageRequest.Builder(LocalContext.current)
-                        .data(appInfo.icon)
-                        .placeholder(R.drawable.ic_launcher_foreground)
-                        .error(R.drawable.ic_launcher_foreground)
-                        .crossfade(true).build()
+                        .data(appInfo.applicationInfo)
+                        // [OPT] 使用我们创建的轻量级矢量占位图
+                        .placeholder(R.drawable.ic_placeholder_icon)
+                        .error(R.drawable.ic_placeholder_icon)
+                        // [OPT] 核心优化1: 降低分辨率 (配置页图标稍小，用128x128)
+                        .size(Size(23, 23))
+                        // [OPT] 核心优化2: 降低颜色质量
+                        .allowRgb565(true)
+                        .crossfade(true)
+                        .build()
                 ),
                 contentDescription = appInfo.appName,
-                modifier = Modifier.size(40.dp)
+                modifier = Modifier.size(40.dp) // UI显示尺寸保持不变
             )
             Column(Modifier.weight(1f).padding(start = 16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -161,7 +164,6 @@ fun AppPolicyItem(
                     expanded = showMenu,
                     onDismissRequest = { showMenu = false }
                 ) {
-                    // 只提供用户可选的策略
                     listOf(Policy.EXEMPTED, Policy.STANDARD, Policy.STRICT).forEach { p ->
                         DropdownMenuItem(
                             text = {

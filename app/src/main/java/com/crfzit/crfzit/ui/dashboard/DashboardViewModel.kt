@@ -2,7 +2,7 @@
 package com.crfzit.crfzit.ui.dashboard
 
 import android.app.Application
-import android.graphics.drawable.Drawable
+import android.content.pm.ApplicationInfo
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppRuntimeState
@@ -14,10 +14,11 @@ import com.crfzit.crfzit.data.system.NetworkSpeed
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
+// [MEM_OPT] UiAppRuntime现在持有ApplicationInfo而不是Drawable
 data class UiAppRuntime(
     val runtimeState: AppRuntimeState,
     val appName: String,
-    val icon: Drawable?,
+    val applicationInfo: ApplicationInfo?, // 修改点
     val isSystem: Boolean,
     val userId: Int
 )
@@ -42,8 +43,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            // Pre-warm the app info cache
-            appInfoRepository.getAllApps(forceRefresh = true)
+            // [MEM_OPT] 灾难性的 getAllApps 调用已被彻底移除！
+            // 不再需要预热缓存，因为这会导致一次性加载所有应用图标。
+            // appInfoRepository.getAllApps(forceRefresh = true)
 
             // Combine the three streams: daemon data, network speed, and UI settings
             combine(
@@ -51,18 +53,19 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, showSystem ->
-                
+
                 // Map daemon data to UI data
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .mapNotNull { runtimeState ->
-                        // Use the repository to get app metadata (icon, name)
+                        // 按需从仓库获取应用的元数据
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
                         // Only display if we can get metadata for it
                         appInfo?.let {
                             UiAppRuntime(
                                 runtimeState = runtimeState,
                                 appName = it.appName,
-                                icon = it.icon,
+                                // [MEM_OPT] 传递ApplicationInfo给UI层
+                                applicationInfo = it.applicationInfo,
                                 isSystem = it.isSystemApp,
                                 userId = runtimeState.userId
                             )

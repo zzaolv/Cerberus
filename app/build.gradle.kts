@@ -19,11 +19,16 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        // [FINAL_FIX] ndk块的正确位置和语法
+        // abiFilters应该在defaultConfig.ndk块中定义。
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+        }
     }
 
     buildTypes {
         release {
-            // [核心优化] 开启代码混淆和资源压缩，减小最终APK体积
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -65,7 +70,14 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    // [FINAL_FIX] 使用最新的API来过滤语言资源
+    // 这是AGP 8.0+ 推荐的做法，替代了已废弃的 resConfigs。
+    androidResources {
+        localeFilters.addAll(listOf("en", "zh-rCN", "zh"))
+    }
 }
+
 
 dependencies {
     implementation(libs.accompanist.swiperefresh)

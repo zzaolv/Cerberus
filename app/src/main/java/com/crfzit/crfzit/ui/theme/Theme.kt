@@ -1,4 +1,4 @@
-// app/src/main/java/com/crfzit/crfzit/ui/theme
+// app/src/main/java/com/crfzit/crfzit/ui/theme/Theme.kt
 package com.crfzit.crfzit.ui.theme
 
 import android.app.Activity
@@ -11,7 +11,6 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -47,13 +46,10 @@ fun CRFzitTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            // 【全面屏适配】将状态栏设置为透明，让Scaffold来控制颜色
-            window.statusBarColor = Color.Transparent.toArgb()
-            // 【全面屏适配】设置导航栏颜色为透明，并确保内容和导航栏图标颜色对比度
-            window.navigationBarColor = Color.Transparent.toArgb()
-            // 设置状态栏图标颜色
+            // [FIX] 使用 `enableEdgeToEdge` 后，不再需要手动设置状态栏颜色为透明。
+            // `enableEdgeToEdge` 会处理好系统栏颜色和内容绘制区域。
+            // 这里我们只需要根据主题设置系统图标的颜色（亮色/暗色）。
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
-            // 设置导航栏图标颜色
             WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = !darkTheme
         }
     }

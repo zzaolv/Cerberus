@@ -12,9 +12,10 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * [核心修复] 此仓库的职责被重新定义。
- * 它不再是所有应用列表的来源，而是一个按需提供应用元数据（如名称、图标）的工具。
- * 尤其重要的是，它只查询当前用户（通常是User 0）的应用信息。
+ * [MEM_OPT] 仓库的重大重构。
+ * 1. 它不再预加载所有应用信息。getAllApps被移除。
+ * 2. 缓存中的AppInfo对象不再持有Drawable，而是持有ApplicationInfo。
+ * 3. 它的唯一职责是：根据包名，按需提供应用的元数据。
  */
 class AppInfoRepository private constructor(private val context: Context) {
 
@@ -23,17 +24,16 @@ class AppInfoRepository private constructor(private val context: Context) {
     private val appInfoCache: ConcurrentHashMap<String, AppInfo> = ConcurrentHashMap()
     private val cacheMutex = Mutex()
 
-    suspend fun getAllApps(forceRefresh: Boolean = false): List<AppInfo> {
-        cacheMutex.withLock {
-            if (appInfoCache.isNotEmpty() && !forceRefresh) {
-                return appInfoCache.values.toList()
-            }
-            loadAllInstalledApps()
-            return appInfoCache.values.toList()
-        }
-    }
+    /**
+     * [MEM_OPT] 移除了 getAllApps 方法。
+     * ViewModel不应该再要求一次性获取所有应用信息。
+     */
+    // suspend fun getAllApps(...) { ... }
 
-    // [核心修复] getAppInfo不再需要userId。它只为给定的包名查找主用户的应用信息。
+    /**
+     * [MEM_OPT] 这是现在获取应用信息的唯一入口。
+     * 它会按需加载并缓存AppInfo（不含Drawable）。
+     */
     suspend fun getAppInfo(packageName: String): AppInfo? {
         appInfoCache[packageName]?.let { return it }
 
@@ -44,24 +44,6 @@ class AppInfoRepository private constructor(private val context: Context) {
             val app = loadSingleApp(packageName)
             app?.let { appInfoCache[packageName] = it }
             app
-        }
-    }
-
-    private suspend fun loadAllInstalledApps() {
-        withContext(Dispatchers.IO) {
-            appInfoCache.clear()
-            // [核心修复] 只获取当前用户(user 0)的应用列表作为基础元数据
-            val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-                .filterNotNull()
-                .mapNotNull { appInfo ->
-                    try {
-                        createAppInfoFrom(appInfo)
-                    } catch (e: Exception) {
-                        null
-                    }
-                }
-
-            appInfoCache.putAll(apps.associateBy { it.packageName })
         }
     }
 
@@ -79,7 +61,8 @@ class AppInfoRepository private constructor(private val context: Context) {
         return AppInfo(
             packageName = appInfo.packageName,
             appName = appInfo.loadLabel(packageManager).toString(),
-            icon = appInfo.loadIcon(packageManager),
+            // [MEM_OPT] 将重量级的Drawable替换为轻量级的ApplicationInfo对象
+            applicationInfo = appInfo,
             isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
             userId = 0 // 这个仓库获取的都是主用户空间的应用，因此userId固定为0
         )

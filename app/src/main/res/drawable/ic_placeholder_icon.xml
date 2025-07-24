@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 
+      [FIX] 修复 resource attr/colorControlNormal not found 错误
+      将 tint 的值从主题属性引用 "?attr/colorControlNormal" 
+      修改为一个具体的、与主题无关的颜色值。
+      #FF8A8A8A 是一个中性灰色，在亮色和暗色主题下都能看得清。
+    -->
+    <path
+        android:fillColor="#FF8A8A8A"
+        android:pathData="M19,5v14H5V5h14m0,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2V5c0,-1.1 -0.9,-2 -2,-2z"/>
+</vector>
