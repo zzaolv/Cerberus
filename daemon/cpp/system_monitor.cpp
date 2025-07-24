@@ -22,24 +22,13 @@
 #include <string>
 #include <memory>
 
-#define LOG_TAG "cerberusd_monitor_v15_final" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v16_smart"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
-
-// ... (从文件顶部到 network_snapshot_thread_func 之前的代码保持不变) ...
-
-int get_uid_from_pid(int pid) {
-    char path_buffer[64];
-    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
-    struct stat st;
-    if (stat(path_buffer, &st) != 0) return -1;
-    return st.st_uid;
-}
-
 
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
@@ -54,6 +43,7 @@ SystemMonitor::SystemMonitor() {
 
 SystemMonitor::~SystemMonitor() {
     stop_top_app_monitor();
+    stop_network_snapshot_thread();
 }
 
 void SystemMonitor::start_top_app_monitor() {
@@ -104,6 +94,7 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+// [OPT_FIX] 变为私有方法，按需调用
 void SystemMonitor::update_audio_state() {
     std::set<int> focus_uids;
     std::set<int> started_player_uids;
@@ -169,14 +160,15 @@ void SystemMonitor::update_audio_state() {
         if (uids_playing_audio_ != active_uids) {
             std::stringstream ss;
             for(int uid : active_uids) { ss << uid << " "; }
-            LOGI("Audio active UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
-                 uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
+            LOGI("Audio active UIDs changed. New UIDs: [ %s]", ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
     }
 }
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
+    // [OPT_FIX] 调用前先更新状态
+    update_audio_state();
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
     return uids_playing_audio_.count(uid) > 0;
 }
@@ -200,7 +192,6 @@ void SystemMonitor::stop_network_snapshot_thread() {
     }
 }
 
-// --- 核心修复：网速缓存逻辑 ---
 void SystemMonitor::network_snapshot_thread_func() {
     while (network_monitoring_active_) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -223,17 +214,12 @@ void SystemMonitor::network_snapshot_thread_func() {
         {
             std::lock_guard<std::mutex> lock(speed_mutex_);
             
-            // 步骤1：遍历当前缓存的所有UID，将它们的速率乘以一个衰减因子
-            const double DECAY_FACTOR = 0.5; // 每次迭代，旧速率衰减为原来的一半
-            for (auto& [uid, speed] : uid_network_speed_) {
-                speed.download_kbps *= DECAY_FACTOR;
-                speed.upload_kbps *= DECAY_FACTOR;
-                // 如果速率非常小，直接清零
-                if (speed.download_kbps < 0.1) speed.download_kbps = 0.0;
-                if (speed.upload_kbps < 0.1) speed.upload_kbps = 0.0;
+            // [OPT_FIX] 衰减所有现有条目
+            for (auto& [uid, info] : uid_network_speed_cache_) {
+                info.speed.download_kbps *= 0.5;
+                info.speed.upload_kbps *= 0.5;
             }
 
-            // 步骤2：计算新的速率，并【覆盖或添加】到缓存中
             for (const auto& [uid, current_stats] : current_snapshot) {
                 auto last_it = last_snapshot.find(uid);
                 if (last_it != last_snapshot.end()) {
@@ -241,15 +227,31 @@ void SystemMonitor::network_snapshot_thread_func() {
                     long long tx_delta = (current_stats.tx_bytes > last_it->second.tx_bytes) ? (current_stats.tx_bytes - last_it->second.tx_bytes) : 0;
                     
                     if (rx_delta > 0 || tx_delta > 0) {
-                        // 只有在有新流量时，才计算并覆盖速率
-                        uid_network_speed_[uid] = {
-                            .download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec,
-                            .upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec
+                        uid_network_speed_cache_[uid] = {
+                            .speed = {
+                                .download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec,
+                                .upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec
+                            },
+                            .last_active = current_time
                         };
                     }
                 }
             }
-             LOGD("Network speed cache updated. Total tracked UIDs: %zu", uid_network_speed_.size());
+
+            // [OPT_FIX] 修剪不活跃的缓存条目
+            const auto prune_threshold = std::chrono::minutes(5);
+            std::vector<int> uids_to_prune;
+            for (const auto& [uid, info] : uid_network_speed_cache_) {
+                if (current_time - info.last_active > prune_threshold) {
+                    uids_to_prune.push_back(uid);
+                }
+            }
+            if (!uids_to_prune.empty()) {
+                LOGD("Pruning %zu inactive UIDs from network speed cache.", uids_to_prune.size());
+                for (int uid : uids_to_prune) {
+                    uid_network_speed_cache_.erase(uid);
+                }
+            }
         }
 
         {
@@ -264,9 +266,9 @@ void SystemMonitor::network_snapshot_thread_func() {
 
 NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     std::lock_guard<std::mutex> lock(speed_mutex_);
-    auto it = uid_network_speed_.find(uid);
-    if (it != uid_network_speed_.end()) {
-        return it->second;
+    auto it = uid_network_speed_cache_.find(uid);
+    if (it != uid_network_speed_cache_.end()) {
+        return it->second.speed;
     }
     return NetworkSpeed();
 }
@@ -394,6 +396,7 @@ std::string SystemMonitor::get_current_ime_package() {
     return current_ime_package_;
 }
 
+// [OPT_FIX] 变为私有方法，按需调用
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
     std::array<char, 2048> buffer;
@@ -452,7 +455,7 @@ void SystemMonitor::update_location_state() {
         if (uids_using_location_ != active_uids) {
             std::stringstream ss;
             for(int uid : active_uids) { ss << uid << " "; }
-            LOGI("Active location UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_using_location_.size(), active_uids.size(), ss.str().c_str());
+            LOGI("Active location UIDs changed. New UIDs: [ %s]", ss.str().c_str());
             uids_using_location_ = active_uids;
         }
     }
@@ -460,9 +463,12 @@ void SystemMonitor::update_location_state() {
 
 
 bool SystemMonitor::is_uid_using_location(int uid) {
+    // [OPT_FIX] 调用前先更新状态
+    update_location_state();
     std::lock_guard<std::mutex> lock(location_uids_mutex_);
     return uids_using_location_.count(uid) > 0;
 }
+
 
 void SystemMonitor::update_global_stats() {
     update_cpu_usage();

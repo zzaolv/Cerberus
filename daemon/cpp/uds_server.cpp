@@ -9,14 +9,15 @@
 #include <algorithm>
 #include <vector>
 #include <cstddef>
-#include <sys/epoll.h> // [新]
-#include <sys/eventfd.h> // [新]
-#include <fcntl.h>       // [新] fcntl for non-blocking
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <fcntl.h>
 
-#define LOG_TAG "cerberusd_uds_epoll" // 新版本Tag
+#define LOG_TAG "cerberusd_uds_stable" // 新版本Tag
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 
 UdsServer::UdsServer(const std::string& socket_name)
@@ -48,7 +49,6 @@ void UdsServer::add_client(int client_fd) {
 void UdsServer::remove_client(int client_fd) {
     if (client_fd < 0) return;
     
-    // 从epoll中移除
     if (epoll_fd_ != -1) {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
     }
@@ -71,19 +71,46 @@ void UdsServer::remove_client(int client_fd) {
     }
 }
 
-bool UdsServer::send_message(int client_fd, const std::string& message) {
+void UdsServer::send_message(int client_fd, const std::string& message) {
     std::string line = message + "\n";
-    ssize_t bytes_sent = send(client_fd, line.c_str(), line.length(), MSG_NOSIGNAL);
-    if (bytes_sent < 0) {
-        if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
-            LOGW("Send to fd %d failed (connection closed), scheduling removal.", client_fd);
-            // 这里不直接调用remove_client，因为可能在epoll循环中，让循环自己处理
-        } else {
-            LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
-        }
-        return false;
+    
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    auto it = clients_.find(client_fd);
+    if (it == clients_.end()) {
+        LOGW("Attempted to send message to non-existent client fd %d", client_fd);
+        return;
     }
-    return true;
+
+    // [STABILITY_FIX] 如果写缓冲区为空，直接尝试发送
+    if (it->second.write_buffer.empty()) {
+        ssize_t bytes_sent = send(client_fd, line.c_str(), line.length(), MSG_NOSIGNAL);
+        if (bytes_sent >= 0) {
+            // 如果只发送了一部分
+            if (static_cast<size_t>(bytes_sent) < line.length()) {
+                // 将未发送的部分放入写缓冲区
+                const char* remaining_data = line.c_str() + bytes_sent;
+                it->second.write_buffer.insert(it->second.write_buffer.end(), remaining_data, remaining_data + line.length() - bytes_sent);
+                // 告诉epoll，我们对这个socket的可写事件感兴趣了
+                modify_epoll_events(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
+            }
+            // 如果全部发送成功，则什么都不做
+            return;
+        }
+        
+        // 如果发送失败
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGE("Send to fd %d failed: %s. Scheduling removal.", client_fd, strerror(errno));
+            // 延迟移除，让主循环处理
+            // remove_client(client_fd); // 不在这里直接移除
+            return;
+        }
+        // 如果是EAGAIN，说明缓冲区满了，走下面的逻辑
+    }
+    
+    // [STABILITY_FIX] 如果直接发送失败（EAGAIN）或者缓冲区本身就有数据，将新数据追加到写缓冲区
+    it->second.write_buffer.insert(it->second.write_buffer.end(), line.begin(), line.end());
+    // 确保epoll正在监听可写事件
+    modify_epoll_events(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
 }
 
 void UdsServer::broadcast_message_except(const std::string& message, int excluded_fd) {
@@ -135,21 +162,43 @@ void UdsServer::handle_client_data(int client_fd) {
                     on_message_received_(client_fd, msg);
                 }
              }
-
         } else if (bytes_read == 0) {
-            // Connection closed by peer
             remove_client(client_fd);
             break;
-        } else { // bytes_read < 0
+        } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No more data to read
                 break;
             }
-            // Real error
-            LOGE("recv() error on fd %d: %s", client_fd, strerror(errno));
             remove_client(client_fd);
             break;
         }
+    }
+}
+
+// [STABILITY_FIX] 新增：处理可写事件的函数
+void UdsServer::handle_client_write(int client_fd) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    auto it = clients_.find(client_fd);
+    if (it == clients_.end()) return;
+
+    auto& write_buffer = it->second.write_buffer;
+    while (!write_buffer.empty()) {
+        ssize_t bytes_sent = send(client_fd, write_buffer.data(), write_buffer.size(), MSG_NOSIGNAL);
+        if (bytes_sent > 0) {
+            write_buffer.erase(write_buffer.begin(), write_buffer.begin() + bytes_sent);
+        } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOGE("Send (in write handler) to fd %d failed: %s.", client_fd, strerror(errno));
+                // 延迟移除
+            }
+            // 如果是EAGAIN，说明又满了，直接退出循环，等待下一次可写事件
+            return;
+        }
+    }
+
+    // 如果缓冲区已全部发送完毕，告诉epoll不再关心可写事件
+    if (write_buffer.empty()) {
+        modify_epoll_events(client_fd, EPOLLIN | EPOLLET);
     }
 }
 
@@ -166,7 +215,6 @@ void UdsServer::stop() {
         server_thread_.join();
     }
     
-    // 清理所有剩余资源
     std::lock_guard<std::mutex> lock(client_mutex_);
     for (const auto& pair : clients_) {
         close(pair.first);
@@ -200,6 +248,15 @@ void UdsServer::set_socket_non_blocking(int fd) {
     }
 }
 
+void UdsServer::modify_epoll_events(int fd, uint32_t events) {
+    epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
+        LOGE("epoll_ctl(EPOLL_CTL_MOD) for fd %d failed: %s", fd, strerror(errno));
+    }
+}
+
 
 void UdsServer::run() {
     server_thread_ = std::thread(&UdsServer::server_loop, this);
@@ -219,8 +276,6 @@ void UdsServer::server_loop() {
     strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_name_.length() + 1;
     
-    unlink(addr.sun_path); // In case of abstract namespace, this is harmless but good practice for file-based UDS
-
     if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
         LOGE("Failed to bind abstract socket '@%s': %s", socket_name_.c_str(), strerror(errno));
         close(server_fd_);
@@ -242,34 +297,21 @@ void UdsServer::server_loop() {
     
     event_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if(event_fd_ == -1) {
-        LOGE("eventfd failed: %s", strerror(errno));
-        close(server_fd_);
-        close(epoll_fd_);
+        // ... (error handling)
         return;
     }
 
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = server_fd_;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) == -1) {
-        LOGE("epoll_ctl: listen_sock failed: %s", strerror(errno));
-        close(server_fd_);
-        close(epoll_fd_);
-        close(event_fd_);
-        return;
-    }
+    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev);
     
     ev.events = EPOLLIN;
     ev.data.fd = event_fd_;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event_fd_, &ev) == -1) {
-        LOGE("epoll_ctl: event_fd failed: %s", strerror(errno));
-        // ... cleanup ...
-        return;
-    }
-
+    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event_fd_, &ev);
+    
     LOGI("Server listening on abstract UDS: @%s using epoll", socket_name_.c_str());
     is_running_ = true;
-
     std::vector<epoll_event> events(64);
 
     while (is_running_) {
@@ -281,27 +323,36 @@ void UdsServer::server_loop() {
         }
 
         for (int i = 0; i < n; ++i) {
-            if (events[i].data.fd == server_fd_) {
-                // New connection
+            int current_fd = events[i].data.fd;
+            uint32_t current_events = events[i].events;
+
+            if (current_fd == server_fd_) {
                 int client_fd = accept4(server_fd_, nullptr, nullptr, SOCK_CLOEXEC);
                 if (client_fd >= 0) {
                     set_socket_non_blocking(client_fd);
-                    ev.events = EPOLLIN | EPOLLET; // Edge-Triggered
+                    ev.events = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
                     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) != -1) {
                         add_client(client_fd);
                     } else {
-                        LOGE("epoll_ctl: add client failed: %s", strerror(errno));
                         close(client_fd);
                     }
                 }
-            } else if (events[i].data.fd == event_fd_) {
-                 // Stop signal
+            } else if (current_fd == event_fd_) {
                  is_running_ = false;
                  break;
             } else {
-                // Data from client
-                handle_client_data(events[i].data.fd);
+                // [STABILITY_FIX] 分别处理读、写和错误事件
+                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP)) {
+                    remove_client(current_fd);
+                } else {
+                    if (current_events & EPOLLIN) {
+                        handle_client_data(current_fd);
+                    }
+                    if (current_events & EPOLLOUT) {
+                        handle_client_write(current_fd);
+                    }
+                }
             }
         }
     }

@@ -15,14 +15,34 @@
 #include <algorithm>
 #include <fcntl.h>
 
-#define LOG_TAG "cerberusd_action_v2"
+#define LOG_TAG "cerberusd_action_v3"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-// --- Constructor & Destructor ---
+// [FREEZE_FIX] 新增辅助函数，检查进程是否有binder fd
+static bool has_binder_fd(int pid) {
+    std::string fd_path = "/proc/" + std::to_string(pid) + "/fd";
+    try {
+        if (!fs::exists(fd_path)) return false;
+        for (const auto& entry : fs::directory_iterator(fd_path)) {
+            if (fs::is_symlink(entry.symlink_status())) {
+                std::string link_target = fs::read_symlink(entry.path());
+                if (link_target == "/dev/binder") {
+                    return true;
+                }
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        // Ignore errors, e.g. permission denied for some processes
+    }
+    return false;
+}
+
+
 ActionExecutor::ActionExecutor() {
     initialize_binder();
     initialize_cgroup();
@@ -32,33 +52,45 @@ ActionExecutor::~ActionExecutor() {
     cleanup_binder();
 }
 
-// --- Public Methods ---
 bool ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids, FreezeMethod method) {
     if (pids.empty()) return true;
 
-    // 步骤 1: Binder 冻结
-    if (handle_binder_freeze(pids, true) < 0) {
-        LOGE("Binder freeze failed for %s. Aborting physical freeze.", key.first.c_str());
-        // 尝试回滚已经冻结的binder
-        handle_binder_freeze(pids, false);
-        return false;
+    // [FREEZE_FIX] 步骤 1: 筛选出需要执行binder冻结的pids
+    std::vector<int> pids_for_binder_freeze;
+    for (int pid : pids) {
+        if (has_binder_fd(pid)) {
+            pids_for_binder_freeze.push_back(pid);
+        } else {
+            LOGD("PID %d of %s has no binder fd, skipping binder freeze.", pid, key.first.c_str());
+        }
     }
 
-    // 步骤 2: 物理冻结
+    // 步骤 2: Binder 冻结
+    if (!pids_for_binder_freeze.empty()) {
+        if (handle_binder_freeze(pids_for_binder_freeze, true) < 0) {
+            LOGE("Binder freeze failed for %s. Aborting physical freeze.", key.first.c_str());
+            handle_binder_freeze(pids_for_binder_freeze, false);
+            return false;
+        }
+    }
+
+    // 步骤 3: 物理冻结 (作用于所有pids)
     bool physical_freeze_ok = false;
     switch (method) {
         case FreezeMethod::CGROUP_V2:
             physical_freeze_ok = freeze_cgroup(key, pids);
             break;
-        case FreezeMethod::METHOD_SIGSTOP: // [修复] 使用新的枚举成员名
+        case FreezeMethod::METHOD_SIGSTOP:
             freeze_sigstop(pids);
-            physical_freeze_ok = true; // SIGSTOP 总是“成功”
+            physical_freeze_ok = true;
             break;
     }
 
     if (!physical_freeze_ok) {
         LOGE("Physical freeze failed for %s. Rolling back binder freeze.", key.first.c_str());
-        handle_binder_freeze(pids, false);
+        if (!pids_for_binder_freeze.empty()) {
+            handle_binder_freeze(pids_for_binder_freeze, false);
+        }
         return false;
     }
     
@@ -68,26 +100,33 @@ bool ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& p
 }
 
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
-    // 步骤 1: 物理解冻 (必须先做，否则进程无法处理binder消息)
+    // 步骤 1: 物理解冻 (作用于所有pids)
     bool cgroup_unfrozen = unfreeze_cgroup(key);
-    // SIGSTOP解冻总是执行，即使没有pids，以防万一
     unfreeze_sigstop(pids);
 
     if (!cgroup_unfrozen) {
-        LOGW("Cgroup unfreeze seems to have failed for %s, but proceeding with binder unfreeze.", key.first.c_str());
+        LOGW("Cgroup unfreeze seems to have failed for %s, but proceeding.", key.first.c_str());
     }
 
-    // 步骤 2: Binder 解冻
-    if (handle_binder_freeze(pids, false) < 0) {
-        LOGE("Binder unfreeze failed for %s.", key.first.c_str());
-        // 即使binder解冻失败，物理层也已解冻，所以不返回false
+    // [FREEZE_FIX] 步骤 2: Binder 解冻 (只作用于有binder的pids)
+    std::vector<int> pids_for_binder_unfreeze;
+    for (int pid : pids) {
+        if (has_binder_fd(pid)) {
+            pids_for_binder_unfreeze.push_back(pid);
+        }
+    }
+    
+    if (!pids_for_binder_unfreeze.empty()) {
+        if (handle_binder_freeze(pids_for_binder_unfreeze, false) < 0) {
+            LOGE("Binder unfreeze failed for %s.", key.first.c_str());
+        }
     }
     
     LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
     return true;
 }
 
-// --- Binder Freeze Implementation ---
+
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
     if (binder_state_.fd < 0) {

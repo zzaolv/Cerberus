@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v16_final" // 版本号更新
+#define LOG_TAG "cerberusd_state_v17_smart"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -47,7 +47,7 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
 }
 
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act)
-    : db_manager_(db), sys_monitor_(sys), action_executor_(act), unfrozen_timeline_(43200, 0) { // 12 hours * 3600s/hr
+    : db_manager_(db), sys_monitor_(sys), action_executor_(act), unfrozen_timeline_(43200, 0) {
     LOGI("StateManager Initializing...");
     
     master_config_ = db_manager_->get_master_config().value_or(MasterConfig{});
@@ -405,11 +405,81 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+   
     load_all_configs();
     reconcile_process_state_full();
     LOGI("StateManager Initialized.");
 }
 
+// [OPT_FIX] check_timers 现在是智能轮询的核心
+bool StateManager::check_timers() {
+    bool changed = false;
+    time_t now = time(nullptr);
+    const double NETWORK_THRESHOLD_KBPS = 100.0;
+
+    for (auto& [key, app] : managed_apps_) {
+        if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
+            if (app.observation_since > 0 || app.background_since > 0) {
+                app.observation_since = 0;
+                app.background_since = 0;
+                changed = true;
+            }
+            continue;
+        }
+        
+        if (app.observation_since > 0 && now - app.observation_since >= 10) {
+            LOGD("TICK: Observation for %s ended. Checking exemption conditions...", app.package_name.c_str());
+            app.observation_since = 0;
+            changed = true; // 状态即将改变，标记为true
+
+            // [OPT_FIX] 按需检查音频
+            if (sys_monitor_->is_uid_playing_audio(app.uid)) {
+                LOGI("TICK: %s is playing audio, extending observation.", app.package_name.c_str());
+                app.observation_since = now;
+                continue;
+            }
+
+            // [OPT_FIX] 按需检查定位
+            if (sys_monitor_->is_uid_using_location(app.uid)) {
+                LOGI("TICK: %s is using location, extending observation.", app.package_name.c_str());
+                app.observation_since = now;
+                continue;
+            }
+
+            NetworkSpeed speed = sys_monitor_->get_cached_network_speed(app.uid);
+            if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
+                LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), extending observation.",
+                     app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
+                app.observation_since = now;
+                continue;
+            }
+            
+            LOGI("TICK: %s is silent and inactive, starting freeze timer.", app.package_name.c_str());
+            app.background_since = now;
+        }
+        
+        if (app.background_since > 0) {
+            int timeout_sec = 0;
+            if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
+            else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
+
+            if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
+                LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
+                if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
+                    app.current_status = AppRuntimeState::Status::FROZEN;
+                    schedule_timed_unfreeze(app);
+                    notify_probe_of_config_change();
+                }
+                app.background_since = 0;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+
+// ... 其他所有函数粘贴在这里，它们不需要改动 ...
 void StateManager::on_wakeup_request(const json& payload) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
@@ -603,74 +673,6 @@ bool StateManager::tick_state_machine() {
 
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
-}
-
-bool StateManager::check_timers() {
-    bool changed = false;
-    time_t now = time(nullptr);
-    const double NETWORK_THRESHOLD_KBPS = 100.0;
-
-    for (auto& [key, app] : managed_apps_) {
-        if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
-            if (app.observation_since > 0 || app.background_since > 0) {
-                app.observation_since = 0;
-                app.background_since = 0;
-                changed = true;
-            }
-            continue;
-        }
-
-        if (app.observation_since > 0 && now - app.observation_since >= 10) {
-            LOGD("TICK: Observation for %s ended. Checking all exemption conditions...", app.package_name.c_str());
-            app.observation_since = 0;
-
-            sys_monitor_->update_audio_state();
-            if (is_app_playing_audio(app)) {
-                LOGI("TICK: %s is playing audio, deferring freeze.", app.package_name.c_str());
-                app.observation_since = now;
-                changed = true;
-                continue;
-            }
-
-            if (sys_monitor_->is_uid_using_location(app.uid)) {
-                LOGI("TICK: %s is using location, deferring freeze.", app.package_name.c_str());
-                app.observation_since = now;
-                changed = true;
-                continue;
-            }
-
-            NetworkSpeed speed = sys_monitor_->get_cached_network_speed(app.uid);
-            if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
-                LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), deferring freeze.",
-                     app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
-                app.observation_since = now;
-                changed = true;
-                continue;
-            }
-
-            LOGI("TICK: %s is silent and inactive, starting freeze timer.", app.package_name.c_str());
-            app.background_since = now;
-            changed = true;
-        }
-        
-        if (app.background_since > 0) {
-            int timeout_sec = 0;
-            if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
-            else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
-
-            if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                LOGI("TICK: Timeout for %s. Freezing.", app.package_name.c_str());
-                if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
-                    app.current_status = AppRuntimeState::Status::FROZEN;
-                    schedule_timed_unfreeze(app);
-                    notify_probe_of_config_change();
-                }
-                app.background_since = 0;
-                changed = true;
-            }
-        }
-    }
-    return changed;
 }
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {

@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <chrono> // For time points
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -24,7 +25,6 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
-// [核心新增] 定义网速和流量统计的数据结构
 struct NetworkSpeed {
     double download_kbps = 0.0;
     double upload_kbps = 0.0;
@@ -35,6 +35,11 @@ struct TrafficStats {
     long long tx_bytes = 0;
 };
 
+// [OPT_FIX] 新增一个结构体，用于缓存网络速度和最后活动时间
+struct NetworkSpeedInfo {
+    NetworkSpeed speed;
+    std::chrono::steady_clock::time_point last_active;
+};
 
 extern std::atomic<int> g_top_app_refresh_tickets;
 
@@ -53,16 +58,12 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
     
-    void update_audio_state();
+    // [OPT_FIX] 这些接口保持不变，但它们的调用方式会改变
     bool is_uid_playing_audio(int uid);
-    
-    // [核心新增] 新增定位状态检测接口
-    void update_location_state();
     bool is_uid_using_location(int uid);
     
     std::string get_current_ime_package();
     
-    // [核心新增] 网速监控相关接口
     void start_network_snapshot_thread();
     void stop_network_snapshot_thread();
     NetworkSpeed get_cached_network_speed(int uid);
@@ -71,6 +72,10 @@ private:
     void update_cpu_usage();
     void update_mem_info();
     void top_app_monitor_thread();
+    
+    // [OPT_FIX] 内部实现现在会按需调用
+    void update_audio_state();
+    void update_location_state();
     
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
@@ -84,7 +89,6 @@ private:
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
-    std::set<int> last_known_top_pids_;
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};
     std::string top_app_tasks_path_;
@@ -92,7 +96,6 @@ private:
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
     
-    // [核心新增] 新增定位状态相关成员
     mutable std::mutex location_uids_mutex_;
     std::set<int> uids_using_location_;
     
@@ -100,20 +103,18 @@ private:
     std::string current_ime_package_;
     time_t last_ime_check_time_ = 0;
 
-    // [核心新增] 网速监控私有函数和成员
     void network_snapshot_thread_func();
     std::map<int, TrafficStats> read_current_traffic();
 
-    // [核心新增] 网速监控相关成员
     std::thread network_thread_;
     std::atomic<bool> network_monitoring_active_{false};
     mutable std::mutex traffic_mutex_;
     std::map<int, TrafficStats> last_traffic_snapshot_;
     std::chrono::steady_clock::time_point last_snapshot_time_;
-    // [核心修改] 新增一个map用于存储计算好的速率
+    
     mutable std::mutex speed_mutex_;
-    std::map<int, NetworkSpeed> uid_network_speed_;
-
+    // [OPT_FIX] 缓存现在存储NetworkSpeedInfo
+    std::map<int, NetworkSpeedInfo> uid_network_speed_cache_;
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H
