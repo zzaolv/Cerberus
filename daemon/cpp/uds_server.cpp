@@ -171,25 +171,20 @@ void UdsServer::handle_client_write(int client_fd) {
 
     auto& write_buffer = it->second.write_buffer;
     while (!write_buffer.empty()) {
-        // [COMPILE_FIX] 将deque的内容复制到临时的vector中以获得连续内存
         std::vector<char> temp_buffer(write_buffer.begin(), write_buffer.end());
         
         ssize_t bytes_sent = send(client_fd, temp_buffer.data(), temp_buffer.size(), MSG_NOSIGNAL);
         
         if (bytes_sent > 0) {
-            // 从deque的头部移除已发送的数据
             write_buffer.erase(write_buffer.begin(), write_buffer.begin() + bytes_sent);
         } else {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 LOGE("Send (in write handler) for fd %d failed: %s.", client_fd, strerror(errno));
-                // 延迟移除，让主循环的错误处理逻辑来执行
             }
-            // 如果是EAGAIN或EWOULDBLOCK，说明缓冲区又满了，直接返回，等待下一次可写事件
             return;
         }
     }
 
-    // 如果缓冲区已全部发送完毕，告诉epoll不再关心可写事件
     if (write_buffer.empty()) {
         modify_epoll_events(client_fd, EPOLLIN | EPOLLET);
     }
@@ -350,7 +345,8 @@ void UdsServer::server_loop() {
                  is_running_ = false;
                  break;
             } else {
-                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP) || !(current_events & (EPOLLIN | EPOLLOUT)))) {
+                // [COMPILE_FIX] 移除了多余的括号
+                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP) || !(current_events & (EPOLLIN | EPOLLOUT))) {
                     remove_client(current_fd);
                 } else {
                     if (current_events & EPOLLIN) {
