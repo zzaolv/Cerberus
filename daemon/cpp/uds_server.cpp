@@ -13,7 +13,7 @@
 #include <sys/eventfd.h>
 #include <fcntl.h>
 
-#define LOG_TAG "cerberusd_uds_stable" // 新版本Tag
+#define LOG_TAG "cerberusd_uds_stable"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -81,35 +81,24 @@ void UdsServer::send_message(int client_fd, const std::string& message) {
         return;
     }
 
-    // [STABILITY_FIX] 如果写缓冲区为空，直接尝试发送
     if (it->second.write_buffer.empty()) {
         ssize_t bytes_sent = send(client_fd, line.c_str(), line.length(), MSG_NOSIGNAL);
         if (bytes_sent >= 0) {
-            // 如果只发送了一部分
             if (static_cast<size_t>(bytes_sent) < line.length()) {
-                // 将未发送的部分放入写缓冲区
                 const char* remaining_data = line.c_str() + bytes_sent;
                 it->second.write_buffer.insert(it->second.write_buffer.end(), remaining_data, remaining_data + line.length() - bytes_sent);
-                // 告诉epoll，我们对这个socket的可写事件感兴趣了
                 modify_epoll_events(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
             }
-            // 如果全部发送成功，则什么都不做
             return;
         }
         
-        // 如果发送失败
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             LOGE("Send to fd %d failed: %s. Scheduling removal.", client_fd, strerror(errno));
-            // 延迟移除，让主循环处理
-            // remove_client(client_fd); // 不在这里直接移除
             return;
         }
-        // 如果是EAGAIN，说明缓冲区满了，走下面的逻辑
     }
     
-    // [STABILITY_FIX] 如果直接发送失败（EAGAIN）或者缓冲区本身就有数据，将新数据追加到写缓冲区
     it->second.write_buffer.insert(it->second.write_buffer.end(), line.begin(), line.end());
-    // 确保epoll正在监听可写事件
     modify_epoll_events(client_fd, EPOLLIN | EPOLLOUT | EPOLLET);
 }
 
@@ -175,7 +164,6 @@ void UdsServer::handle_client_data(int client_fd) {
     }
 }
 
-// [STABILITY_FIX] 新增：处理可写事件的函数
 void UdsServer::handle_client_write(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     auto it = clients_.find(client_fd);
@@ -183,15 +171,20 @@ void UdsServer::handle_client_write(int client_fd) {
 
     auto& write_buffer = it->second.write_buffer;
     while (!write_buffer.empty()) {
-        ssize_t bytes_sent = send(client_fd, write_buffer.data(), write_buffer.size(), MSG_NOSIGNAL);
+        // [COMPILE_FIX] 将deque的内容复制到临时的vector中以获得连续内存
+        std::vector<char> temp_buffer(write_buffer.begin(), write_buffer.end());
+        
+        ssize_t bytes_sent = send(client_fd, temp_buffer.data(), temp_buffer.size(), MSG_NOSIGNAL);
+        
         if (bytes_sent > 0) {
+            // 从deque的头部移除已发送的数据
             write_buffer.erase(write_buffer.begin(), write_buffer.begin() + bytes_sent);
         } else {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                LOGE("Send (in write handler) to fd %d failed: %s.", client_fd, strerror(errno));
-                // 延迟移除
+                LOGE("Send (in write handler) for fd %d failed: %s.", client_fd, strerror(errno));
+                // 延迟移除，让主循环的错误处理逻辑来执行
             }
-            // 如果是EAGAIN，说明又满了，直接退出循环，等待下一次可写事件
+            // 如果是EAGAIN或EWOULDBLOCK，说明缓冲区又满了，直接返回，等待下一次可写事件
             return;
         }
     }
@@ -297,19 +290,33 @@ void UdsServer::server_loop() {
     
     event_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if(event_fd_ == -1) {
-        // ... (error handling)
+        LOGE("eventfd failed: %s", strerror(errno));
+        close(server_fd_);
+        close(epoll_fd_);
         return;
     }
 
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = server_fd_;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev);
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, server_fd_, &ev) == -1) {
+        LOGE("epoll_ctl: listen_sock failed: %s", strerror(errno));
+        close(server_fd_);
+        close(epoll_fd_);
+        close(event_fd_);
+        return;
+    }
     
     ev.events = EPOLLIN;
     ev.data.fd = event_fd_;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event_fd_, &ev);
-    
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event_fd_, &ev) == -1) {
+        LOGE("epoll_ctl: event_fd failed: %s", strerror(errno));
+        close(server_fd_);
+        close(epoll_fd_);
+        close(event_fd_);
+        return;
+    }
+
     LOGI("Server listening on abstract UDS: @%s using epoll", socket_name_.c_str());
     is_running_ = true;
     std::vector<epoll_event> events(64);
@@ -335,6 +342,7 @@ void UdsServer::server_loop() {
                     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) != -1) {
                         add_client(client_fd);
                     } else {
+                        LOGE("epoll_ctl: add client failed: %s", strerror(errno));
                         close(client_fd);
                     }
                 }
@@ -342,8 +350,7 @@ void UdsServer::server_loop() {
                  is_running_ = false;
                  break;
             } else {
-                // [STABILITY_FIX] 分别处理读、写和错误事件
-                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP)) {
+                if ((current_events & EPOLLERR) || (current_events & EPOLLHUP) || !(current_events & (EPOLLIN | EPOLLOUT)))) {
                     remove_client(current_fd);
                 } else {
                     if (current_events & EPOLLIN) {
