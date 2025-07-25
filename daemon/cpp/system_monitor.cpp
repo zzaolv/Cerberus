@@ -22,7 +22,7 @@
 #include <string>
 #include <memory>
 
-#define LOG_TAG "cerberusd_monitor_v16_fixed" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v18_robust_parser" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -102,7 +102,7 @@ void SystemMonitor::top_app_monitor_thread() {
 }
 
 // =========================================================================================
-// [核心修复] 重写音频状态检测逻辑，严格遵循“焦点+播放”双重验证
+// [核心修复] 重写音频状态检测逻辑，采用更健壮的有限状态机解析器
 // =========================================================================================
 void SystemMonitor::update_audio_state() {
     std::set<int> focus_uids;
@@ -121,35 +121,39 @@ void SystemMonitor::update_audio_state() {
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
-        // 使用更可靠的标记来切换解析区域
+        // --- 状态机切换逻辑 ---
+        // 只有遇到明确的节标题时才切换状态，这比之前的逻辑更健壮
         if (line.find("Audio Focus stack entries") != std::string::npos) {
             current_section = ParseSection::FOCUS_STACK;
-            continue;
+            continue; // 继续下一行，因为标题行本身不包含数据
         }
-        if (line.rfind("  players:", 0) == 0) { // 严格匹配行首
+        if (line.rfind("  players:", 0) == 0) {
             current_section = ParseSection::PLAYERS;
             continue;
         }
-        // 如果遇到顶层标题，则退出当前解析区域
-        if (!line.empty() && !isspace(line[0])) {
+        // 当遇到下一个主要部分的标题时，退出当前解析状态
+        if (line.find("RecordActivityMonitor dump time:") != std::string::npos || line.find("AudioDeviceBroker:") != std::string::npos) {
             current_section = ParseSection::NONE;
         }
 
-        if (current_section == ParseSection::NONE) continue;
+        // --- 数据解析逻辑 ---
+        if (current_section == ParseSection::NONE) {
+            continue;
+        }
         
         try {
             if (current_section == ParseSection::FOCUS_STACK) {
-                // 查找持有焦点的UID
-                // 日志格式: source: ... -- uid: 10338 -- ...
+                // 在FOCUS_STACK模式下，持续查找所有持有焦点的UID
                 const std::string uid_marker = "-- uid: ";
                 size_t marker_pos = line.find(uid_marker);
                 if (marker_pos != std::string::npos) {
                     int uid = std::stoi(line.substr(marker_pos + uid_marker.length()));
-                    if (uid >= 10000) focus_uids.insert(uid);
+                    if (uid >= 10000) {
+                        focus_uids.insert(uid);
+                    }
                 }
             } else if (current_section == ParseSection::PLAYERS) {
-                // 查找正在播放的媒体播放器UID
-                // 日志格式: ... u/pid:10338/25803 state:started attr:AudioAttributes: usage=USAGE_MEDIA ...
+                // 在PLAYERS模式下，持续查找所有正在播放的媒体播放器UID
                 if (line.find("state:started") != std::string::npos && line.find("usage=USAGE_MEDIA") != std::string::npos) {
                     const std::string upid_marker = "u/pid:";
                     size_t upid_marker_pos = line.find(upid_marker);
@@ -157,7 +161,9 @@ void SystemMonitor::update_audio_state() {
                         int uid = 0;
                         std::stringstream ss(line.substr(upid_marker_pos + upid_marker.length()));
                         ss >> uid;
-                        if (uid >= 10000) started_player_uids.insert(uid);
+                        if (uid >= 10000) {
+                            started_player_uids.insert(uid);
+                        }
                     }
                 }
             }
@@ -165,12 +171,13 @@ void SystemMonitor::update_audio_state() {
     }
     pclose(pipe);
 
-    // 核心逻辑：取两个集合的交集
+    // 核心逻辑：取两个集合的交集，得到真正播放音频的UID
     std::set<int> active_media_uids;
     std::set_intersection(focus_uids.begin(), focus_uids.end(),
                           started_player_uids.begin(), started_player_uids.end(),
                           std::inserter(active_media_uids, active_media_uids.begin()));
 
+    // 更新全局状态
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_media_uids) {
@@ -183,6 +190,7 @@ void SystemMonitor::update_audio_state() {
     }
 }
 // =========================================================================================
+
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
@@ -407,40 +415,37 @@ void SystemMonitor::update_location_state() {
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
         
-        // 捕获 GPS/Network Provider 的摘要行
         if (line.rfind("LocationProvider[", 0) == 0) {
             current_provider_line = line;
             continue;
         }
 
-        // 只有在最近的 Provider 行不是 PASSIVE 的情况下，才解析请求
         if (current_provider_line.find("PASSIVE") != std::string::npos) {
             continue;
         }
         
-        // 解析请求行
         if (line.find("Request[") != std::string::npos) {
-             // 再次过滤 PASSIVE 请求
             if (line.find("PASSIVE") != std::string::npos) {
                 continue;
             }
 
             try {
-                // 提取包名
                 size_t pkg_start = line.find("package=");
                 if (pkg_start == std::string::npos) continue;
                 pkg_start += 8;
                 size_t pkg_end = line.find(" ", pkg_start);
                 if (pkg_end == std::string::npos) continue;
                 std::string pkg_name = line.substr(pkg_start, pkg_end - pkg_start);
-
-                // 提取UID
-                int uid = get_uid_from_pid(get_pid_from_pkg(pkg_name));
-                if (uid >= 10000) {
-                    active_uids.insert(uid);
+                
+                int pid = get_pid_from_pkg(pkg_name);
+                if (pid != -1) {
+                    int uid = get_uid_from_pid(pid);
+                    if (uid >= 10000) {
+                        active_uids.insert(uid);
+                    }
                 }
+
             } catch (const std::exception& e) {
-                // LOGW("LOCATION: Parsing error on line: %s", line.c_str());
             }
         }
     }
@@ -458,7 +463,6 @@ void SystemMonitor::update_location_state() {
     }
 }
 
-// 辅助函数，通过包名获取PID (这可能不总是准确，因为一个包可以有多个进程)
 int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
@@ -470,7 +474,7 @@ int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
             if (cmdline_file.is_open()) {
                 std::string cmdline;
                 std::getline(cmdline_file, cmdline, '\0');
-                if (cmdline.rfind(pkg_name, 0) == 0) { // 检查是否以包名开头
+                if (cmdline.rfind(pkg_name, 0) == 0) {
                     return pid;
                 }
             }
