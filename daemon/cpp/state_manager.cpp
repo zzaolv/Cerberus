@@ -1058,7 +1058,7 @@ void StateManager::remove_pid_from_app(int pid) {
             app->cpu_usage_percent = 0.0f;
             app->is_foreground = false;
             app->background_since = 0;
-            app.observation_since = 0;
+            app->observation_since = 0;
             app->undetected_since = 0;
         }
     }
