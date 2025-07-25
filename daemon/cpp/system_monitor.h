@@ -24,7 +24,6 @@ struct CpuTimeSlice {
     long long total_jiffies = 0;
 };
 
-// [核心新增] 定义网速和流量统计的数据结构
 struct NetworkSpeed {
     double download_kbps = 0.0;
     double upload_kbps = 0.0;
@@ -56,13 +55,11 @@ public:
     void update_audio_state();
     bool is_uid_playing_audio(int uid);
     
-    // [核心新增] 新增定位状态检测接口
     void update_location_state();
     bool is_uid_using_location(int uid);
     
     std::string get_current_ime_package();
     
-    // [核心新增] 网速监控相关接口
     void start_network_snapshot_thread();
     void stop_network_snapshot_thread();
     NetworkSpeed get_cached_network_speed(int uid);
@@ -72,6 +69,9 @@ private:
     void update_mem_info();
     void top_app_monitor_thread();
     
+    // [核心修复] 在类的私有部分声明 get_pid_from_pkg 函数
+    int get_pid_from_pkg(const std::string& pkg_name);
+
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
         long long iowait = 0, irq = 0, softirq = 0, steal = 0;
@@ -92,7 +92,6 @@ private:
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
     
-    // [核心新增] 新增定位状态相关成员
     mutable std::mutex location_uids_mutex_;
     std::set<int> uids_using_location_;
     
@@ -100,17 +99,14 @@ private:
     std::string current_ime_package_;
     time_t last_ime_check_time_ = 0;
 
-    // [核心新增] 网速监控私有函数和成员
     void network_snapshot_thread_func();
     std::map<int, TrafficStats> read_current_traffic();
 
-    // [核心新增] 网速监控相关成员
     std::thread network_thread_;
     std::atomic<bool> network_monitoring_active_{false};
     mutable std::mutex traffic_mutex_;
     std::map<int, TrafficStats> last_traffic_snapshot_;
     std::chrono::steady_clock::time_point last_snapshot_time_;
-    // [核心修改] 新增一个map用于存储计算好的速率
     mutable std::mutex speed_mutex_;
     std::map<int, NetworkSpeed> uid_network_speed_;
 
