@@ -8,10 +8,9 @@
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-// 从 freezeitVS 借鉴的多模式冻结策略
 enum class FreezeMethod {
     CGROUP_V2,
-    METHOD_SIGSTOP // [修复] 将 SIGSTOP 重命名为 METHOD_SIGSTOP 以避免宏冲突
+    METHOD_SIGSTOP
 };
 
 class ActionExecutor {
@@ -20,37 +19,33 @@ public:
     ~ActionExecutor();
 
     /**
-     * @brief 冻结一个应用实例，采用“先Binder冻结，再物理冻结”的安全流程。
+     * @brief [战术指挥官] 尝试冻结一个应用实例。
      * @param key 应用实例的唯一标识。
      * @param pids 该实例当前的所有PID。
-     * @param method 选择的物理冻结方法 (cgroup或SIGSTOP)。
-     * @return 操作是否完全成功。
+     * @return 0: 成功 (完全或降级) | 1: 需要重试 (软失败) | -1: 彻底失败
      */
-    bool freeze(const AppInstanceKey& key, const std::vector<int>& pids, FreezeMethod method);
+    int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
     
-    /**
-     * @brief 解冻一个应用实例，采用“先物理解冻，再Binder解冻”的安全流程。
-     * @param key 应用实例的唯一标识。
-     * @param pids 该实例当前的所有PID (如果已知)。
-     * @return 操作是否成功。
-     */
     bool unfreeze(const AppInstanceKey& key, const std::vector<int>& pids);
 
 private:
-    // --- Binder Freeze (核心技术，源自 freezeitVS) ---
+    // --- Binder Freeze ---
     bool initialize_binder();
     void cleanup_binder();
-    // 返回值: 0成功, <0为操作失败的pid
+    /**
+     * @brief [情报官] 执行ioctl操作并报告精确情报。
+     * @return 0: 全部成功 | 1: 软失败(EAGAIN) | -1: 硬失败(EINVAL/EPERM) | -2: 致命失败
+     */
     int handle_binder_freeze(const std::vector<int>& pids, bool freeze);
 
-    // --- Cgroup v2 Freeze (源自 Cerberus) ---
+    // --- Cgroup v2 Freeze ---
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();
     std::string get_instance_cgroup_path(const AppInstanceKey& key) const;
     bool freeze_cgroup(const AppInstanceKey& key, const std::vector<int>& pids);
     bool unfreeze_cgroup(const AppInstanceKey& key);
 
-    // --- SIGSTOP Freeze (源自 freezeitVS) ---
+    // --- SIGSTOP Freeze ---
     void freeze_sigstop(const std::vector<int>& pids);
     void unfreeze_sigstop(const std::vector<int>& pids);
 

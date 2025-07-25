@@ -15,14 +15,13 @@
 #include <algorithm>
 #include <fcntl.h>
 
-#define LOG_TAG "cerberusd_action_v2"
+#define LOG_TAG "cerberusd_action_v3_robust"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-// --- Constructor & Destructor ---
 ActionExecutor::ActionExecutor() {
     initialize_binder();
     initialize_cgroup();
@@ -32,69 +31,115 @@ ActionExecutor::~ActionExecutor() {
     cleanup_binder();
 }
 
-// --- Public Methods ---
-bool ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids, FreezeMethod method) {
-    if (pids.empty()) return true;
+// =========================================================================================
+// [核心重构] `freeze` 函数现在是战术指挥官
+// =========================================================================================
+int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
+    if (pids.empty()) return 0; // 成功
 
-    // 步骤 1: Binder 冻结
-    if (handle_binder_freeze(pids, true) < 0) {
-        LOGE("Binder freeze failed for %s. Aborting physical freeze.", key.first.c_str());
-        // 尝试回滚已经冻结的binder
-        handle_binder_freeze(pids, false);
-        return false;
-    }
+    // 步骤 1: 调用情报官，获取Binder冻结结果
+    int binder_result = handle_binder_freeze(pids, true);
 
-    // 步骤 2: 物理冻结
-    bool physical_freeze_ok = false;
-    switch (method) {
-        case FreezeMethod::CGROUP_V2:
-            physical_freeze_ok = freeze_cgroup(key, pids);
-            break;
-        case FreezeMethod::METHOD_SIGSTOP: // [修复] 使用新的枚举成员名
+    // 步骤 2: 根据情报执行战术决策
+    switch (binder_result) {
+        case 0: { // Binder全部成功
+            LOGI("Binder freeze successful for %s. Proceeding with physical freeze.", key.first.c_str());
+            // 优先cgroup，SIGSTOP兜底
+            bool physical_ok = freeze_cgroup(key, pids);
+            if (!physical_ok) {
+                LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
+                freeze_sigstop(pids);
+            }
+            return 0; // 最终成功
+        }
+        case 1: // 软失败 (EAGAIN)
+            LOGW("Binder freeze for %s resulted in soft failure (EAGAIN). Will retry later.", key.first.c_str());
+            // 无需做任何事，直接向上层报告需要重试
+            return 1; // 需要重试
+        
+        case -1: // 硬失败 (EINVAL/EPERM)
+            LOGW("Binder freeze for %s resulted in hard failure (EINVAL/EPERM). Fallback to SIGSTOP only.", key.first.c_str());
+            // 智能降级: 放弃有风险的cgroup冻结，直接使用更强力的SIGSTOP
             freeze_sigstop(pids);
-            physical_freeze_ok = true; // SIGSTOP 总是“成功”
-            break;
-    }
+            return 0; // 接受降级后的成功
 
-    if (!physical_freeze_ok) {
-        LOGE("Physical freeze failed for %s. Rolling back binder freeze.", key.first.c_str());
-        handle_binder_freeze(pids, false);
-        return false;
+        case -2: // 致命失败
+        default:
+            LOGE("Binder freeze for %s resulted in fatal failure. Aborting freeze.", key.first.c_str());
+            // 无法继续，报告彻底失败
+            return -1; // 彻底失败
     }
-    
-    LOGI("Successfully froze instance '%s' (user %d) with %zu pids using %s.", 
-         key.first.c_str(), key.second, pids.size(), method == FreezeMethod::CGROUP_V2 ? "cgroup" : "SIGSTOP");
-    return true;
 }
 
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
-    // 步骤 1: 物理解冻 (必须先做，否则进程无法处理binder消息)
-    bool cgroup_unfrozen = unfreeze_cgroup(key);
-    // SIGSTOP解冻总是执行，即使没有pids，以防万一
+    unfreeze_cgroup(key);
     unfreeze_sigstop(pids);
-
-    if (!cgroup_unfrozen) {
-        LOGW("Cgroup unfreeze seems to have failed for %s, but proceeding with binder unfreeze.", key.first.c_str());
-    }
-
-    // 步骤 2: Binder 解冻
-    if (handle_binder_freeze(pids, false) < 0) {
-        LOGE("Binder unfreeze failed for %s.", key.first.c_str());
-        // 即使binder解冻失败，物理层也已解冻，所以不返回false
-    }
-    
+    handle_binder_freeze(pids, false); // 尝试解冻Binder，即使失败也要继续
     LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
     return true;
 }
 
-// --- Binder Freeze Implementation ---
+// =========================================================================================
+// [核心重构] `handle_binder_freeze` 函数现在是情报官
+// =========================================================================================
+int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
+    if (binder_state_.fd < 0 || pids.empty()) return 0;
+
+    bool has_soft_failure = false;
+    bool has_hard_failure = false;
+    std::vector<int> successfully_frozen_pids;
+
+    binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
+
+    for (int pid : pids) {
+        info.pid = pid;
+        if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) < 0) {
+            switch (errno) {
+                case EAGAIN:
+                    has_soft_failure = true;
+                    LOGW("Binder op for pid %d has pending transactions (EAGAIN).", info.pid);
+                    break;
+                case EINVAL:
+                case EPERM:
+                    has_hard_failure = true;
+                    LOGW("Binder op for pid %d failed with hard error: %s", info.pid, strerror(errno));
+                    break;
+                default:
+                    LOGE("Binder op for pid %d failed with fatal error: %s", info.pid, strerror(errno));
+                    // 这是致命失败，必须回滚并立即中止
+                    if (freeze && !successfully_frozen_pids.empty()) {
+                        LOGE("Rolling back fatally failed binder freeze op...");
+                        handle_binder_freeze(successfully_frozen_pids, false);
+                    }
+                    return -2; // 致命失败
+            }
+        } else if (freeze) {
+            successfully_frozen_pids.push_back(pid);
+        }
+    }
+
+    // 原子性原则：如果冻结过程中遇到任何失败，回滚所有已成功的冻结
+    if (freeze && (has_soft_failure || has_hard_failure)) {
+        if (!successfully_frozen_pids.empty()) {
+            LOGW("Rolling back partially successful binder freeze due to errors...");
+            handle_binder_freeze(successfully_frozen_pids, false);
+        }
+    }
+
+    // 根据情报优先级返回结果
+    if (has_hard_failure) return -1; // 硬失败
+    if (has_soft_failure) return 1;  // 软失败
+    
+    return 0; // 全部成功
+}
+
+
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
     if (binder_state_.fd < 0) {
         LOGE("Failed to open /dev/binder: %s", strerror(errno));
         return false;
     }
-
     binder_version version;
     if (ioctl(binder_state_.fd, BINDER_VERSION, &version) < 0 || version.protocol_version != BINDER_CURRENT_PROTOCOL_VERSION) {
         LOGE("Binder version mismatch or ioctl failed. Required: %d", BINDER_CURRENT_PROTOCOL_VERSION);
@@ -102,22 +147,6 @@ bool ActionExecutor::initialize_binder() {
         binder_state_.fd = -1;
         return false;
     }
-
-    binder_state_.mapped = mmap(NULL, binder_state_.mapSize, PROT_READ, MAP_PRIVATE, binder_state_.fd, 0);
-    if (binder_state_.mapped == MAP_FAILED) {
-        LOGE("Binder mmap failed: %s", strerror(errno));
-        close(binder_state_.fd);
-        binder_state_.fd = -1;
-        return false;
-    }
-
-    binder_frozen_status_info info = { (uint32_t)getpid(), 0, 0 };
-    if (ioctl(binder_state_.fd, BINDER_GET_FROZEN_INFO, &info) < 0) {
-        LOGW("Kernel does not support BINDER_FREEZE feature. Binder freezing disabled.");
-        cleanup_binder();
-        return false;
-    }
-
     LOGI("Binder driver initialized successfully for freezing.");
     return true;
 }
@@ -133,36 +162,13 @@ void ActionExecutor::cleanup_binder() {
     }
 }
 
-int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
-    if (binder_state_.fd < 0 || pids.empty()) return 0;
-
-    binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
-
-    for (size_t i = 0; i < pids.size(); ++i) {
-        info.pid = pids[i];
-        if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) < 0) {
-            if (errno == EAGAIN) { // 事务未处理完，这是可接受的失败
-                 LOGW("Binder freeze for pid %d has pending transactions (EAGAIN).", info.pid);
-            } else {
-                LOGE("Failed to %s binder for pid %d: %s", freeze ? "freeze" : "unfreeze", info.pid, strerror(errno));
-                if(freeze) return -info.pid; // 如果是冻结失败，返回失败的pid
-            }
-        }
-    }
-    return 0; // 成功或非致命错误
-}
-
-// --- Cgroup v2 Implementation ---
 bool ActionExecutor::initialize_cgroup() {
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
         cgroup_version_ = CgroupVersion::V2;
         cgroup_root_path_ = "/sys/fs/cgroup/";
         LOGI("Detected cgroup v2. Root: %s", cgroup_root_path_.c_str());
-        // 确保 freezer controller 在根cgroup可用
         if(!write_to_file(cgroup_root_path_ + "cgroup.subtree_control", "+freezer")) {
-             LOGE("Failed to enable freezer controller in root cgroup.");
-             cgroup_version_ = CgroupVersion::UNKNOWN;
-             return false;
+             LOGW("Failed to enable freezer controller in root cgroup. It might be already enabled.");
         }
         return true;
     }
@@ -179,15 +185,12 @@ std::string ActionExecutor::get_instance_cgroup_path(const AppInstanceKey& key) 
 
 bool ActionExecutor::freeze_cgroup(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (cgroup_version_ != CgroupVersion::V2) return false;
-
     std::string instance_path = get_instance_cgroup_path(key);
     if (!create_instance_cgroup(instance_path)) return false;
-
     if (!move_pids_to_cgroup(pids, instance_path)) {
         LOGE("Failed to move pids for '%s' to its cgroup.", key.first.c_str());
         return false;
     }
-
     if (!write_to_file(instance_path + "/cgroup.freeze", "1")) {
         LOGE("Failed to write '1' to cgroup.freeze for '%s'.", key.first.c_str());
         return false;
@@ -196,32 +199,20 @@ bool ActionExecutor::freeze_cgroup(const AppInstanceKey& key, const std::vector<
 }
 
 bool ActionExecutor::unfreeze_cgroup(const AppInstanceKey& key) {
-    if (cgroup_version_ != CgroupVersion::V2) return true; // 如果不支持cgroup，解冻操作自然是“成功”的
-
+    if (cgroup_version_ != CgroupVersion::V2) return true;
     std::string instance_path = get_instance_cgroup_path(key);
     if (!fs::exists(instance_path)) return true;
-
-    if (!write_to_file(instance_path + "/cgroup.freeze", "0")) {
-        LOGE("Failed to write '0' to cgroup.freeze for '%s'.", key.first.c_str());
-        // Don't return false, try to cleanup anyway
-    }
-
+    write_to_file(instance_path + "/cgroup.freeze", "0");
     std::string procs_file = instance_path + "/cgroup.procs";
     std::vector<int> pids_to_move;
     std::ifstream ifs(procs_file);
     int pid;
-    while(ifs >> pid) {
-        pids_to_move.push_back(pid);
-    }
-    if (!pids_to_move.empty()) {
-        move_pids_to_default_cgroup(pids_to_move);
-    }
-    
+    while(ifs >> pid) { pids_to_move.push_back(pid); }
+    if (!pids_to_move.empty()) { move_pids_to_default_cgroup(pids_to_move); }
     remove_instance_cgroup(instance_path);
     return true;
 }
 
-// --- SIGSTOP Implementation ---
 void ActionExecutor::freeze_sigstop(const std::vector<int>& pids) {
     for (int pid : pids) {
         if (kill(pid, SIGSTOP) < 0) {
@@ -232,13 +223,10 @@ void ActionExecutor::freeze_sigstop(const std::vector<int>& pids) {
 
 void ActionExecutor::unfreeze_sigstop(const std::vector<int>& pids) {
     for (int pid : pids) {
-        if (kill(pid, SIGCONT) < 0) {
-            // This can happen if the process died, so it's not a critical error.
-        }
+        if (kill(pid, SIGCONT) < 0) { }
     }
 }
 
-// --- Utility Functions ---
 bool ActionExecutor::create_instance_cgroup(const std::string& path) {
     if (fs::exists(path)) return true;
     try {
@@ -252,17 +240,11 @@ bool ActionExecutor::create_instance_cgroup(const std::string& path) {
 
 bool ActionExecutor::remove_instance_cgroup(const std::string& path) {
     if (!fs::exists(path)) return true;
-    try {
-        if (rmdir(path.c_str()) != 0) {
-            // rmdir only works on empty directories
-            LOGW("Cannot remove cgroup '%s': %s. It might not be empty.", path.c_str(), strerror(errno));
-            return false;
-        }
-        return true;
-    } catch (const fs::filesystem_error& e) {
-        LOGE("Failed to remove cgroup '%s': %s", path.c_str(), e.what());
+    if (rmdir(path.c_str()) != 0) {
+        LOGW("Cannot remove cgroup '%s': %s. It might not be empty.", path.c_str(), strerror(errno));
         return false;
     }
+    return true;
 }
 
 bool ActionExecutor::move_pids_to_cgroup(const std::vector<int>& pids, const std::string& cgroup_path) {
@@ -289,7 +271,6 @@ bool ActionExecutor::move_pids_to_default_cgroup(const std::vector<int>& pids) {
 bool ActionExecutor::write_to_file(const std::string& path, const std::string& value) {
     std::ofstream ofs(path);
     if (!ofs.is_open()) {
-        // Log silently for subtree_control, as it can fail legitimately if already set
         if (path.find("subtree_control") == std::string::npos) {
             LOGE("Failed to open file '%s' for writing: %s", path.c_str(), strerror(errno));
         }

@@ -35,6 +35,9 @@ struct AppRuntimeState {
     time_t observation_since = 0;
     time_t undetected_since = 0;
 
+    // [核心新增] 用于指数退避重试的计数器
+    int freeze_retry_count = 0;
+
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
@@ -58,11 +61,8 @@ public:
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
 
-
 private:
-    // [核心修复] 新增一个内部无锁版本，用于在已持有锁的上下文中安全调用
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
-
     bool reconcile_process_state_full(); 
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -85,8 +85,7 @@ private:
     std::set<int> last_known_top_pids_;
     
     GlobalStatsData global_stats_;
-    FreezeMethod default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
-
+    
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     

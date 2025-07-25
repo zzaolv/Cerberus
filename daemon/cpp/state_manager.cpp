@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <ctime>
 
-#define LOG_TAG "cerberusd_state_v16_fixed"
+#define LOG_TAG "cerberusd_state_v18_robust"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -33,6 +33,9 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
         } else if (app.config.policy == AppPolicy::STANDARD) {
             timeout_sec = master_config.standard_timeout_sec;
         }
+        if (app.freeze_retry_count > 0) {
+            timeout_sec += (5 * app.freeze_retry_count); // 指数退避增加的延迟
+        }
         int remaining = timeout_sec - (now - app.background_since);
         if (remaining < 0) remaining = 0;
         return "PENDING_FREEZE (" + std::to_string(remaining) + "s)";
@@ -52,14 +55,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     
     master_config_ = db_manager_->get_master_config().value_or(MasterConfig{});
     LOGI("Loaded master config: standard_timeout=%ds", master_config_.standard_timeout_sec);
-    
-    if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
-        default_freeze_method_ = FreezeMethod::CGROUP_V2;
-    } else {
-        default_freeze_method_ = FreezeMethod::METHOD_SIGSTOP;
-    }
-    LOGI("Default freeze method set to %s.", default_freeze_method_ == FreezeMethod::CGROUP_V2 ? "CGROUP_V2" : "SIGSTOP");
-   
+       
     critical_system_apps_ = {
         "com.google.android.inputmethod.latin", // Gboard
         "com.baidu.input",
@@ -411,15 +407,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
 }
 
 
-// =========================================================================================
-// [核心修复] 死锁修复区域
-// =========================================================================================
-
-/**
- * @brief 内部无锁解冻函数。它假定调用者已经持有了 state_mutex_。
- *        它只负责修改状态，不负责触发外部通知（如广播）。
- * @return 如果应用状态确实从 FROZEN 变为 RUNNING，则返回 true。
- */
 bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason) {
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         LOGI("UNFREEZE [%s]: Unfreezing %s (user %d).", 
@@ -429,16 +416,16 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.observation_since = time(nullptr);
         app.background_since = 0;
+        app.freeze_retry_count = 0; // 解冻后重置重试计数
         
-        return true; // 状态已改变
+        return true;
     } else {
         LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
             reason.c_str(), app.package_name.c_str(), static_cast<int>(app.current_status));
-        return false; // 状态未改变
+        return false;
     }
 }
 
-// 通用请求处理函数，避免了死锁
 void StateManager::on_wakeup_request(const json& payload) {
     bool state_changed = false;
     try {
@@ -557,8 +544,6 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     }
 }
 
-// =========================================================================================
-
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     master_config_ = config;
@@ -570,7 +555,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
 
-    { // 加锁范围开始
+    {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (top_pids == last_known_top_pids_) {
             return false;
@@ -612,6 +597,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                     }
                     app.observation_since = 0;
                     app.background_since = 0;
+                    app.freeze_retry_count = 0; // 成为前台，重置重试计数
                     if (unfreeze_and_observe_nolock(app, "BECAME_FOREGROUND")) {
                         probe_config_needs_update = true;
                     }
@@ -626,7 +612,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                 }
             }
         }
-    } // 加锁范围结束
+    }
 
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
@@ -644,74 +630,101 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
+// =========================================================================================
+// [核心重构] `check_timers` 函数现在是战略决策者
+// =========================================================================================
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
+    const int MAX_FREEZE_RETRIES = 3;
+    const int RETRY_DELAY_BASE_SEC = 5;
 
-    { // 加锁范围开始
+    {
         std::lock_guard<std::mutex> lock(state_mutex_);
         time_t now = time(nullptr);
         const double NETWORK_THRESHOLD_KBPS = 100.0;
 
         for (auto& [key, app] : managed_apps_) {
+            // 清理不应有计时器的应用状态
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
                 if (app.observation_since > 0 || app.background_since > 0) {
                     app.observation_since = 0;
                     app.background_since = 0;
+                    app.freeze_retry_count = 0;
                     changed = true;
                 }
                 continue;
             }
 
+            // 观察期结束，检查豁免条件
             if (app.observation_since > 0 && now - app.observation_since >= 10) {
                 app.observation_since = 0;
 
                 sys_monitor_->update_audio_state();
-                if (is_app_playing_audio(app)) {
-                    LOGI("TICK: %s is playing audio, deferring freeze.", app.package_name.c_str());
+                if (is_app_playing_audio(app) || sys_monitor_->is_uid_using_location(app.uid) || 
+                    (sys_monitor_->get_cached_network_speed(app.uid).download_kbps > NETWORK_THRESHOLD_KBPS)) {
+                    LOGI("TICK: %s is active (audio/location/network), restarting observation.", app.package_name.c_str());
                     app.observation_since = now;
                     changed = true;
                     continue;
                 }
-
-                if (sys_monitor_->is_uid_using_location(app.uid)) {
-                    LOGI("TICK: %s is using location, deferring freeze.", app.package_name.c_str());
-                    app.observation_since = now;
-                    changed = true;
-                    continue;
-                }
-
-                NetworkSpeed speed = sys_monitor_->get_cached_network_speed(app.uid);
-                if (speed.download_kbps > NETWORK_THRESHOLD_KBPS || speed.upload_kbps > NETWORK_THRESHOLD_KBPS) {
-                    LOGI("TICK: %s has high network activity (DL: %.1f, UL: %.1f KB/s), deferring freeze.",
-                         app.package_name.c_str(), speed.download_kbps, speed.upload_kbps);
-                    app.observation_since = now;
-                    changed = true;
-                    continue;
-                }
-
-                LOGI("TICK: %s is silent and inactive, starting freeze timer.", app.package_name.c_str());
+                LOGI("TICK: %s is inactive, starting freeze timer.", app.package_name.c_str());
                 app.background_since = now;
+                app.freeze_retry_count = 0; // 每次进入冻结流程都重置重试计数
                 changed = true;
             }
             
+            // 冻结倒计时检查
             if (app.background_since > 0) {
                 int timeout_sec = 0;
                 if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
                 else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
+                
+                // 指数退避的延迟
+                if (app.freeze_retry_count > 0) {
+                    timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
+                }
 
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                    if (action_executor_->freeze(key, app.pids, default_freeze_method_)) {
-                        app.current_status = AppRuntimeState::Status::FROZEN;
-                        schedule_timed_unfreeze(app);
-                        probe_config_needs_update = true;
+                    LOGI("TICK: Timeout for %s. Attempting to freeze (try #%d)...", app.package_name.c_str(), app.freeze_retry_count + 1);
+                    
+                    int freeze_result = action_executor_->freeze(key, app.pids);
+
+                    switch (freeze_result) {
+                        case 0: // 成功
+                            LOGI("STRATEGY: Freeze successful for %s.", key.first.c_str());
+                            app.current_status = AppRuntimeState::Status::FROZEN;
+                            schedule_timed_unfreeze(app);
+                            probe_config_needs_update = true;
+                            app.background_since = 0;
+                            app.freeze_retry_count = 0;
+                            break;
+                        
+                        case 1: // 需要重试
+                            app.freeze_retry_count++;
+                            if (app.freeze_retry_count > MAX_FREEZE_RETRIES) {
+                                LOGW("STRATEGY: Giving up on freezing %s after %d retries.", key.first.c_str(), MAX_FREEZE_RETRIES);
+                                app.background_since = 0;
+                                app.freeze_retry_count = 0;
+                            } else {
+                                LOGW("STRATEGY: Freeze for %s needs retry. Scheduling next attempt.", key.first.c_str());
+                                // 通过重置 `background_since` 来实现延迟重试
+                                app.background_since = now; 
+                            }
+                            break;
+
+                        case -1: // 彻底失败
+                        default:
+                            LOGE("STRATEGY: Freeze for %s failed fatally. Aborting.", key.first.c_str());
+                            app.background_since = 0;
+                            app.freeze_retry_count = 0;
+                            break;
                     }
-                    app.background_since = 0;
                     changed = true;
                 }
             }
         }
-    } // 加锁范围结束
+    }
     
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
@@ -793,6 +806,7 @@ bool StateManager::perform_deep_scan() {
                     app.is_foreground = false;
                     app.background_since = 0;
                     app.observation_since = 0;
+                    app.freeze_retry_count = 0;
                     app.mem_usage_kb = 0;
                     app.swap_usage_kb = 0;
                     app.cpu_usage_percent = 0.0f;
@@ -809,7 +823,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
     bool state_changed = false;
     bool probe_config_needs_update = false;
 
-    { // 加锁范围开始
+    {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!payload.contains("policies")) return false;
         
@@ -839,12 +853,11 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
             }
         }
         LOGI("New configuration applied.");
-    } // 加锁范围结束
+    }
 
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
     }
-    // 即使没有解冻操作，策略本身也变了，需要通知UI刷新
     return true; 
 }
 
@@ -1059,6 +1072,7 @@ void StateManager::remove_pid_from_app(int pid) {
             app->is_foreground = false;
             app->background_since = 0;
             app->observation_since = 0;
+            app->freeze_retry_count = 0;
             app->undetected_since = 0;
         }
     }
