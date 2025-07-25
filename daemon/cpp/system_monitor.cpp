@@ -22,15 +22,13 @@
 #include <string>
 #include <memory>
 
-#define LOG_TAG "cerberusd_monitor_v15_final" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v16_fixed" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
-
-// ... (从文件顶部到 network_snapshot_thread_func 之前的代码保持不变) ...
 
 int get_uid_from_pid(int pid) {
     char path_buffer[64];
@@ -39,7 +37,6 @@ int get_uid_from_pid(int pid) {
     if (stat(path_buffer, &st) != 0) return -1;
     return st.st_uid;
 }
-
 
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
@@ -104,6 +101,9 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+// =========================================================================================
+// [核心修复] 重写音频状态检测逻辑，严格遵循“焦点+播放”双重验证
+// =========================================================================================
 void SystemMonitor::update_audio_state() {
     std::set<int> focus_uids;
     std::set<int> started_player_uids;
@@ -115,20 +115,22 @@ void SystemMonitor::update_audio_state() {
         return;
     }
 
-    enum class ParseSection { NONE, FOCUS, PLAYERS };
+    enum class ParseSection { NONE, FOCUS_STACK, PLAYERS };
     ParseSection current_section = ParseSection::NONE;
 
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
+        // 使用更可靠的标记来切换解析区域
         if (line.find("Audio Focus stack entries") != std::string::npos) {
-            current_section = ParseSection::FOCUS;
+            current_section = ParseSection::FOCUS_STACK;
             continue;
         }
-        if (line.find("  players:") != std::string::npos) {
+        if (line.rfind("  players:", 0) == 0) { // 严格匹配行首
             current_section = ParseSection::PLAYERS;
             continue;
         }
+        // 如果遇到顶层标题，则退出当前解析区域
         if (!line.empty() && !isspace(line[0])) {
             current_section = ParseSection::NONE;
         }
@@ -136,7 +138,9 @@ void SystemMonitor::update_audio_state() {
         if (current_section == ParseSection::NONE) continue;
         
         try {
-            if (current_section == ParseSection::FOCUS) {
+            if (current_section == ParseSection::FOCUS_STACK) {
+                // 查找持有焦点的UID
+                // 日志格式: source: ... -- uid: 10338 -- ...
                 const std::string uid_marker = "-- uid: ";
                 size_t marker_pos = line.find(uid_marker);
                 if (marker_pos != std::string::npos) {
@@ -144,37 +148,41 @@ void SystemMonitor::update_audio_state() {
                     if (uid >= 10000) focus_uids.insert(uid);
                 }
             } else if (current_section == ParseSection::PLAYERS) {
-                if (line.find("state:started") != std::string::npos) {
-                    const std::string uid_marker = "u/pid:";
-                    size_t uid_marker_pos = line.find(uid_marker);
-                    if (uid_marker_pos != std::string::npos) {
+                // 查找正在播放的媒体播放器UID
+                // 日志格式: ... u/pid:10338/25803 state:started attr:AudioAttributes: usage=USAGE_MEDIA ...
+                if (line.find("state:started") != std::string::npos && line.find("usage=USAGE_MEDIA") != std::string::npos) {
+                    const std::string upid_marker = "u/pid:";
+                    size_t upid_marker_pos = line.find(upid_marker);
+                    if (upid_marker_pos != std::string::npos) {
                         int uid = 0;
-                        std::stringstream ss(line.substr(uid_marker_pos + uid_marker.length()));
+                        std::stringstream ss(line.substr(upid_marker_pos + upid_marker.length()));
                         ss >> uid;
                         if (uid >= 10000) started_player_uids.insert(uid);
                     }
                 }
             }
-        } catch (const std::exception& e) { /* ignore parsing errors */ }
+        } catch (const std::exception& e) { /* 忽略解析错误 */ }
     }
     pclose(pipe);
 
-    std::set<int> active_uids;
+    // 核心逻辑：取两个集合的交集
+    std::set<int> active_media_uids;
     std::set_intersection(focus_uids.begin(), focus_uids.end(),
                           started_player_uids.begin(), started_player_uids.end(),
-                          std::inserter(active_uids, active_uids.begin()));
+                          std::inserter(active_media_uids, active_media_uids.begin()));
 
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
-        if (uids_playing_audio_ != active_uids) {
+        if (uids_playing_audio_ != active_media_uids) {
             std::stringstream ss;
-            for(int uid : active_uids) { ss << uid << " "; }
-            LOGI("Audio active UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
-                 uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
-            uids_playing_audio_ = active_uids;
+            for(int uid : active_media_uids) { ss << uid << " "; }
+            LOGI("Active audio UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+                 uids_playing_audio_.size(), active_media_uids.size(), ss.str().c_str());
+            uids_playing_audio_ = active_media_uids;
         }
     }
 }
+// =========================================================================================
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
@@ -200,7 +208,6 @@ void SystemMonitor::stop_network_snapshot_thread() {
     }
 }
 
-// --- 核心修复：网速缓存逻辑 ---
 void SystemMonitor::network_snapshot_thread_func() {
     while (network_monitoring_active_) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -222,18 +229,14 @@ void SystemMonitor::network_snapshot_thread_func() {
         
         {
             std::lock_guard<std::mutex> lock(speed_mutex_);
-            
-            // 步骤1：遍历当前缓存的所有UID，将它们的速率乘以一个衰减因子
-            const double DECAY_FACTOR = 0.5; // 每次迭代，旧速率衰减为原来的一半
+            const double DECAY_FACTOR = 0.5;
             for (auto& [uid, speed] : uid_network_speed_) {
                 speed.download_kbps *= DECAY_FACTOR;
                 speed.upload_kbps *= DECAY_FACTOR;
-                // 如果速率非常小，直接清零
                 if (speed.download_kbps < 0.1) speed.download_kbps = 0.0;
                 if (speed.upload_kbps < 0.1) speed.upload_kbps = 0.0;
             }
 
-            // 步骤2：计算新的速率，并【覆盖或添加】到缓存中
             for (const auto& [uid, current_stats] : current_snapshot) {
                 auto last_it = last_snapshot.find(uid);
                 if (last_it != last_snapshot.end()) {
@@ -241,7 +244,6 @@ void SystemMonitor::network_snapshot_thread_func() {
                     long long tx_delta = (current_stats.tx_bytes > last_it->second.tx_bytes) ? (current_stats.tx_bytes - last_it->second.tx_bytes) : 0;
                     
                     if (rx_delta > 0 || tx_delta > 0) {
-                        // 只有在有新流量时，才计算并覆盖速率
                         uid_network_speed_[uid] = {
                             .download_kbps = (static_cast<double>(rx_delta) / 1024.0) / time_delta_sec,
                             .upload_kbps = (static_cast<double>(tx_delta) / 1024.0) / time_delta_sec
@@ -249,7 +251,6 @@ void SystemMonitor::network_snapshot_thread_func() {
                     }
                 }
             }
-             LOGD("Network speed cache updated. Total tracked UIDs: %zu", uid_network_speed_.size());
         }
 
         {
@@ -261,7 +262,6 @@ void SystemMonitor::network_snapshot_thread_func() {
     LOGI("Network snapshot thread stopped.");
 }
 
-
 NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     std::lock_guard<std::mutex> lock(speed_mutex_);
     auto it = uid_network_speed_.find(uid);
@@ -270,7 +270,6 @@ NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     }
     return NetworkSpeed();
 }
-
 
 static std::string exec_shell_pipe(const char* cmd) {
     std::array<char, 128> buffer;
@@ -404,43 +403,44 @@ void SystemMonitor::update_location_state() {
         return;
     }
 
-    enum class ParseSection { NONE, ACTIVE_PROVIDER };
-    ParseSection current_section = ParseSection::NONE;
-
+    std::string current_provider_line;
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
         
-        if (line.find("gps provider:") != std::string::npos || line.find("network provider:") != std::string::npos) {
-            current_section = ParseSection::ACTIVE_PROVIDER;
+        // 捕获 GPS/Network Provider 的摘要行
+        if (line.rfind("LocationProvider[", 0) == 0) {
+            current_provider_line = line;
             continue;
-        }
-        
-        if (!line.empty() && !isspace(line[0])) {
-            current_section = ParseSection::NONE;
         }
 
-        if (current_section != ParseSection::ACTIVE_PROVIDER) {
+        // 只有在最近的 Provider 行不是 PASSIVE 的情况下，才解析请求
+        if (current_provider_line.find("PASSIVE") != std::string::npos) {
             continue;
         }
         
+        // 解析请求行
         if (line.find("Request[") != std::string::npos) {
+             // 再次过滤 PASSIVE 请求
             if (line.find("PASSIVE") != std::string::npos) {
                 continue;
             }
 
             try {
-                std::string trimmed_line = line;
-                trimmed_line.erase(0, trimmed_line.find_first_not_of(" \t"));
-                
-                std::stringstream ss(trimmed_line);
-                int uid = 0;
-                ss >> uid;
+                // 提取包名
+                size_t pkg_start = line.find("package=");
+                if (pkg_start == std::string::npos) continue;
+                pkg_start += 8;
+                size_t pkg_end = line.find(" ", pkg_start);
+                if (pkg_end == std::string::npos) continue;
+                std::string pkg_name = line.substr(pkg_start, pkg_end - pkg_start);
 
+                // 提取UID
+                int uid = get_uid_from_pid(get_pid_from_pkg(pkg_name));
                 if (uid >= 10000) {
                     active_uids.insert(uid);
                 }
             } catch (const std::exception& e) {
-                LOGW("LOCATION: Parsing error on line: %s", line.c_str());
+                // LOGW("LOCATION: Parsing error on line: %s", line.c_str());
             }
         }
     }
@@ -458,6 +458,26 @@ void SystemMonitor::update_location_state() {
     }
 }
 
+// 辅助函数，通过包名获取PID (这可能不总是准确，因为一个包可以有多个进程)
+int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        try {
+            int pid = std::stoi(entry.path().filename().string());
+            char path_buffer[256];
+            snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
+            std::ifstream cmdline_file(path_buffer);
+            if (cmdline_file.is_open()) {
+                std::string cmdline;
+                std::getline(cmdline_file, cmdline, '\0');
+                if (cmdline.rfind(pkg_name, 0) == 0) { // 检查是否以包名开头
+                    return pid;
+                }
+            }
+        } catch (...) { continue; }
+    }
+    return -1;
+}
 
 bool SystemMonitor::is_uid_using_location(int uid) {
     std::lock_guard<std::mutex> lock(location_uids_mutex_);

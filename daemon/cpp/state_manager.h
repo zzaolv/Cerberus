@@ -53,16 +53,16 @@ public:
     json get_full_config_for_ui();
     json get_probe_config_payload();
 
-    // [旧接口，保持不变]
     void on_wakeup_request(const json& payload);
-    
-    // --- [新接口] ---
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
 
 
 private:
+    // [核心修复] 新增一个内部无锁版本，用于在已持有锁的上下文中安全调用
+    bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
+
     bool reconcile_process_state_full(); 
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -71,9 +71,6 @@ private:
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
     
-    // 内部通用解冻逻辑
-    void unfreeze_and_observe(AppRuntimeState& app, const std::string& reason);
-
     bool is_app_playing_audio(const AppRuntimeState& app);
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
