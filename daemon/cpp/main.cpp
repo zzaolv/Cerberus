@@ -16,7 +16,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v15_ultimate"
+#define LOG_TAG "cerberusd_main_v19_timeline"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -40,7 +40,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (!g_state_manager) return;
 
-        // --- 新增的IPC指令处理 ---
         if (type == "cmd.request_temp_unfreeze_pkg") {
             g_state_manager->on_temp_unfreeze_request_by_pkg(msg.at("payload"));
         } else if (type == "cmd.request_temp_unfreeze_uid") {
@@ -48,7 +47,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         } else if (type == "cmd.request_temp_unfreeze_pid") {
             g_state_manager->on_temp_unfreeze_request_by_pid(msg.at("payload"));
         }
-        // --- 旧指令处理保持不变 ---
         else if (type == "event.app_wakeup_request") {
             g_state_manager->on_wakeup_request(msg.at("payload"));
         } else if (type == "cmd.set_policy") {
@@ -56,11 +54,17 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 notify_probe_of_config_change();
             }
             g_top_app_refresh_tickets = 1; 
-        } else if (type == "cmd.set_master_config") {
+        } 
+        // [核心修改] 更新 cmd.set_master_config 的处理逻辑
+        else if (type == "cmd.set_master_config") {
             MasterConfig cfg;
-            cfg.standard_timeout_sec = msg.at("payload").at("standard_timeout_sec").get<int>();
+            const auto& payload = msg.at("payload");
+            cfg.standard_timeout_sec = payload.value("standard_timeout_sec", 90);
+            cfg.is_timed_unfreeze_enabled = payload.value("is_timed_unfreeze_enabled", true);
+            cfg.timed_unfreeze_interval_sec = payload.value("timed_unfreeze_interval_sec", 1800);
             g_state_manager->update_master_config(cfg);
-        } else if (type == "query.refresh_dashboard") {
+        } 
+        else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
             json payload = g_state_manager->get_full_config_for_ui();
@@ -130,7 +134,6 @@ void worker_thread_func() {
             g_sys_monitor->update_location_state();
             location_scan_countdown = 15;
         }
-
 
         if (g_state_manager->tick_state_machine()) {
             needs_broadcast = true;

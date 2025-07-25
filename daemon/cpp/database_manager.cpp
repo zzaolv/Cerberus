@@ -3,7 +3,7 @@
 #include <android/log.h>
 #include <filesystem>
 
-#define LOG_TAG "cerberusd_db_v8"
+#define LOG_TAG "cerberusd_db_v9"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -17,10 +17,6 @@ void DatabaseManager::initialize_database() {
     try {
         if (!db_.tableExists("app_policies_v3")) {
             LOGI("Table 'app_policies_v3' does not exist. Creating it.");
-            if (db_.tableExists("app_policies_v2")) {
-                 LOGI("Old 'app_policies_v2' table found. Dropping it.");
-                 db_.exec("DROP TABLE app_policies_v2;");
-            }
             db_.exec(R"(
                 CREATE TABLE app_policies_v3 (
                     package_name TEXT NOT NULL,
@@ -31,15 +27,22 @@ void DatabaseManager::initialize_database() {
             )");
         }
 
-        if (!db_.tableExists("master_config_v1")) {
-            LOGI("Table 'master_config_v1' does not exist. Creating it.");
+        // [核心修改] 更新 master_config 表结构和默认值
+        if (!db_.tableExists("master_config_v2")) {
+            LOGI("Table 'master_config_v2' does not exist. Creating it.");
+            if (db_.tableExists("master_config_v1")) {
+                 LOGI("Old 'master_config_v1' table found. Dropping it.");
+                 db_.exec("DROP TABLE master_config_v1;");
+            }
             db_.exec(R"(
-                CREATE TABLE master_config_v1 (
+                CREATE TABLE master_config_v2 (
                     key TEXT PRIMARY KEY,
                     value INTEGER NOT NULL
                 )
             )");
-            db_.exec("INSERT OR IGNORE INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', 90)");
+            db_.exec("INSERT OR IGNORE INTO master_config_v2 (key, value) VALUES ('standard_timeout_sec', 90)");
+            db_.exec("INSERT OR IGNORE INTO master_config_v2 (key, value) VALUES ('is_timed_unfreeze_enabled', 1)");
+            db_.exec("INSERT OR IGNORE INTO master_config_v2 (key, value) VALUES ('timed_unfreeze_interval_sec', 1800)");
         }
     } catch (const std::exception& e) {
         LOGE("Database initialization failed: %s", e.what());
@@ -49,11 +52,19 @@ void DatabaseManager::initialize_database() {
 std::optional<MasterConfig> DatabaseManager::get_master_config() {
     try {
         MasterConfig config;
-        SQLite::Statement query(db_, "SELECT value FROM master_config_v1 WHERE key = 'standard_timeout_sec'");
-        if (query.executeStep()) {
-            config.standard_timeout_sec = query.getColumn(0).getInt();
-            return config;
+        SQLite::Statement query(db_, "SELECT key, value FROM master_config_v2");
+        while (query.executeStep()) {
+            std::string key = query.getColumn(0).getString();
+            int value = query.getColumn(1).getInt();
+            if (key == "standard_timeout_sec") {
+                config.standard_timeout_sec = value;
+            } else if (key == "is_timed_unfreeze_enabled") {
+                config.is_timed_unfreeze_enabled = (value != 0);
+            } else if (key == "timed_unfreeze_interval_sec") {
+                config.timed_unfreeze_interval_sec = value;
+            }
         }
+        return config;
     } catch (const std::exception& e) {
         LOGE("Failed to get master config: %s", e.what());
     }
@@ -62,12 +73,14 @@ std::optional<MasterConfig> DatabaseManager::get_master_config() {
 
 bool DatabaseManager::set_master_config(const MasterConfig& config) {
     try {
-        SQLite::Statement query(db_, R"(
-            INSERT INTO master_config_v1 (key, value) VALUES ('standard_timeout_sec', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        )");
-        query.bind(1, config.standard_timeout_sec);
-        return query.exec() > 0;
+        SQLite::Transaction transaction(db_);
+        
+        db_.exec("INSERT OR REPLACE INTO master_config_v2 (key, value) VALUES ('standard_timeout_sec', " + std::to_string(config.standard_timeout_sec) + ")");
+        db_.exec("INSERT OR REPLACE INTO master_config_v2 (key, value) VALUES ('is_timed_unfreeze_enabled', " + std::to_string(config.is_timed_unfreeze_enabled ? 1 : 0) + ")");
+        db_.exec("INSERT OR REPLACE INTO master_config_v2 (key, value) VALUES ('timed_unfreeze_interval_sec', " + std::to_string(config.timed_unfreeze_interval_sec) + ")");
+
+        transaction.commit();
+        return true;
     } catch (const std::exception& e) {
         LOGE("Failed to set master config: %s", e.what());
         return false;

@@ -55,11 +55,7 @@ data class AppRuntimeState(
     val isForeground: Boolean = false
 )
 
-// --- [移除] Probe -> Daemon 指令模型，因为决策已移至Daemon ---
-// data class ProbeFreezePayload(...)
-// data class ProbeUnfreezePayload(...)
-
-// --- [新增] Probe -> Daemon 事件模型 ---
+// --- Probe -> Daemon 事件模型 ---
 data class AppStateEventPayload(
     @SerializedName("package_name")
     val packageName: String,
@@ -67,7 +63,7 @@ data class AppStateEventPayload(
     val userId: Int
 )
 
-// --- 配置模型 (UI -> Daemon -> Probe) (保持不变) ---
+// --- 配置模型 (UI -> Daemon -> Probe) ---
 data class FullConfigPayload(
     @SerializedName("master_config")
     val masterConfig: MasterConfig,
@@ -75,20 +71,25 @@ data class FullConfigPayload(
     val exemptConfig: ExemptConfig,
     @SerializedName("policies")
     val policies: List<AppPolicyPayload>,
-    // [新增] Daemon会附加此列表给Probe
     @SerializedName("frozen_uids") 
     val frozenUids: List<Int>? = null 
 )
 
+// [核心修复] 在 MasterConfig 中添加新字段，使其与 daemon 一致
 data class MasterConfig(
     @SerializedName("is_enabled")
     val isEnabled: Boolean = true,
     @SerializedName("freeze_on_screen_off")
-    val freezeOnScreenOff: Boolean = true
+    val freezeOnScreenOff: Boolean = true,
+    @SerializedName("standard_timeout_sec")
+    val standardTimeoutSec: Int = 90,
+    @SerializedName("is_timed_unfreeze_enabled")
+    val isTimedUnfreezeEnabled: Boolean = true,
+    @SerializedName("timed_unfreeze_interval_sec")
+    val timedUnfreezeIntervalSec: Int = 1800
 )
 
 data class ExemptConfig(
-    // [简化] 暂时只保留一个总开关
     @SerializedName("exempt_foreground_services")
     val exemptForegroundServices: Boolean = true
 )
@@ -101,7 +102,6 @@ data class AppPolicyPayload(
     val policy: Int // Corresponds to AppPolicy enum
 )
 
-// --- 通用键 (保持不变) ---
 data class AppInstanceKey(
     @SerializedName("package_name")
     val packageName: String,

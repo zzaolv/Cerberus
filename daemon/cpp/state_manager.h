@@ -34,9 +34,10 @@ struct AppRuntimeState {
     time_t background_since = 0;
     time_t observation_since = 0;
     time_t undetected_since = 0;
-
-    // [核心新增] 用于指数退避重试的计数器
     int freeze_retry_count = 0;
+
+    // [核心新增] 记录被调度的解冻任务在时间线中的索引
+    int scheduled_unfreeze_idx = -1;
 
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
@@ -72,8 +73,12 @@ private:
     bool is_critical_system_app(const std::string&) const;
     
     bool is_app_playing_audio(const AppRuntimeState& app);
+    
+    // [核心新增] 定时解冻相关的辅助函数
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
+    void cancel_timed_unfreeze(AppRuntimeState& app);
+
     bool check_timers();
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -86,6 +91,7 @@ private:
     
     GlobalStatsData global_stats_;
     
+    // [核心新增] 时间线环形缓冲区和时针
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     
