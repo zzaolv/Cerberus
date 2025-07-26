@@ -10,9 +10,12 @@
 #include <mutex>
 #include <unordered_set>
 #include <set>
+#include <chrono> // [新增]
 #include "database_manager.h"
 #include "system_monitor.h"
 #include "action_executor.h"
+#include "logger.h"                 // [新增]
+#include "time_series_database.h"   // [新增]
 
 using json = nlohmann::json;
 
@@ -42,12 +45,33 @@ struct AppRuntimeState {
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
+    // [新增] 用于统计的字段
+    long long last_foreground_timestamp_ms = 0;
+    long long total_runtime_ms = 0;    
+};
+
+// [新增] Doze状态机
+class DozeManager {
+public:
+    enum class State { AWAKE, IDLE, INACTIVE, DEEP_DOZE };
+    DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor);
+    void process_metrics(const MetricsRecord& record);
+private:
+    void enter_state(State new_state);
+    State current_state_ = State::AWAKE;
+    std::chrono::steady_clock::time_point state_change_timestamp_;
+    std::shared_ptr<Logger> logger_;
+    std::shared_ptr<ActionExecutor> action_executor_;
 };
 
 class StateManager {
 public:
-    StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>);
+    // [修改] 构造函数注入新依赖
+    StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
+                 std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
+    // [新增] 新的数据处理入口
+    void process_new_metrics(const MetricsRecord& record);
     bool tick_state_machine();
     bool perform_deep_scan();
     bool update_foreground_state(const std::set<int>& top_pids);
@@ -63,6 +87,7 @@ public:
     void on_temp_unfreeze_request_by_pid(const json& payload);
 
 private:
+    void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
     bool reconcile_process_state_full(); 
     void load_all_configs();
@@ -84,12 +109,15 @@ private:
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
+    std::shared_ptr<Logger> logger_; // [新增]
+    std::shared_ptr<TimeSeriesDatabase> ts_db_; // [新增]
+    
     MasterConfig master_config_;
-
+    std::unique_ptr<DozeManager> doze_manager_; // [新增]
     std::mutex state_mutex_;
     std::set<int> last_known_top_pids_;
     
-    GlobalStatsData global_stats_;
+    std::optional<MetricsRecord> last_metrics_record_;
     
     // [核心新增] 时间线环形缓冲区和时针
     uint32_t timeline_idx_ = 0;

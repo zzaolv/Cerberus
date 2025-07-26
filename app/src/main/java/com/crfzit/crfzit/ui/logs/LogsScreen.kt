@@ -1,24 +1,33 @@
+// app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
 package com.crfzit.crfzit.ui.logs
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogEntry
 import com.crfzit.crfzit.data.model.LogLevel
+import com.crfzit.crfzit.ui.stats.StatisticsScreen // [新增]
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
-    val logs by viewModel.logs.collectAsState()
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("事件时间线", "资源统计")
 
@@ -36,58 +45,92 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
                 }
             }
             when (selectedTab) {
-                0 -> EventTimeline(logs)
-                1 -> ResourceStatistics()
+                0 -> EventTimelineTab(viewModel)
+                1 -> StatisticsScreen() // [新增] 调用新的统计屏幕
             }
         }
     }
 }
 
 @Composable
-fun EventTimeline(logs: List<LogEntry>) {
-    LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        reverseLayout = true
-    ) {
-        items(logs, key = { it.timestamp }) { log ->
-            LogItem(log)
+fun EventTimelineTab(viewModel: LogsViewModel) {
+    val uiState by viewModel.uiState.collectAsState()
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (uiState.isLoading) {
+            CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                reverseLayout = true // 从底部开始显示
+            ) {
+                items(uiState.logs) { log ->
+                    LogItem(log)
+                }
+            }
+            // 滚动到底部（即最新日志）
+            LaunchedEffect(uiState.logs.size) {
+                 coroutineScope.launch {
+                     if (uiState.logs.isNotEmpty()) {
+                         listState.animateScrollToItem(uiState.logs.size - 1)
+                     }
+                 }
+            }
         }
     }
 }
 
+
 @Composable
 fun LogItem(log: LogEntry) {
-    val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
+    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val (icon, color) = getLogAppearance(log.level)
 
-    Row(verticalAlignment = Alignment.Top) {
-        Text(
-            text = "${formatter.format(Date(log.timestamp))} $icon",
-            color = color,
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(end = 8.dp)
-        )
-        Text(log.message, style = MaterialTheme.typography.bodySmall)
+    val annotatedString = buildAnnotatedString {
+        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+            append(formatter.format(Date(log.timestamp)))
+        }
+        append(" | ")
+        withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
+            append("$icon[${log.category}]")
+        }
+        append(" | ")
+        append(log.message)
     }
+
+    Text(
+        text = annotatedString,
+        style = MaterialTheme.typography.bodySmall.copy(
+            fontFamily = FontFamily.Monospace,
+            lineHeight = 16.sp
+        ),
+        modifier = Modifier.fillMaxWidth()
+    )
 }
 
-@Composable
-fun ResourceStatistics() {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text("资源统计图表 (待实现)")
-    }
-}
-
-// <-- 关键修正：将此函数标记为 @Composable
+// [修改] getLogAppearance 适配新的 LogLevel
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {
     return when (level) {
         LogLevel.INFO -> "ℹ️" to MaterialTheme.colorScheme.outline
-        LogLevel.SUCCESS -> "✅" to Color(0xFF34A853) // Green
-        LogLevel.WARNING -> "⚠️" to Color(0xFFFBBC05) // Yellow
+        LogLevel.SUCCESS -> "✅" to Color(0xFF34A853)
+        LogLevel.WARN -> "⚠️" to Color(0xFFFBBC05)
         LogLevel.ERROR -> "❌" to MaterialTheme.colorScheme.error
-        // 现在可以安全地访问 MaterialTheme.colorScheme 了
         LogLevel.EVENT -> "⚡" to MaterialTheme.colorScheme.primary
+        LogLevel.DOZE -> "🌙" to Color(0xFF6650a4)
+        LogLevel.BATTERY -> "🔋" to Color(0xFF0B8043)
+        LogLevel.REPORT -> "📊" to Color(0xFF1A73E8)
+        LogLevel.ACTION_OPEN -> "▶️" to Color.Unspecified
+        LogLevel.ACTION_CLOSE -> "⏹️" to MaterialTheme.colorScheme.onSurfaceVariant
+        LogLevel.ACTION_FREEZE -> "❄️" to Color(0xFF4285F4)
+        LogLevel.ACTION_UNFREEZE -> "☀️" to Color(0xFFF4B400)
+        LogLevel.ACTION_DELAY -> "🤣" to Color(0xFFE52592)
+        LogLevel.TIMER -> "⏰" to Color(0xFFF25622)
+        LogLevel.BATCH_PARENT -> "📦" to Color.Unspecified
     }
 }

@@ -108,3 +108,27 @@ data class AppInstanceKey(
     @SerializedName("user_id")
     val userId: Int
 )
+
+// [新增] 用于反序列化日志条目的模型
+data class LogEntryPayload(
+    val timestamp: Long,
+    val level: Int,
+    val category: String,
+    val message: String,
+    @SerializedName("package_name") val packageName: String?,
+    @SerializedName("user_id") val userId: Int?
+)
+
+// [新增] 用于反序列化统计记录的模型
+data class MetricsRecordPayload(
+    val timestamp: Long,
+    @SerializedName("cpu_usage_percent") val cpuUsagePercent: Float,
+    @SerializedName("mem_used_kb") val memUsedKb: Long,
+    @SerializedName("battery_level") val batteryLevel: Int,
+    @SerializedName("battery_temp_celsius") val batteryTempCelsius: Float,
+    @SerializedName("battery_power_watt") val batteryPowerWatt: Float,
+    @SerializedName("is_charging") val isCharging: Boolean,
+    @SerializedName("is_screen_on") val isScreenOn: Boolean,
+    @SerializedName("is_audio_playing") val isAudioPlaying: Boolean,
+    @SerializedName("is_location_active") val isLocationActive: Boolean
+)

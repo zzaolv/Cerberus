@@ -2,6 +2,7 @@
 #ifndef CERBERUS_SYSTEM_MONITOR_H
 #define CERBERUS_SYSTEM_MONITOR_H
 
+#include "time_series_database.h" // [新增] 引入新的头文件
 #include <string>
 #include <mutex>
 #include <map>
@@ -10,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <optional> // [新增]
 
 struct GlobalStatsData {
     float total_cpu_usage_percent = 0.0f;
@@ -42,7 +44,9 @@ public:
     SystemMonitor();
     ~SystemMonitor();
     
-    void update_global_stats();
+    // [修改] 接口现在返回一个完整的 MetricsRecord
+    std::optional<MetricsRecord> collect_current_metrics();
+    
     GlobalStatsData get_global_stats() const;
 
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
@@ -65,11 +69,12 @@ public:
     NetworkSpeed get_cached_network_speed(int uid);
 
 private:
-    void update_cpu_usage();
-    void update_mem_info();
-    void top_app_monitor_thread();
-    
-    // [核心修复] 在类的私有部分声明 get_pid_from_pkg 函数
+    // [新增] 增加新的私有采集函数
+    void update_cpu_usage(float& usage);
+    void update_mem_info(long& total, long& available, long& swap_total, long& swap_free);
+    bool get_screen_state();
+    void get_battery_stats(int& level, float& temp, float& power, bool& charging);
+
     int get_pid_from_pkg(const std::string& pkg_name);
 
     struct TotalCpuTimes {
@@ -84,6 +89,7 @@ private:
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
+    // ... (其他私有成员保持不变)
     std::set<int> last_known_top_pids_;
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};
@@ -109,7 +115,6 @@ private:
     std::chrono::steady_clock::time_point last_snapshot_time_;
     mutable std::mutex speed_mutex_;
     std::map<int, NetworkSpeed> uid_network_speed_;
-
 };
 
 #endif //CERBERUS_SYSTEM_MONITOR_H

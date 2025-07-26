@@ -4,6 +4,7 @@
         "functional": "cpp",
         "filesystem": "cpp",
         "xstring": "cpp",
-        "set": "cpp"
+        "set": "cpp",
+        "memory": "cpp"
     }
 }

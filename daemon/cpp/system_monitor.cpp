@@ -30,6 +30,16 @@
 
 namespace fs = std::filesystem;
 
+// [新增] 辅助函数，安全读取文件内容
+static std::optional<long> read_long_from_file(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return std::nullopt;
+    long value;
+    file >> value;
+    if (file.fail()) return std::nullopt;
+    return value;
+}
+
 int get_uid_from_pid(int pid) {
     char path_buffer[64];
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
@@ -46,11 +56,101 @@ SystemMonitor::SystemMonitor() {
     } else {
         LOGE("Could not find top-app tasks file. Active monitoring disabled.");
     }
-    update_global_stats();
+    float dummy_usage;
+    update_cpu_usage(dummy_usage)
 }
 
 SystemMonitor::~SystemMonitor() {
     stop_top_app_monitor();
+    stop_network_snapshot_thread(); // [新增] 确保网络监控也停止    
+}
+
+// [修改] 核心采集函数
+std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
+    MetricsRecord record;
+    record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    update_cpu_usage(record.cpu_usage_percent);
+    update_mem_info(current_stats_.total_mem_kb, record.mem_used_kb, current_stats_.swap_total_kb, current_stats_.swap_free_kb);
+    record.mem_used_kb = current_stats_.total_mem_kb - record.mem_used_kb; // 计算已用内存
+    
+    get_battery_stats(record.battery_level, record.battery_temp_celsius, record.battery_power_watt, record.is_charging);
+    record.is_screen_on = get_screen_state();
+
+    // 复用现有已更新的状态
+    {
+        std::lock_guard<std::mutex> lock(audio_uids_mutex_);
+        record.is_audio_playing = !uids_playing_audio_.empty();
+    }
+    {
+        std::lock_guard<std::mutex> lock(location_uids_mutex_);
+        record.is_location_active = !uids_using_location_.empty();
+    }
+    
+    // 更新内部的 GlobalStatsData (部分数据)
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        current_stats_.total_cpu_usage_percent = record.cpu_usage_percent;
+        current_stats_.avail_mem_kb = current_stats_.total_mem_kb - record.mem_used_kb;
+    }
+
+    return record;
+}
+
+// [新增] 获取屏幕状态
+bool SystemMonitor::get_screen_state() {
+    // 使用 dumpsys power 是最可靠的方式之一
+    std::string result = exec_shell_pipe("dumpsys power | grep -E 'mWakefulness|mScreenState' | head -n 1");
+    // Android 10+ uses mWakefulness=Awake/Asleep, older versions use mScreenState=ON/OFF
+    return result.find("Awake") != std::string::npos || result.find("ON") != std::string::npos;
+}
+
+// [新增] 获取电池统计信息
+void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, bool& charging) {
+    const std::string battery_path = "/sys/class/power_supply/battery/";
+    const std::string bms_path = "/sys/class/power_supply/bms/"; // 有些设备(如小米)使用bms
+
+    std::string final_path = fs::exists(battery_path) ? battery_path : (fs::exists(bms_path) ? bms_path : "");
+    if (final_path.empty()) {
+        level = -1; temp = 0.0f; power = 0.0f; charging = false;
+        return;
+    }
+
+    level = read_long_from_file(final_path + "capacity").value_or(-1);
+    
+    auto temp_raw = read_long_from_file(final_path + "temp");
+    if (temp_raw.has_value()) {
+        // 根据您的分析，原始值是三位数，代表实际温度的10倍
+        temp = static_cast<float>(*temp_raw) / 10.0f;
+    } else {
+        temp = 0.0f;
+    }
+
+    auto current_now_ua = read_long_from_file(final_path + "current_now");
+    auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
+    
+    if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
+        // Power (W) = Voltage (V) * Current (A)
+        // Voltage = voltage_now (uV) / 1,000,000
+        // Current = current_now (uA) / 1,000,000 (注意：文档中为1000，但uA到A是10^6)
+        // 为了避免浮点数精度问题，我们先计算微瓦(uW)，再转为瓦(W)
+        // power (uW) = voltage_now * current_now / 1,000,000
+        // 文档指示 current_now 除以 1000，我将遵循这个，这可能意味着单位是mA
+        double current_a = static_cast<double>(*current_now_ua) / 1000.0; // uA to A
+        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0; // uV to V
+        power = static_cast<float>(std::abs(current_a * voltage_v));
+    } else {
+        power = 0.0f;
+    }
+
+    std::ifstream status_file(final_path + "status");
+    std::string status;
+    if(status_file >> status) {
+        charging = (status == "Charging" || status == "Full");
+    } else {
+        charging = false;
+    }
 }
 
 void SystemMonitor::start_top_app_monitor() {
@@ -570,7 +670,7 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
     return "Unknown";
 }
 
-void SystemMonitor::update_cpu_usage() {
+void SystemMonitor::update_cpu_usage(float& usage) {
     std::ifstream stat_file("/proc/stat");
     if (!stat_file.is_open()) return;
     std::string line;
@@ -586,32 +686,27 @@ void SystemMonitor::update_cpu_usage() {
         long long delta_total = current_total - prev_total;
         if (delta_total > 0) {
             long long delta_idle = current_times.idle_total() - prev_total_cpu_times_.idle_total();
-            float cpu_usage = 100.0f * static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total);
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            current_stats_.total_cpu_usage_percent = std::max(0.0f, cpu_usage);
+            usage = 100.0f * static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total);
+            usage = std::max(0.0f, std::min(100.0f, usage));
+        } else {
+            usage = 0.0f;
         }
         prev_total_cpu_times_ = current_times;
     }
 }
 
-void SystemMonitor::update_mem_info() {
+void SystemMonitor::update_mem_info(long& total, long& available, long& swap_total, long& swap_free) {
     std::ifstream meminfo_file("/proc/meminfo");
     if (!meminfo_file.is_open()) return;
     std::string line;
-    long mem_total = 0, mem_available = 0, swap_total = 0, swap_free = 0;
     while (std::getline(meminfo_file, line)) {
         std::string key;
         long value;
         std::stringstream ss(line);
         ss >> key >> value;
-        if (key == "MemTotal:") mem_total = value;
-        else if (key == "MemAvailable:") mem_available = value;
+        if (key == "MemTotal:") total = value;
+        else if (key == "MemAvailable:") available = value;
         else if (key == "SwapTotal:") swap_total = value;
         else if (key == "SwapFree:") swap_free = value;
     }
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    current_stats_.total_mem_kb = mem_total;
-    current_stats_.avail_mem_kb = mem_available;
-    current_stats_.swap_total_kb = swap_total;
-    current_stats_.swap_free_kb = swap_free;
 }
