@@ -14,13 +14,23 @@
 #include <csignal>
 #include <algorithm>
 #include <fcntl.h>
+#include <vector>
 
-#define LOG_TAG "cerberusd_action_v4_robust"
+#define LOG_TAG "cerberusd_action_v5_strategic"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// 辅助函数：通过PID获取UID
+static int get_uid_from_pid(int pid) {
+    char path_buffer[64];
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+    struct stat st;
+    if (stat(path_buffer, &st) != 0) return -1;
+    return st.st_uid;
+}
 
 ActionExecutor::ActionExecutor() {
     initialize_binder();
@@ -31,124 +41,120 @@ ActionExecutor::~ActionExecutor() {
     cleanup_binder();
 }
 
-// =========================================================================================
-// [核心重构] `freeze` 函数现在是战术指挥官
-// =========================================================================================
+// [核心重构] 采用新的“分级冻结”策略
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
-    if (pids.empty()) return 0; // 成功
+    if (pids.empty()) return 0;
 
-    // 步骤 1: 调用情报官，获取Binder冻结结果
-    int binder_result = handle_binder_freeze(pids, true);
-
-    // 步骤 2: 根据情报执行战术决策
-    switch (binder_result) {
-        case 0: { // Binder全部成功
-            LOGI("Binder freeze successful for %s. Proceeding with physical freeze.", key.first.c_str());
-            // 优先cgroup，SIGSTOP兜底
-            bool physical_ok = freeze_cgroup(key, pids);
-            if (!physical_ok) {
-                LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
-                freeze_sigstop(pids);
-            }
-            return 0; // 最终成功
-        }
-        case 1: // 软失败 (EAGAIN)
-            LOGW("Binder freeze for %s resulted in soft failure (EAGAIN). Will retry later.", key.first.c_str());
-            // 无需做任何事，直接向上层报告需要重试
-            return 1; // 需要重试
-        
-        case -1: // 硬失败 (EINVAL/EPERM)
-            LOGW("Binder freeze for %s resulted in hard failure (EINVAL/EPERM). Fallback to SIGSTOP only.", key.first.c_str());
-            // 智能降级: 放弃有风险的cgroup冻结，直接使用更强力的SIGSTOP
-            freeze_sigstop(pids);
-            return 0; // 接受降级后的成功
-
-        case -2: // 致命失败
-        default:
-            LOGE("Binder freeze for %s resulted in fatal failure. Aborting freeze.", key.first.c_str());
-            // 无法继续，报告彻底失败
-            return -1; // 彻底失败
+    // 步骤 1: 识别主进程
+    // 通常一个应用实例的所有进程UID相同。我们先获取一个基准UID。
+    int target_uid = -1;
+    if (!pids.empty()) {
+        target_uid = get_uid_from_pid(pids[0]);
     }
+    if (target_uid == -1) {
+        LOGE("Could not get UID for pids of %s. Aborting freeze.", key.first.c_str());
+        return -1; // 致命失败
+    }
+    
+    // 找出所有与应用UID完全匹配的进程作为“主进程组”
+    std::vector<int> main_pids;
+    std::vector<int> secondary_pids;
+    for (int pid : pids) {
+        if (get_uid_from_pid(pid) == target_uid) {
+            main_pids.push_back(pid);
+        } else {
+            secondary_pids.push_back(pid);
+        }
+    }
+    
+    // 步骤 2: 对主进程组执行严格的Binder冻结
+    LOGI("Freezing main pids for %s...", key.first.c_str());
+    int main_binder_result = handle_binder_freeze_strict(main_pids, true);
+
+    switch (main_binder_result) {
+        case 1: // 软失败
+            LOGW("Strict binder freeze on main pids of %s failed (EAGAIN). Rolling back and retrying later.", key.first.c_str());
+            handle_binder_freeze_lenient(main_pids, false); // 回滚
+            return 1; // 向上层报告需要重试
+        case -1: // 硬失败或致命失败
+            LOGE("Strict binder freeze on main pids of %s failed critically. Aborting.", key.first.c_str());
+            handle_binder_freeze_lenient(main_pids, false); // 尽力回滚
+            return -1; // 向上层报告彻底失败
+    }
+
+    // 步骤 3: 对次要进程组（如果有）执行宽容的Binder冻结
+    if (!secondary_pids.empty()) {
+        LOGI("Freezing secondary pids for %s...", key.first.c_str());
+        handle_binder_freeze_lenient(secondary_pids, true);
+    }
+    
+    // 步骤 4: 执行物理冻结
+    LOGI("Binder freeze phase completed for %s. Proceeding with physical freeze.", key.first.c_str());
+    bool physical_ok = freeze_cgroup(key, pids);
+    if (!physical_ok) {
+        LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
+        freeze_sigstop(pids);
+    }
+
+    return 0; // 最终成功
 }
 
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     unfreeze_cgroup(key);
     unfreeze_sigstop(pids);
-    handle_binder_freeze(pids, false); // 尝试解冻Binder，即使失败也要继续
+    // 解冻时，对所有进程都执行宽容的解冻即可
+    handle_binder_freeze_lenient(pids, false); 
     LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
     return true;
 }
 
-// =========================================================================================
-// [核心重构] `handle_binder_freeze` 函数现在是情报官
-// =========================================================================================
-int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
+// [核心新增] 严格的Binder冻结，用于主进程。任何失败都会中止并返回错误。
+int ActionExecutor::handle_binder_freeze_strict(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0 || pids.empty()) return 0;
-
-    bool has_soft_failure = false;
-    bool has_hard_failure = false;
-    std::vector<int> successfully_frozen_pids;
-
+    
+    std::vector<int> successfully_processed_pids;
     binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
 
     for (int pid : pids) {
         info.pid = pid;
         bool op_success = false;
-        
-        // --- 微重试循环 ---
-        for (int retry = 0; retry < 3; ++retry) { // 重试3次
+        for (int retry = 0; retry < 3; ++retry) {
             if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
                 op_success = true;
-                break; // 成功，退出重试循环
+                break;
             }
-            
-            // 如果不是EAGAIN，或者这是最后一次重试，则处理错误并跳出
             if (errno != EAGAIN || retry == 2) {
-                switch (errno) {
-                    case EAGAIN:
-                        has_soft_failure = true;
-                        LOGW("Binder op for pid %d has pending transactions (EAGAIN) after all retries.", info.pid);
-                        break;
-                    case EINVAL:
-                    case EPERM:
-                        has_hard_failure = true;
-                        LOGW("Binder op for pid %d failed with hard error: %s", info.pid, strerror(errno));
-                        break;
-                    default:
-                        LOGE("Binder op for pid %d failed with fatal error: %s", info.pid, strerror(errno));
-                        if (freeze && !successfully_frozen_pids.empty()) {
-                            LOGE("Rolling back fatally failed binder freeze op...");
-                            handle_binder_freeze(successfully_frozen_pids, false);
-                        }
-                        return -2; // 致命失败
-                }
-                goto next_pid; // 跳到外层循环的下一个pid
+                // 任何非EAGAIN的错误，或EAGAIN重试耗尽，都视为失败
+                LOGW("Strict binder op for pid %d failed: %s", info.pid, strerror(errno));
+                return (errno == EAGAIN) ? 1 : -1; // 1 for soft fail, -1 for hard fail
             }
-            
-            // 等待50毫秒再重试
             usleep(50000); 
         }
-
-        if (op_success && freeze) {
-            successfully_frozen_pids.push_back(pid);
-        }
-        
-        next_pid:;
-    }
-
-    // 如果是冻结操作，且过程中出现了任何失败，则回滚所有已成功的冻结，保证原子性
-    if (freeze && (has_soft_failure || has_hard_failure)) {
-        if (!successfully_frozen_pids.empty()) {
-            LOGW("Rolling back partially successful binder freeze due to errors...");
-            handle_binder_freeze(successfully_frozen_pids, false);
+        if (op_success) {
+            successfully_processed_pids.push_back(pid);
         }
     }
-
-    if (has_hard_failure) return -1;
-    if (has_soft_failure) return 1;
-    
-    return 0;
+    return 0; // 全部成功
 }
+
+// [核心新增] 宽容的Binder冻结，用于次要进程和解冻。忽略EAGAIN错误。
+void ActionExecutor::handle_binder_freeze_lenient(const std::vector<int>& pids, bool freeze) {
+    if (binder_state_.fd < 0 || pids.empty()) return;
+
+    binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
+
+    for (int pid : pids) {
+        info.pid = pid;
+        if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) < 0) {
+            if (errno == EAGAIN) {
+                LOGW("Lenient binder op for pid %d has pending transactions (EAGAIN). Ignoring.", info.pid);
+            } else {
+                LOGE("Lenient binder op for pid %d failed with error: %s", info.pid, strerror(errno));
+            }
+        }
+    }
+}
+
 
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
