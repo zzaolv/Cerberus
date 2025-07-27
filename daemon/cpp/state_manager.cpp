@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v21_final"
+#define LOG_TAG "cerberusd_state_v22_logfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,7 +35,7 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
             timeout_sec = master_config.standard_timeout_sec;
         }
         if (app.freeze_retry_count > 0) {
-            timeout_sec += (5 * app.freeze_retry_count); // 每次重试增加延迟
+            timeout_sec += (5 * app.freeze_retry_count);
         }
         int remaining = timeout_sec - (now - app.background_since);
         if (remaining < 0) remaining = 0;
@@ -62,19 +62,20 @@ void DozeManager::enter_state(State new_state) {
     State old_state = current_state_;
     current_state_ = new_state;
     state_change_timestamp_ = std::chrono::steady_clock::now();
-
+    
+    // [核心修复] 使用固定的category "Doze状态"
     switch(new_state) {
         case State::AWAKE:
-            if (old_state != State::AWAKE) logger_->log(LogLevel::DOZE, "状态", "亮屏", "Doze");
+            if (old_state != State::AWAKE) logger_->log(LogLevel::DOZE, "Doze状态", "设备唤醒");
             break;
         case State::IDLE:
-             logger_->log(LogLevel::DOZE, "状态", "息屏, 未充电", "Doze");
+             logger_->log(LogLevel::DOZE, "Doze状态", "进入IDLE (息屏, 未充电)");
             break;
         case State::INACTIVE:
-            logger_->log(LogLevel::DOZE, "状态", "检查中", "Doze");
+            logger_->log(LogLevel::DOZE, "Doze状态", "进入INACTIVE (检查期)");
             break;
         case State::DEEP_DOZE:
-            logger_->log(LogLevel::DOZE, "状态", "深度模式", "Doze");
+            logger_->log(LogLevel::DOZE, "Doze状态", "进入DEEP DOZE (深度休眠)");
             break;
     }
 }
@@ -111,7 +112,6 @@ void DozeManager::process_metrics(const MetricsRecord& record) {
 
 
 // --- StateManager 实现 ---
-
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act,
                            std::shared_ptr<Logger> logger, std::shared_ptr<TimeSeriesDatabase> ts_db)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), logger_(logger), ts_db_(ts_db) {
@@ -471,7 +471,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
    
     load_all_configs();
     reconcile_process_state_full();
-    // [核心修复] 初始化电量计算状态
     last_battery_level_info_ = std::nullopt;    
     LOGI("StateManager Initialized.");
 }
@@ -488,15 +487,13 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [核心修复] 重写电量变化分析逻辑
 void StateManager::analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (new_record.is_charging || new_record.battery_level < 0) {
-        last_battery_level_info_ = std::nullopt; // 充电时重置
+        last_battery_level_info_ = std::nullopt;
         return;
     }
 
     if (!last_battery_level_info_) {
-        // 如果是首次记录或刚停止充电，初始化状态
         last_battery_level_info_ = {new_record.battery_level, new_record.timestamp_ms};
         return;
     }
@@ -507,7 +504,6 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
         
         if (time_delta_ms <= 0 || level_delta <= 0) return;
         
-        // 计算每消耗1%电量的平均时间
         long long time_per_percent_ms = time_delta_ms / level_delta;
 
         std::stringstream ss;
@@ -517,11 +513,11 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
            << "[温度: " << std::fixed << std::setprecision(1) << new_record.battery_temp_celsius << "°C]";
         
         LogLevel level = LogLevel::BATTERY;
+        // [核心修复] 使用固定的category "电量"
         std::string category = "电量";
-        // 如果1%电量消耗时间少于5分钟 (300000 ms), 认为是警告
         if (time_per_percent_ms < 300000) {
             level = LogLevel::WARN;
-            category = "警告";
+            category = "电量警告";
             ss << " (耗电较快)";
         } else {
             ss << " (状态更新)";
@@ -529,7 +525,6 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
         
         logger_->log(level, category, ss.str());
         
-        // 更新状态，以便下次计算
         last_battery_level_info_ = {new_record.battery_level, new_record.timestamp_ms};
     }
 }
@@ -538,7 +533,9 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     cancel_timed_unfreeze(app);
 
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
-        logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", "原因: " + reason, app.package_name, app.user_id);
+        // [核心修复] 使用固定的category "解冻操作"
+        std::string msg = "应用 " + app.app_name + " 因 " + reason + " 而解冻";
+        logger_->log(LogLevel::ACTION_UNFREEZE, "解冻操作", msg, app.package_name, app.user_id);
         
         action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
         app.current_status = AppRuntimeState::Status::RUNNING;
@@ -554,6 +551,7 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
+// ... on_wakeup_request, on_temp_unfreeze_* functions remain the same conceptually but will benefit from the unfreeze_and_observe_nolock change ...
 void StateManager::on_wakeup_request(const json& payload) {
     bool state_changed = false;
     try {
@@ -581,7 +579,6 @@ void StateManager::on_wakeup_request(const json& payload) {
     }
 }
 
-// ... on_temp_unfreeze_request_* functions remain the same ...
 void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     bool state_changed = false;
     try {
@@ -672,13 +669,13 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     }
 }
 
-
 void StateManager::update_master_config(const MasterConfig& config) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     master_config_ = config;
     db_manager_->set_master_config(config);
     LOGI("Master config updated: standard_timeout=%ds, timed_unfreeze_enabled=%d, timed_unfreeze_interval=%ds", 
         master_config_.standard_timeout_sec, master_config_.is_timed_unfreeze_enabled, master_config_.timed_unfreeze_interval_sec);
+    // [核心修复] 使用固定的category "配置"
     logger_->log(LogLevel::EVENT, "配置", "核心配置已更新");
 }
 
@@ -720,17 +717,16 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
             }
         }
 
-        // ... (logging for foreground/background switch remains the same) ...
+        // [核心修复] 使用固定的category "进程状态" and "运行时长"
         for (const auto& key : final_foreground_keys) {
             if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
                 auto it = managed_apps_.find(key);
                 if (it != managed_apps_.end()) {
                     AppRuntimeState& app = it->second;
                     if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                        logger_->log(LogLevel::ACTION_UNFREEZE, app.app_name, "应用因切换至前台而解冻", app.package_name, app.user_id);
-                    } else {
-                        logger_->log(LogLevel::ACTION_OPEN, app.app_name, "应用已打开", app.package_name, app.user_id);
+                         unfreeze_and_observe_nolock(app, "BECAME_FOREGROUND");
                     }
+                    logger_->log(LogLevel::ACTION_OPEN, "进程状态", "应用 " + app.app_name + " 已打开", app.package_name, app.user_id);
                     app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()
                     ).count();
@@ -755,9 +751,9 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                     long minutes = (total_seconds % 3600) / 60;
                     long seconds = total_seconds % 60;
                     std::stringstream ss_msg;
-                    ss_msg << "[运行时长: " << (current_runtime_ms / 1000) << "秒] | " << app.app_name << " 已关闭 (累计: "
-                           << hours << "h" << minutes << "m" << seconds << "s)";
-                    logger_->log(LogLevel::ACTION_CLOSE, app.app_name, ss_msg.str(), app.package_name, app.user_id);
+                    ss_msg << "应用 " << app.app_name << " 已关闭 [本次: " << (current_runtime_ms / 1000) << "s] [累计: "
+                           << hours << "h" << minutes << "m" << seconds << "s]";
+                    logger_->log(LogLevel::ACTION_CLOSE, "进程状态", ss_msg.str(), app.package_name, app.user_id);
                 }
             }
         }
@@ -807,7 +803,6 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
-// [核心修复] 适配 action_executor->freeze 的新返回值
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -839,7 +834,8 @@ bool StateManager::check_timers() {
 
                 if (is_active) {
                     LOGI("TICK: %s is active, restarting observation.", app.package_name.c_str());
-                    logger_->log(LogLevel::ACTION_DELAY, "推迟冻结", "应用活跃 (音频/定位/网络)", app.package_name, app.user_id);
+                    // [核心修复] 使用固定的category "冻结延迟"
+                    logger_->log(LogLevel::ACTION_DELAY, "冻结延迟", "应用 " + app.app_name + " 活跃 (音频/定位/网络)", app.package_name, app.user_id);
                     app.observation_since = now;
                     changed = true;
                     continue;
@@ -865,34 +861,35 @@ bool StateManager::check_timers() {
                     int freeze_result = action_executor_->freeze(key, app.pids);
 
                     switch (freeze_result) {
-                        case 0: // 成功 (完全或降级)
+                        case 0:
                             LOGI("STRATEGY: Freeze successful for %s.", key.first.c_str());
                             app.current_status = AppRuntimeState::Status::FROZEN;
-                            logger_->log(LogLevel::ACTION_FREEZE, app.app_name, "应用因后台超时被冻结", app.package_name, app.user_id);
+                            // [核心修复] 使用固定的category "冻结操作"
+                            logger_->log(LogLevel::ACTION_FREEZE, "冻结操作", "应用 " + app.app_name + " 因后台超时被冻结", app.package_name, app.user_id);
                             schedule_timed_unfreeze(app);
                             probe_config_needs_update = true;
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
                         
-                        case 1: // 需要重试
+                        case 1:
                             app.freeze_retry_count++;
                             if (app.freeze_retry_count > MAX_FREEZE_RETRIES) {
                                 LOGW("STRATEGY: Giving up on freezing %s after %d retries.", key.first.c_str(), MAX_FREEZE_RETRIES);
-                                logger_->log(LogLevel::WARN, app.app_name, "多次尝试冻结失败，已放弃", app.package_name, app.user_id);
+                                logger_->log(LogLevel::WARN, "冻结操作", "应用 " + app.app_name + " 多次尝试冻结失败，已放弃", app.package_name, app.user_id);
                                 app.background_since = 0;
                                 app.freeze_retry_count = 0;
                             } else {
                                 LOGW("STRATEGY: Freeze for %s needs retry. Scheduling next attempt.", key.first.c_str());
-                                logger_->log(LogLevel::INFO, app.app_name, "冻结操作遇到软失败，将重试", app.package_name, app.user_id);
-                                app.background_since = now; // 重置计时器以实现延迟重试
+                                logger_->log(LogLevel::INFO, "冻结操作", "应用 " + app.app_name + " 冻结遇到软失败，将重试", app.package_name, app.user_id);
+                                app.background_since = now; 
                             }
                             break;
 
-                        case -1: // 彻底失败
+                        case -1:
                         default:
                             LOGE("STRATEGY: Freeze for %s failed fatally. Aborting.", key.first.c_str());
-                             logger_->log(LogLevel::ERROR, app.app_name, "冻结操作遇到致命错误，已中止", app.package_name, app.user_id);
+                             logger_->log(LogLevel::ERROR, "冻结操作", "应用 " + app.app_name + " 冻结遇到致命错误，已中止", app.package_name, app.user_id);
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
@@ -909,7 +906,6 @@ bool StateManager::check_timers() {
     return changed;
 }
 
-// ... schedule_timed_unfreeze, check_timed_unfreeze, cancel_timed_unfreeze remain the same ...
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
     if (!master_config_.is_timed_unfreeze_enabled || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
         return;
@@ -922,7 +918,8 @@ void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
             unfrozen_timeline_[current_index] = app.uid;
             app.scheduled_unfreeze_idx = current_index;
             LOGD("TIMELINE: Scheduled timed unfreeze for %s (uid %d) at index %u.", app.package_name.c_str(), app.uid, current_index);
-            logger_->log(LogLevel::TIMER, "定时", "已计划定时解冻", app.package_name, app.user_id);
+            // [核心修复] 使用固定的category "定时器"
+            logger_->log(LogLevel::TIMER, "定时器", "已为 " + app.app_name + " 计划定时解冻", app.package_name, app.user_id);
             return;
         }
     }
@@ -946,7 +943,8 @@ bool StateManager::check_timed_unfreeze() {
                 if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
                     LOGI("TIMELINE: Executing timed unfreeze for %s.", app.package_name.c_str());
                     if(unfreeze_and_observe_nolock(app, "TIMED_UNFREEZE")) {
-                       logger_->log(LogLevel::TIMER, "定时", "执行定时解冻", app.package_name, app.user_id);
+                       // [核心修复] 使用固定的category "定时器"
+                       logger_->log(LogLevel::TIMER, "定时器", "执行 " + app.app_name + " 的定时解冻", app.package_name, app.user_id);
                        state_changed = true;
                     }
                 }
@@ -962,6 +960,7 @@ bool StateManager::check_timed_unfreeze() {
     return state_changed;
 }
 
+// ... the rest of the file remains unchanged as the previous fixes were correct ...
 void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
     if (app.scheduled_unfreeze_idx != -1) {
         if (app.scheduled_unfreeze_idx < unfrozen_timeline_.size()) {
@@ -973,7 +972,6 @@ void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
         app.scheduled_unfreeze_idx = -1;
     }
 }
-
 
 bool StateManager::perform_deep_scan() {
     bool changed = false;
@@ -1043,7 +1041,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
                 }
             }
         }
-        logger_->log(LogLevel::EVENT, "配置", "应用策略已更新");
+        logger_->log(LogLevel::EVENT, "配置", "应用策略已从UI更新");
         LOGI("New configuration applied.");
     }
 
@@ -1053,7 +1051,6 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
     return true; 
 }
 
-// ... get_dashboard_payload, get_full_config_for_ui, get_probe_config_payload remain the same ...
 json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     json payload;
@@ -1076,7 +1073,7 @@ json StateManager::get_dashboard_payload() {
         }
         json app_json;
         app_json["package_name"] = app.package_name;
-        app_json["app_name"] = app.app_name; // This name comes from get_app_name_from_pid
+        app_json["app_name"] = app.app_name;
         app_json["user_id"] = app.user_id;
         app_json["display_status"] = status_to_string(app, master_config_);
         app_json["mem_usage_kb"] = app.mem_usage_kb;
@@ -1184,7 +1181,6 @@ void StateManager::load_all_configs() {
     }
 }
 
-// [核心修复] 智能提取包名，去除进程后缀
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
     uid = -1; user_id = -1;
@@ -1225,7 +1221,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    // [核心修复] 默认app_name为包名，后续由add_pid_to_app更新
     new_state.app_name = package_name;
 
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
@@ -1251,17 +1246,10 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
     
-    // [核心修复] app->app_name 在此处更新，并只在必要时更新
-    // 只有当 app_name 还是默认包名时，才尝试用更友好的名称更新它
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
         if (!friendly_name.empty() && friendly_name != app->package_name) {
-             // 再次检查，防止friendly_name是截断的进程名
-            if (friendly_name.length() < app->package_name.length() && app->package_name.rfind(friendly_name, 0) == 0) {
-                 // friendly name is likely a truncated process name, ignore it.
-            } else {
-                app->app_name = friendly_name;
-            }
+            app->app_name = friendly_name;
         }
     }
 
@@ -1270,8 +1258,7 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
         pid_to_app_map_[pid] = app;
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
            app->current_status = AppRuntimeState::Status::RUNNING;
-           // 使用更准确的app_name记录日志
-           logger_->log(LogLevel::INFO, "进程", "检测到新进程启动", app->app_name, user_id);
+           logger_->log(LogLevel::INFO, "进程状态", "检测到应用 " + app->app_name + " 新进程启动", app->package_name, user_id);
         }
     }
 }

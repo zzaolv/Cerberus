@@ -66,9 +66,14 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
-                // reverseLayout = true, // 从底部开始显示
             ) {
-                items(uiState.logs, key = { it.originalLog.timestamp.toString() + it.originalLog.message }) { log ->
+                // [核心修复] 使用一个绝对唯一的 key 来防止闪退
+                items(
+                    items = uiState.logs, 
+                    key = { log -> 
+                        "${log.originalLog.timestamp}-${log.originalLog.packageName}-${log.originalLog.userId}-${log.originalLog.message}" 
+                    }
+                ) { log ->
                     LogItem(log)
                 }
             }
@@ -76,7 +81,7 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
             // 当有新日志时，自动滚动到底部
             LaunchedEffect(uiState.logs.size) {
                  coroutineScope.launch {
-                     if (uiState.logs.isNotEmpty()) {
+                     if (uiState.logs.size > 1 && listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index == listState.layoutInfo.totalItemsCount - 2) {
                          listState.animateScrollToItem(uiState.logs.size - 1)
                      }
                  }
@@ -92,7 +97,7 @@ fun LogItem(log: UiLogEntry) {
     val originalLog = log.originalLog
     val (icon, color) = getLogAppearance(originalLog.level)
 
-    // [核心修复] 定义标题的显示优先级：应用名 > 包名 > 类别
+    // 定义标题的显示优先级：转换后的应用名 > 完整的包名 > 后端传来的类别
     val title = log.appName ?: originalLog.packageName ?: originalLog.category
     
     val annotatedString = buildAnnotatedString {
