@@ -15,8 +15,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.draw.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -49,10 +51,17 @@ fun StatisticsScreen(viewModel: StatisticsViewModel = viewModel()) {
             }
             item {
                 ChartCard(
-                    title = "内存使用 (MB)",
+                    title = "内存使用率 (%)",
                     records = uiState.records,
                     color = Color(0xFF34A853),
-                    valueExtractor = { it.memUsedKb / 1024f }
+                    valueExtractor = {
+                        if (it.memTotalKb > 0) {
+                            (it.memTotalKb - it.memAvailableKb) * 100f / it.memTotalKb
+                        } else {
+                            0f
+                        }
+                    },
+                    range = 0f..100f
                 )
             }
             item {
@@ -106,23 +115,32 @@ fun LineChart(
     }
 
     val values = records.map(valueExtractor)
-    val yMin = range?.start ?: (values.minOrNull() ?: 0f)
-    val yMax = range?.endInclusive ?: (values.maxOrNull() ?: 0f)
-    val yRange = if (yMax - yMin == 0f) 1f else yMax - yMin
+    val yMinValue = range?.start ?: (values.minOrNull() ?: 0f)
+    val yMaxValue = range?.endInclusive ?: (values.maxOrNull() ?: 0f)
+
+    val yMin = if(yMaxValue - yMinValue < 1f) yMinValue - 5f else yMinValue
+    val yMax = if(yMaxValue - yMinValue < 1f) yMaxValue + 5f else yMaxValue
+
+    val yRange = (yMax - yMin).coerceAtLeast(1f) // 避免除以零
 
     val textMeasurer = rememberTextMeasurer()
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val textStyle = TextStyle(fontSize = 12.sp, color = labelColor)
 
     Canvas(modifier = modifier.fillMaxWidth().height(150.dp)) {
-        val xStep = size.width / (records.size - 1)
+        val xStep = if (records.size > 1) size.width / (records.size - 1) else 0f
         val path = Path()
 
         records.forEachIndexed { index, record ->
             val x = index * xStep
-            val y = size.height - ((valueExtractor(record) - yMin) / yRange * size.height)
+            val yValue = valueExtractor(record)
+            val clampedYValue = yValue.coerceIn(yMin, yMax)
+            val y = size.height - ((clampedYValue - yMin) / yRange * size.height)
+
             if (index == 0) {
-                path.moveTo(x, y.toFloat())
+                path.moveTo(x, y)
             } else {
-                path.lineTo(x, y.toFloat())
+                path.lineTo(x, y)
             }
         }
 
@@ -132,17 +150,20 @@ fun LineChart(
             style = Stroke(width = 4f)
         )
 
-        // Draw Y-axis labels
-        val yLabelMax = textMeasurer.measure(yMax.roundToInt().toString(), TextStyle(fontSize = 12.sp))
-        val yLabelMin = textMeasurer.measure(yMin.roundToInt().toString(), TextStyle(fontSize = 12.sp))
-        
-        drawText(yLabelMax, topLeft = Offset(5f, -5f))
-        drawText(yLabelMin, topLeft = Offset(5f, size.height - yLabelMin.size.height))
-        
-        // Draw grid lines
+        // 简化版本：暂时移除文本标签，只保留图表
+        // 如果需要文本标签，可以稍后添加
+
         val gridPath = Path()
-        gridPath.moveTo(0f, size.height / 2)
-        gridPath.lineTo(size.width, size.height / 2)
-        drawPath(gridPath, Color.Gray, style = Stroke(width=1f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f))))
+        val midY = size.height / 2f
+        gridPath.moveTo(0f, midY)
+        gridPath.lineTo(size.width, midY)
+        drawPath(
+            gridPath,
+            color.copy(alpha = 0.3f),
+            style = Stroke(
+                width=1f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f))
+            )
+        )
     }
 }

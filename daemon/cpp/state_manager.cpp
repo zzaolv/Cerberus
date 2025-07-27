@@ -477,6 +477,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
    
     load_all_configs();
     reconcile_process_state_full();
+    last_battery_level_info_ = std::nullopt;    
     LOGI("StateManager Initialized.");
 }
 
@@ -496,28 +497,36 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
 }
 
 void StateManager::analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
-    // 只在未充电且电量下降时进行分析
-    if (new_record.is_charging || new_record.battery_level < 0 || old_record.battery_level < 0) {
+    if (new_record.is_charging || new_record.battery_level < 0) {
+        last_battery_level_info_ = std::nullopt; // 充电时重置
+        return;
+    }
+
+    if (!last_battery_level_info_) {
+        // 如果是首次记录或刚停止充电，初始化状态
+        last_battery_level_info_ = {new_record.battery_level, new_record.timestamp_ms};
         return;
     }
     
-    if (new_record.battery_level < old_record.battery_level) {
-        long long time_delta_ms = new_record.timestamp_ms - old_record.timestamp_ms;
+    if (new_record.battery_level < last_battery_level_info_->first) {
+        long long time_delta_ms = new_record.timestamp_ms - last_battery_level_info_->second;
+        int level_delta = last_battery_level_info_->first - new_record.battery_level;
+        
         if (time_delta_ms <= 0) return;
         
-        long long seconds_per_percent = time_delta_ms / 1000 / (old_record.battery_level - new_record.battery_level);
-        
+        // 计算每消耗1%电量的平均时间
+        long long time_per_percent_ms = time_delta_ms / level_delta;
+
         std::stringstream ss;
-        ss << "[当前: " << new_record.battery_level << "%] | [消耗: " 
-           << (old_record.battery_level - new_record.battery_level) << "% / " 
-           << (time_delta_ms / 1000 / 60) << "分钟] | [功率: " 
+        ss << "[当前: " << new_record.battery_level << "%] | [消耗: " << level_delta << "% / " 
+           << (time_delta_ms / 1000 / 60) << "分" << (time_delta_ms / 1000) % 60 << "秒] | [功率: " 
            << std::fixed << std::setprecision(2) << new_record.battery_power_watt << "w] | [温度: "
            << std::fixed << std::setprecision(1) << new_record.battery_temp_celsius << "°C]";
         
         LogLevel level = LogLevel::BATTERY;
         std::string category = "电量";
-        // 如果1%电量消耗时间少于2分钟, 认为是警告
-        if (seconds_per_percent < 120) {
+        // 如果1%电量消耗时间少于3分钟 (180000 ms), 认为是警告
+        if (time_per_percent_ms < 180000) {
             level = LogLevel::WARN;
             category = "警告";
             ss << " 耗电较快";
@@ -526,6 +535,9 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
         }
         
         logger_->log(level, category, ss.str());
+        
+        // 更新状态
+        last_battery_level_info_ = {new_record.battery_level, new_record.timestamp_ms};
     }
 }
 
@@ -720,9 +732,9 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                 if (it != managed_apps_.end()) {
                     AppRuntimeState& app = it->second;
                     if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                        logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", app.app_name + " 已解冻 (切换至前台)", app.package_name, app.user_id);
+                        logger_->log(LogLevel::ACTION_UNFREEZE, app.app_name, "应用因切换至前台而解冻", app.package_name, app.user_id);
                     } else {
-                        logger_->log(LogLevel::ACTION_OPEN, "打开", app.app_name + " 已打开", app.package_name, app.user_id);
+                        logger_->log(LogLevel::ACTION_OPEN, app.app_name, "应用已打开", app.package_name, app.user_id);
                     }
                     app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()
@@ -754,7 +766,7 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
                     ss_msg << "[运行时长: " << (current_runtime_ms / 1000) << "秒] | " << app.app_name << " 已关闭 (累计: "
                            << hours << "时" << minutes << "分" << seconds << "秒)";
 
-                    logger_->log(LogLevel::ACTION_CLOSE, "关闭", ss_msg.str(), app.package_name, app.user_id);
+                    logger_->log(LogLevel::ACTION_CLOSE, app.app_name, ss_msg.str(), app.package_name, app.user_id);
                 }
             }
         }
@@ -1191,13 +1203,11 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
 
     char path_buffer[64];
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
-
     struct stat st;
     if (stat(path_buffer, &st) != 0) return "";
     uid = st.st_uid;
-
     if (uid < 10000) return "";
-    user_id = uid / PER_USER_RANGE;
+    user_id = uid / 100000;
     
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
     std::ifstream cmdline_file(path_buffer);
@@ -1209,7 +1219,8 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     if (cmdline.empty() || cmdline.find('.') == std::string::npos) {
         return "";
     }
-
+    
+    // 智能提取包名：去掉冒号后面的部分
     size_t colon_pos = cmdline.find(':');
     if (colon_pos != std::string::npos) {
         return cmdline.substr(0, colon_pos);
@@ -1251,14 +1262,21 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
-    if (app->app_name == package_name) {
-        app->app_name = sys_monitor_->get_app_name_from_pid(pid);
+    
+    // 只有当 app_name 还是默认包名时，才尝试用更友好的名称更新它
+    if (app->app_name == app->package_name) {
+        std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
+        if (!friendly_name.empty() && friendly_name != app->package_name) {
+            app->app_name = friendly_name;
+        }
     }
+
     if (std::find(app->pids.begin(), app->pids.end(), pid) == app->pids.end()) {
         app->pids.push_back(pid);
         pid_to_app_map_[pid] = app;
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
            app->current_status = AppRuntimeState::Status::RUNNING;
+           logger_->log(LogLevel::INFO, "进程", "检测到新进程启动", app->package_name, user_id);
         }
     }
 }

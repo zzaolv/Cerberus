@@ -47,14 +47,6 @@ class DaemonRepository(
             }
         }
 
-    // [REFACTORED] setPolicy now sends the entire config bundle.
-    // A more advanced implementation would send individual config changes.
-    fun setPolicy(config: FullConfigPayload) {
-        val message = CerberusMessage(type = "cmd.set_policy", payload = config)
-        udsClient.sendMessage(gson.toJson(message))
-    }
-
-    // [修改] 增加新的流式消息处理
     fun getLogStream(): Flow<LogEntry> = udsClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
@@ -66,20 +58,34 @@ class DaemonRepository(
                 } else null
             } catch (e: Exception) { null }
         }
-        
+
     fun getStatsStream(): Flow<MetricsRecord> = udsClient.incomingMessages
         .mapNotNull { jsonLine ->
-             try {
+            try {
                 val type = object : TypeToken<CerberusMessage<MetricsRecordPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<MetricsRecordPayload>>(jsonLine, type)
                 if (msg.type == "stream.new_stats_record") {
                     val p = msg.payload
-                    MetricsRecord(p.timestamp, p.cpuUsagePercent, p.memUsedKb, p.batteryLevel, p.batteryTempCelsius, p.batteryPowerWatt, p.isCharging, p.isScreenOn, p.isAudioPlaying, p.isLocationActive)
+                    // [修复] 使用 MetricsRecordPayload 中的正确字段来构造 MetricsRecord
+                    MetricsRecord(
+                        timestamp = p.timestamp,
+                        cpuUsagePercent = p.cpuUsagePercent,
+                        memTotalKb = p.memTotalKb,
+                        memAvailableKb = p.memAvailableKb,
+                        swapTotalKb = p.swapTotalKb,
+                        swapFreeKb = p.swapFreeKb,
+                        batteryLevel = p.batteryLevel,
+                        batteryTempCelsius = p.batteryTempCelsius,
+                        batteryPowerWatt = p.batteryPowerWatt,
+                        isCharging = p.isCharging,
+                        isScreenOn = p.isScreenOn,
+                        isAudioPlaying = p.isAudioPlaying,
+                        isLocationActive = p.isLocationActive
+                    )
                 } else null
             } catch (e: Exception) { null }
         }
 
-    // [新增] 获取历史日志
     suspend fun getAllLogs(): List<LogEntry>? = query("query.get_all_logs") { json ->
         val type = object : TypeToken<List<LogEntryPayload>>() {}.type
         val payloads = gson.fromJson<List<LogEntryPayload>>(json, type)
@@ -88,44 +94,61 @@ class DaemonRepository(
         }
     }
 
-    // [新增] 获取历史统计数据
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->
         val type = object : TypeToken<List<MetricsRecordPayload>>() {}.type
         val payloads = gson.fromJson<List<MetricsRecordPayload>>(json, type)
         payloads.map { p ->
-             MetricsRecord(p.timestamp, p.cpuUsagePercent, p.memUsedKb, p.batteryLevel, p.batteryTempCelsius, p.batteryPowerWatt, p.isCharging, p.isScreenOn, p.isAudioPlaying, p.isLocationActive)
+            // [修复] 使用 MetricsRecordPayload 中的正确字段来构造 MetricsRecord
+            MetricsRecord(
+                timestamp = p.timestamp,
+                cpuUsagePercent = p.cpuUsagePercent,
+                memTotalKb = p.memTotalKb,
+                memAvailableKb = p.memAvailableKb,
+                swapTotalKb = p.swapTotalKb,
+                swapFreeKb = p.swapFreeKb,
+                batteryLevel = p.batteryLevel,
+                batteryTempCelsius = p.batteryTempCelsius,
+                batteryPowerWatt = p.batteryPowerWatt,
+                isCharging = p.isCharging,
+                isScreenOn = p.isScreenOn,
+                isAudioPlaying = p.isAudioPlaying,
+                isLocationActive = p.isLocationActive
+            )
         }
     }
-    
-    // [新增] 通用查询辅助函数
-    private suspend fun <T> query(type: String, payloadParser: (String) -> T): T? {
+
+    private suspend fun <T> query(queryType: String, payloadParser: (String) -> T): T? {
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
 
-        val requestMsg = CerberusMessage(type = type, requestId = reqId, payload = EmptyPayload)
+        val requestMsg = CerberusMessage(type = queryType, requestId = reqId, payload = EmptyPayload)
         udsClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
-            val responseType = when(type) {
-                "query.get_all_logs" -> "resp.all_logs"
-                "query.get_history_stats" -> "resp.history_stats"
-                else -> "resp.unknown"
-            }
-            
+            // [优化] 动态生成响应类型字符串
+            val expectedResponseType = queryType.replace("query.", "resp.")
+
             val baseMsg = gson.fromJson(responseJson, BaseMessageWithPayload::class.java)
-            if (baseMsg.type == responseType) {
+            if (baseMsg.type == expectedResponseType) {
                 payloadParser(baseMsg.payload.toString())
-            } else null
+            } else {
+                Log.e("DaemonRepository", "Query '$queryType' received unexpected response type '${baseMsg.type}'")
+                null
+            }
         } catch (e: Exception) {
-            Log.e("DaemonRepository", "Failed to query '$type': ${e.message}")
+            Log.e("DaemonRepository", "Failed to query '$queryType': ${e.message}")
             pendingRequests.remove(reqId)
             null
         }
     }
 
-    // [REFACTORED] getAllPolicies now expects the new FullConfigPayload
+    fun setPolicy(config: FullConfigPayload) {
+        val message = CerberusMessage(type = "cmd.set_policy", payload = config)
+        udsClient.sendMessage(gson.toJson(message))
+    }
+
     suspend fun getAllPolicies(): FullConfigPayload? {
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
@@ -159,16 +182,14 @@ class DaemonRepository(
 
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
+    private data class BaseMessageWithPayload(
+        val type: String,
+        @SerializedName("req_id") val requestId: String?,
+        val payload: com.google.gson.JsonElement
+    )
 
     fun setMasterConfig(payload: Map<String, Any>) {
         val message = CerberusMessage(type = "cmd.set_master_config", payload = payload)
         udsClient.sendMessage(gson.toJson(message))
     }
-
-    private data class BaseMessageWithPayload(
-        val type: String, 
-        @SerializedName("req_id") val requestId: String?,
-        val payload: com.google.gson.JsonElement
-    )
-
 }

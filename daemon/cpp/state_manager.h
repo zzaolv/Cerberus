@@ -113,7 +113,7 @@ private:
     std::set<int> last_known_top_pids_;
     
     std::optional<MetricsRecord> last_metrics_record_;
-    
+    std::optional<std::pair<int, long long>> last_battery_level_info_;
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     

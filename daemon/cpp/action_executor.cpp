@@ -93,32 +93,49 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
 
     for (int pid : pids) {
         info.pid = pid;
-        if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) < 0) {
-            switch (errno) {
-                case EAGAIN:
-                    has_soft_failure = true;
-                    LOGW("Binder op for pid %d has pending transactions (EAGAIN).", info.pid);
-                    break;
-                case EINVAL:
-                case EPERM:
-                    has_hard_failure = true;
-                    LOGW("Binder op for pid %d failed with hard error: %s", info.pid, strerror(errno));
-                    break;
-                default:
-                    LOGE("Binder op for pid %d failed with fatal error: %s", info.pid, strerror(errno));
-                    // 这是致命失败，必须回滚并立即中止
-                    if (freeze && !successfully_frozen_pids.empty()) {
-                        LOGE("Rolling back fatally failed binder freeze op...");
-                        handle_binder_freeze(successfully_frozen_pids, false);
-                    }
-                    return -2; // 致命失败
+        bool op_success = false;
+        
+        // --- 微重试循环 ---
+        for (int retry = 0; retry < 5; ++retry) {
+            if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
+                op_success = true;
+                break; // 成功，退出重试循环
             }
-        } else if (freeze) {
+            
+            // 如果不是EAGAIN，或者这是最后一次重试，则处理错误并跳出
+            if (errno != EAGAIN || retry == 2) {
+                switch (errno) {
+                    case EAGAIN:
+                        has_soft_failure = true;
+                        LOGW("Binder op for pid %d has pending transactions (EAGAIN) after all retries.", info.pid);
+                        break;
+                    case EINVAL:
+                    case EPERM:
+                        has_hard_failure = true;
+                        LOGW("Binder op for pid %d failed with hard error: %s", info.pid, strerror(errno));
+                        break;
+                    default:
+                        LOGE("Binder op for pid %d failed with fatal error: %s", info.pid, strerror(errno));
+                        if (freeze && !successfully_frozen_pids.empty()) {
+                            LOGE("Rolling back fatally failed binder freeze op...");
+                            handle_binder_freeze(successfully_frozen_pids, false);
+                        }
+                        return -2; // 致命失败
+                }
+                goto next_pid; // 跳到外层循环的下一个pid
+            }
+            
+            // 等待50毫秒再重试
+            usleep(50000); 
+        }
+
+        if (op_success && freeze) {
             successfully_frozen_pids.push_back(pid);
         }
+        
+        next_pid:;
     }
 
-    // 原子性原则：如果冻结过程中遇到任何失败，回滚所有已成功的冻结
     if (freeze && (has_soft_failure || has_hard_failure)) {
         if (!successfully_frozen_pids.empty()) {
             LOGW("Rolling back partially successful binder freeze due to errors...");
@@ -126,13 +143,11 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
         }
     }
 
-    // 根据情报优先级返回结果
-    if (has_hard_failure) return -1; // 硬失败
-    if (has_soft_failure) return 1;  // 软失败
+    if (has_hard_failure) return -1;
+    if (has_soft_failure) return 1;
     
-    return 0; // 全部成功
+    return 0;
 }
-
 
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);

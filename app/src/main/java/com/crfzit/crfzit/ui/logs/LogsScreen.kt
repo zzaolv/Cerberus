@@ -10,6 +10,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import com.crfzit.crfzit.ui.logs.UiLogEntry
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -69,7 +70,7 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 reverseLayout = true // 从底部开始显示
             ) {
-                items(uiState.logs) { log ->
+                items(uiState.logs, key = { it.originalLog.timestamp }) { log ->
                     LogItem(log)
                 }
             }
@@ -87,20 +88,24 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 
 
 @Composable
-fun LogItem(log: LogEntry) {
+fun LogItem(log: UiLogEntry) { // [修改] 参数类型
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-    val (icon, color) = getLogAppearance(log.level)
+    val originalLog = log.originalLog
+    val (icon, color) = getLogAppearance(originalLog.level)
 
+    // [修改] 显示转换后的appName，如果为null则回退到category或包名
+    val title = log.appName ?: originalLog.category
+    
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-            append(formatter.format(Date(log.timestamp)))
+            append(formatter.format(Date(originalLog.timestamp)))
         }
         append(" | ")
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-            append("$icon[${log.category}]")
+            append("$icon[$title]")
         }
         append(" | ")
-        append(log.message)
+        append(originalLog.message)
     }
 
     Text(

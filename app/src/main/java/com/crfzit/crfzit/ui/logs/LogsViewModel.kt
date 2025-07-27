@@ -1,21 +1,31 @@
 // app/src/main/java/com/crfzit/crfzit/ui/logs/LogsViewModel.kt
 package com.crfzit.crfzit.ui.logs
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.LogEntry
+import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
-data class LogsUiState(
-    val isLoading: Boolean = true,
-    val logs: List<LogEntry> = emptyList()
+// [新增] 用于UI显示的日志数据类
+data class UiLogEntry(
+    val originalLog: LogEntry,
+    val appName: String?
 )
 
-class LogsViewModel : ViewModel() {
+data class LogsUiState(
+    val isLoading: Boolean = true,
+    val logs: List<UiLogEntry> = emptyList() // [修改] 使用新的UI模型
+)
+
+class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     private val daemonRepository = DaemonRepository(viewModelScope)
+    // [新增] 注入AppInfoRepository
+    private val appInfoRepository = AppInfoRepository.getInstance(application)
     
     private val _uiState = MutableStateFlow(LogsUiState())
     val uiState: StateFlow<LogsUiState> = _uiState.asStateFlow()
@@ -29,19 +39,30 @@ class LogsViewModel : ViewModel() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val history = daemonRepository.getAllLogs() ?: emptyList()
-            _uiState.update { it.copy(isLoading = false, logs = history) }
+            // [修改] 批量转换
+            val uiHistory = history.map { log -> mapToUiLog(log) }
+            _uiState.update { it.copy(isLoading = false, logs = uiHistory) }
         }
     }
 
     private fun listenForNewLogs() {
         viewModelScope.launch {
             daemonRepository.getLogStream().collect { newLog ->
+                // [修改] 单条转换
+                val newUiLog = mapToUiLog(newLog)
                 _uiState.update { currentState ->
-                    // 将新日志添加到列表末尾，LazyColumn反向布局会显示在顶部
-                    currentState.copy(logs = currentState.logs + newLog)
+                    currentState.copy(logs = currentState.logs + newUiLog)
                 }
             }
         }
+    }
+
+    // [新增] 转换函数
+    private suspend fun mapToUiLog(log: LogEntry): UiLogEntry {
+        val appName = log.packageName?.let { pkg ->
+            appInfoRepository.getAppInfo(pkg)?.appName
+        }
+        return UiLogEntry(originalLog = log, appName = appName)
     }
 
     override fun onCleared() {
