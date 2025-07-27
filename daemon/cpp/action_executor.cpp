@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <fcntl.h>
 
-#define LOG_TAG "cerberusd_action_v3_robust"
+#define LOG_TAG "cerberusd_action_v4_robust"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -96,7 +96,7 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
         bool op_success = false;
         
         // --- 微重试循环 ---
-        for (int retry = 0; retry < 5; ++retry) {
+        for (int retry = 0; retry < 3; ++retry) { // 重试3次
             if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
                 op_success = true;
                 break; // 成功，退出重试循环
@@ -136,6 +136,7 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
         next_pid:;
     }
 
+    // 如果是冻结操作，且过程中出现了任何失败，则回滚所有已成功的冻结，保证原子性
     if (freeze && (has_soft_failure || has_hard_failure)) {
         if (!successfully_frozen_pids.empty()) {
             LOGW("Rolling back partially successful binder freeze due to errors...");

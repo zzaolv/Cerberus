@@ -10,7 +10,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import com.crfzit.crfzit.ui.logs.UiLogEntry
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -19,9 +18,8 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.crfzit.crfzit.data.model.LogEntry
 import com.crfzit.crfzit.data.model.LogLevel
-import com.crfzit.crfzit.ui.stats.StatisticsScreen // [新增]
+import com.crfzit.crfzit.ui.stats.StatisticsScreen
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
@@ -47,7 +45,7 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
             }
             when (selectedTab) {
                 0 -> EventTimelineTab(viewModel)
-                1 -> StatisticsScreen() // [新增] 调用新的统计屏幕
+                1 -> StatisticsScreen()
             }
         }
     }
@@ -68,13 +66,14 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
-                reverseLayout = true // 从底部开始显示
+                // reverseLayout = true, // 从底部开始显示
             ) {
-                items(uiState.logs, key = { it.originalLog.timestamp }) { log ->
+                items(uiState.logs, key = { it.originalLog.timestamp.toString() + it.originalLog.message }) { log ->
                     LogItem(log)
                 }
             }
-            // 滚动到底部（即最新日志）
+            
+            // 当有新日志时，自动滚动到底部
             LaunchedEffect(uiState.logs.size) {
                  coroutineScope.launch {
                      if (uiState.logs.isNotEmpty()) {
@@ -88,23 +87,23 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 
 
 @Composable
-fun LogItem(log: UiLogEntry) { // [修改] 参数类型
-    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+fun LogItem(log: UiLogEntry) {
+    val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
     val originalLog = log.originalLog
     val (icon, color) = getLogAppearance(originalLog.level)
 
-    // [修改] 显示转换后的appName，如果为null则回退到category或包名
-    val title = log.appName ?: originalLog.category
+    // [核心修复] 定义标题的显示优先级：应用名 > 包名 > 类别
+    val title = log.appName ?: originalLog.packageName ?: originalLog.category
     
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
             append(formatter.format(Date(originalLog.timestamp)))
         }
-        append(" | ")
+        append(" ")
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
             append("$icon[$title]")
         }
-        append(" | ")
+        append(" ")
         append(originalLog.message)
     }
 
@@ -114,11 +113,10 @@ fun LogItem(log: UiLogEntry) { // [修改] 参数类型
             fontFamily = FontFamily.Monospace,
             lineHeight = 16.sp
         ),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
     )
 }
 
-// [修改] getLogAppearance 适配新的 LogLevel
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {
     return when (level) {
@@ -134,7 +132,7 @@ fun getLogAppearance(level: LogLevel): Pair<String, Color> {
         LogLevel.ACTION_CLOSE -> "⏹️" to MaterialTheme.colorScheme.onSurfaceVariant
         LogLevel.ACTION_FREEZE -> "❄️" to Color(0xFF4285F4)
         LogLevel.ACTION_UNFREEZE -> "☀️" to Color(0xFFF4B400)
-        LogLevel.ACTION_DELAY -> "🤣" to Color(0xFFE52592)
+        LogLevel.ACTION_DELAY -> "⏳" to Color(0xFFE52592)
         LogLevel.TIMER -> "⏰" to Color(0xFFF25622)
         LogLevel.BATCH_PARENT -> "📦" to Color.Unspecified
     }
