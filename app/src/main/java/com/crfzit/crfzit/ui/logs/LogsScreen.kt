@@ -93,22 +93,36 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 fun LogItem(log: UiLogEntry) {
     val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
     val originalLog = log.originalLog
-    val (_, color) = getLogAppearance(originalLog.level)
     
-    // [日志修复] 直接使用后端传来的、已规范化的category
+    // [日志修复] 修复图标丢失的bug
+    val (icon, color) = getLogAppearance(originalLog.level)
     val categoryString = originalLog.category
+    
+    // [日志修复] 定义最终显示的应用名，优先使用ViewModel解析出的名字，否则回退到包名
+    val displayAppName = log.appName ?: originalLog.packageName
     
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
             append(formatter.format(Date(originalLog.timestamp)))
         }
         append(" ")
-        // 方括号内显示分类
+        
+        // [日志修复] 正确拼接图标和分类
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-            append("[$categoryString]")
+            append("$icon[$categoryString]")
         }
         append(" ")
-        // 后面直接跟上后端已经完整格式化的消息
+
+        // [日志修复] 如果日志有关联的应用，则构建 "应用 '名字'" 部分
+        if (!displayAppName.isNullOrEmpty()) {
+            append("应用 ‘")
+            withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold)) {
+                append(displayAppName)
+            }
+            append("’ ")
+        }
+        
+        // 拼接后端传来的纯事件描述
         append(originalLog.message)
     }
 
@@ -122,7 +136,6 @@ fun LogItem(log: UiLogEntry) {
     )
 }
 
-// 这个函数现在只用于获取图标和颜色，不再用于获取分类文本
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {
     return when (level) {
