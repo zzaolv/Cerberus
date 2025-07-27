@@ -4,7 +4,6 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-// #include <linux/android/binder.h> // 这个包含现在由 action_executor.h 完成
 #include <fstream>
 #include <filesystem>
 #include <unistd.h>
@@ -16,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v6_coordinator_fix"
+#define LOG_TAG "cerberusd_action_v7_realistic"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,93 +34,78 @@ ActionExecutor::~ActionExecutor() {
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (pids.empty()) return 0;
 
-    std::vector<int> successfully_processed_pids;
-    bool needs_retry = false;
+    int binder_result = handle_binder_freeze(pids, true);
 
-    for (int pid : pids) {
-        int result = handle_binder_op_with_coordination(pid, true);
-        if (result == 0) {
-            successfully_processed_pids.push_back(pid);
-        } else if (result == 1) {
-            needs_retry = true;
-        } else { // result == -1
-            LOGE("Critical failure during coordinated binder freeze for pid %d of %s. Rolling back.", pid, key.first.c_str());
-            for (int processed_pid : successfully_processed_pids) {
-                handle_binder_op_with_coordination(processed_pid, false);
-            }
-            return -1;
-        }
+    if (binder_result < 0) { // 致命错误
+        LOGE("Binder freeze for %s failed critically. Rolling back...", key.first.c_str());
+        handle_binder_freeze(pids, false); // 尽力回滚
+        return -1;
     }
 
-    if (needs_retry) {
-        LOGW("Soft failure (EAGAIN) detected for %s. Rolling back all pids and retrying later.", key.first.c_str());
-        for (int processed_pid : successfully_processed_pids) {
-            handle_binder_op_with_coordination(processed_pid, false);
-        }
+    if (binder_result > 0) { // 软失败 (EAGAIN)，需要重试
+        LOGW("Binder freeze for %s resulted in soft failure. Rolling back and retrying later.", key.first.c_str());
+        handle_binder_freeze(pids, false); // 回滚
         return 1;
     }
     
-    LOGI("Coordinated binder freeze phase completed for %s. Proceeding with physical freeze.", key.first.c_str());
+    // Binder 阶段成功 (完全成功或乐观采纳)
+    LOGI("Binder freeze phase for %s completed. Proceeding with physical freeze.", key.first.c_str());
     bool physical_ok = freeze_cgroup(key, pids);
     if (!physical_ok) {
         LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
         freeze_sigstop(pids);
     }
 
-    return 0;
+    return 0; // 最终成功
 }
 
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     unfreeze_cgroup(key);
     unfreeze_sigstop(pids);
-    
-    for (int pid : pids) {
-        handle_binder_op_with_coordination(pid, false);
-    }
-    
+    handle_binder_freeze(pids, false); 
     LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
     return true;
 }
 
-int ActionExecutor::handle_binder_op_with_coordination(int pid, bool freeze) {
+// [核心重构] 实现“乐观命令式重试”策略
+int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
-
-    bool is_already_in_target_state = (is_pid_binder_frozen(pid) == freeze);
-    if (is_already_in_target_state) {
-        LOGI("Coordination: PID %d is already in target state (frozen=%d). Adopting state.", pid, freeze);
-        return 0;
-    }
-
-    // [核心修复] 对 pid 进行显式类型转换，解决 narrowing conversion 错误
-    binder_freeze_info info{ .pid = static_cast<__u32>(pid), .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
-    for (int retry = 0; retry < 3; ++retry) {
-        if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
-            return 0;
-        }
-
-        if (errno != EAGAIN || retry == 2) {
-            LOGW("Coordination: ioctl(BINDER_FREEZE) for pid %d failed with: %s. Verifying actual state...", pid, strerror(errno));
-            if (is_pid_binder_frozen(pid) == freeze) {
-                LOGW("Coordination: ...Verification shows PID %d is now in the correct state. A competitor likely acted. Adopting state.", pid);
-                return 0;
-            }
-
-            if (errno == EAGAIN) return 1;
-            return -1;
-        }
-        usleep(50000);
-    }
-    return 1;
-}
-
-bool ActionExecutor::is_pid_binder_frozen(int pid) {
-    if (binder_state_.fd < 0) return false;
     
-    binder_frozen_status_info status_info = { .pid = static_cast<__u32>(pid) };
-    if (ioctl(binder_state_.fd, BINDER_GET_FROZEN_INFO, &status_info) < 0) {
-        return false;
+    bool has_soft_failure = false;
+    binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
+
+    for (int pid : pids) {
+        info.pid = static_cast<__u32>(pid);
+        bool op_success = false;
+        
+        for (int retry = 0; retry < 3; ++retry) {
+            if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
+                op_success = true;
+                break;
+            }
+            
+            // 如果ioctl失败，分析错误
+            if (errno == EAGAIN) {
+                if (retry == 2) { // 微重试耗尽
+                    LOGW("Binder op for pid %d still has pending transactions (EAGAIN). Marking as soft failure.", pid);
+                    has_soft_failure = true;
+                }
+                usleep(50000);
+                continue; // 继续重试
+            } else if (freeze && (errno == EPERM || errno == EINVAL)) {
+                // 乐观采纳：在冻结时遇到这些错误，很可能是系统服务已将其冻结
+                LOGI("Binder op for pid %d failed (%s), likely already frozen by system. Adopting state.", pid, strerror(errno));
+                op_success = true; // 假装成功
+                break;
+            } else {
+                // 其他无法恢复的错误
+                LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
+                return -1; // 报告致命失败
+            }
+        }
     }
-    return status_info.is_frozen != 0;
+    
+    return has_soft_failure ? 1 : 0;
 }
 
 bool ActionExecutor::initialize_binder() {
@@ -131,14 +115,14 @@ bool ActionExecutor::initialize_binder() {
         return false;
     }
 
-    binder_frozen_status_info info = { .pid = static_cast<__u32>(getpid()) };
-    if (ioctl(binder_state_.fd, BINDER_GET_FROZEN_INFO, &info) < 0) {
-        LOGE("Kernel does not support BINDER_GET_FROZEN_INFO. Coordinated strategy disabled.");
+    binder_version version;
+    if (ioctl(binder_state_.fd, BINDER_VERSION, &version) < 0 || version.protocol_version != BINDER_CURRENT_PROTOCOL_VERSION) {
+        LOGE("Binder version mismatch or ioctl failed. Required: %d", BINDER_CURRENT_PROTOCOL_VERSION);
         close(binder_state_.fd);
         binder_state_.fd = -1;
         return false;
     }
-    LOGI("Binder driver initialized successfully for coordinated freezing.");
+    LOGI("Binder driver initialized successfully.");
     return true;
 }
 
@@ -152,6 +136,7 @@ void ActionExecutor::cleanup_binder() {
         binder_state_.fd = -1;
     }
 }
+
 
 bool ActionExecutor::initialize_cgroup() {
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {

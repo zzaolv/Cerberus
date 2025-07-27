@@ -5,12 +5,10 @@
 #include <string>
 #include <vector>
 #include <utility> 
-#include <linux/android/binder.h>
+#include <linux/android/binder.h> // 包含系统头文件
 
-// [核心修复] 将 AppInstanceKey 的定义移到这里，因为这是第一个需要它的头文件
+// AppInstanceKey 定义移到这里，因为它首先被这个文件需要
 using AppInstanceKey = std::pair<std::string, int>;
-
-struct binder_frozen_status_info; // 前向声明，因为完整的定义在 <linux/android/binder.h>
 
 class ActionExecutor {
 public:
@@ -18,8 +16,8 @@ public:
     ~ActionExecutor();
 
     /**
-     * @brief 尝试冻结一个应用实例，采用新的分级和自适应协调策略。
-     * @return 0: 成功 | 1: 需要重试 | -1: 彻底失败
+     * @brief 尝试冻结一个应用实例，采用新的“乐观命令式重试”策略。
+     * @return 0: 成功 (可能部分pid是采纳的现有状态) | 1: 软失败，需要重试 | -1: 彻底失败
      */
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
     
@@ -29,17 +27,8 @@ private:
     bool initialize_binder();
     void cleanup_binder();
     
-    /**
-     * @brief 查询指定PID的Binder是否已冻结。
-     * @return true 如果已冻结，false 如果未冻结或查询失败。
-     */
-    bool is_pid_binder_frozen(int pid);
-
-    /**
-     * @brief 智能协调版的Binder冻结/解冻操作。
-     * @return 0: 成功 | 1: 软失败(EAGAIN) | -1: 硬失败或致命失败
-     */
-    int handle_binder_op_with_coordination(int pid, bool freeze);
+    // 这个函数现在是内部实现细节，不再分为 strict/lenient
+    int handle_binder_freeze(const std::vector<int>& pids, bool freeze);
     
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();
