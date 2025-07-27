@@ -63,7 +63,6 @@ void DozeManager::enter_state(State new_state) {
     current_state_ = new_state;
     state_change_timestamp_ = std::chrono::steady_clock::now();
     
-    // [日志修复] 使用固定的category "Doze"
     switch(new_state) {
         case State::AWAKE:
             if (old_state != State::AWAKE) logger_->log(LogLevel::DOZE, "Doze", "设备唤醒");
@@ -532,7 +531,6 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     cancel_timed_unfreeze(app);
 
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
-        // [日志修复] 使用固定的 "解冻" category, 消息体包含应用名
         std::string msg = "应用 ‘" + app.app_name + "’ 因 " + reason + " 而解冻";
         logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", msg, app.package_name, app.user_id);
         
@@ -714,7 +712,6 @@ bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
             }
         }
 
-        // [日志修复] 规范化打开/关闭日志
         for (const auto& key : final_foreground_keys) {
             if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
                 auto it = managed_apps_.find(key);
@@ -800,7 +797,6 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
-// [日志修复] 彻底重构，以提供精确的延迟冻结原因
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -810,7 +806,7 @@ bool StateManager::check_timers() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         time_t now = time(nullptr);
-        const double NETWORK_THRESHOLD_KBPS = 50.0; // 降低网络阈值
+        const double NETWORK_THRESHOLD_KBPS = 50.0; 
 
         for (auto& [key, app] : managed_apps_) {
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
@@ -1260,7 +1256,8 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
         pid_to_app_map_[pid] = app;
         if (app->current_status == AppRuntimeState::Status::STOPPED) {
            app->current_status = AppRuntimeState::Status::RUNNING;
-           logger_->log(LogLevel::INFO, "进程", "检测到应用 ‘" + app->app_name + "’ 新进程启动", app.package_name, user_id);
+           // [核心修复] 使用 -> 访问指针成员
+           logger_->log(LogLevel::INFO, "进程", "检测到应用 ‘" + app->app_name + "’ 新进程启动", app->package_name, user_id);
         }
     }
 }
