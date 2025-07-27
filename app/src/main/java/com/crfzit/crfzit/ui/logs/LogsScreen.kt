@@ -67,7 +67,6 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                // [核心修复] 使用一个绝对唯一的 key 来防止闪退
                 items(
                     items = uiState.logs, 
                     key = { log -> 
@@ -78,10 +77,9 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 }
             }
             
-            // 当有新日志时，自动滚动到底部
             LaunchedEffect(uiState.logs.size) {
                  coroutineScope.launch {
-                     if (uiState.logs.size > 1 && listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index == listState.layoutInfo.totalItemsCount - 2) {
+                     if (uiState.logs.size > 1 && (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) >= uiState.logs.size - 2) {
                          listState.animateScrollToItem(uiState.logs.size - 1)
                      }
                  }
@@ -95,20 +93,22 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 fun LogItem(log: UiLogEntry) {
     val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
     val originalLog = log.originalLog
-    val (icon, color) = getLogAppearance(originalLog.level)
-
-    // 定义标题的显示优先级：转换后的应用名 > 完整的包名 > 后端传来的类别
-    val title = log.appName ?: originalLog.packageName ?: originalLog.category
+    val (_, color) = getLogAppearance(originalLog.level)
+    
+    // [日志修复] 直接使用后端传来的、已规范化的category
+    val categoryString = originalLog.category
     
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
             append(formatter.format(Date(originalLog.timestamp)))
         }
         append(" ")
+        // 方括号内显示分类
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-            append("$icon[$title]")
+            append("[$categoryString]")
         }
         append(" ")
+        // 后面直接跟上后端已经完整格式化的消息
         append(originalLog.message)
     }
 
@@ -122,6 +122,7 @@ fun LogItem(log: UiLogEntry) {
     )
 }
 
+// 这个函数现在只用于获取图标和颜色，不再用于获取分类文本
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {
     return when (level) {
