@@ -22,7 +22,7 @@
 #include <string>
 #include <memory>
 
-#define LOG_TAG "cerberusd_monitor_v18_robust_parser" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v20_fixed"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -30,7 +30,7 @@
 
 namespace fs = std::filesystem;
 
-// [修复] 将 exec_shell_pipe 移到文件顶部，确保在使用前已定义
+// 静态辅助函数
 static std::string exec_shell_pipe(const char* cmd) {
     std::array<char, 256> buffer;
     std::string result;
@@ -45,7 +45,6 @@ static std::string exec_shell_pipe(const char* cmd) {
     return result;
 }
 
-// [新增] 辅助函数，安全读取文件内容
 static std::optional<long> read_long_from_file(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) return std::nullopt;
@@ -63,6 +62,9 @@ int get_uid_from_pid(int pid) {
     return st.st_uid;
 }
 
+
+// --- SystemMonitor 类实现 ---
+
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
         top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
@@ -77,10 +79,9 @@ SystemMonitor::SystemMonitor() {
 
 SystemMonitor::~SystemMonitor() {
     stop_top_app_monitor();
-    stop_network_snapshot_thread(); // [新增] 确保网络监控也停止    
+    stop_network_snapshot_thread();
 }
 
-// [修改] 核心采集函数
 std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
     MetricsRecord record;
     record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -104,19 +105,14 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
     return record;
 }
 
-
-// [新增] 获取屏幕状态
 bool SystemMonitor::get_screen_state() {
-    // 使用 dumpsys power 是最可靠的方式之一
     std::string result = exec_shell_pipe("dumpsys power | grep -E 'mWakefulness|mScreenState' | head -n 1");
-    // Android 10+ uses mWakefulness=Awake/Asleep, older versions use mScreenState=ON/OFF
     return result.find("Awake") != std::string::npos || result.find("ON") != std::string::npos;
 }
 
-// [新增] 获取电池统计信息
 void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, bool& charging) {
     const std::string battery_path = "/sys/class/power_supply/battery/";
-    const std::string bms_path = "/sys/class/power_supply/bms/"; // 有些设备(如小米)使用bms
+    const std::string bms_path = "/sys/class/power_supply/bms/";
 
     std::string final_path = fs::exists(battery_path) ? battery_path : (fs::exists(bms_path) ? bms_path : "");
     if (final_path.empty()) {
@@ -128,7 +124,6 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     
     auto temp_raw = read_long_from_file(final_path + "temp");
     if (temp_raw.has_value()) {
-        // 根据您的分析，原始值是三位数，代表实际温度的10倍
         temp = static_cast<float>(*temp_raw) / 10.0f;
     } else {
         temp = 0.0f;
@@ -138,14 +133,8 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
-        // Power (W) = Voltage (V) * Current (A)
-        // Voltage = voltage_now (uV) / 1,000,000
-        // Current = current_now (uA) / 1,000,000 (注意：文档中为1000，但uA到A是10^6)
-        // 为了避免浮点数精度问题，我们先计算微瓦(uW)，再转为瓦(W)
-        // power (uW) = voltage_now * current_now / 1,000,000
-        // 文档指示 current_now 除以 1000，我将遵循这个，这可能意味着单位是mA
-        double current_a = static_cast<double>(*current_now_ua) / 1000.0; // uA to A
-        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0; // uV to V
+        double current_a = static_cast<double>(*current_now_ua) / 1000.0;
+        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0;
         power = static_cast<float>(std::abs(current_a * voltage_v));
     } else {
         power = 0.0f;
@@ -208,9 +197,6 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// =========================================================================================
-// [核心修复] 重写音频状态检测逻辑，采用更健壮的有限状态机解析器
-// =========================================================================================
 void SystemMonitor::update_audio_state() {
     std::set<int> focus_uids;
     std::set<int> started_player_uids;
@@ -228,29 +214,24 @@ void SystemMonitor::update_audio_state() {
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
-        // --- 状态机切换逻辑 ---
-        // 只有遇到明确的节标题时才切换状态，这比之前的逻辑更健壮
         if (line.find("Audio Focus stack entries") != std::string::npos) {
             current_section = ParseSection::FOCUS_STACK;
-            continue; // 继续下一行，因为标题行本身不包含数据
+            continue;
         }
         if (line.rfind("  players:", 0) == 0) {
             current_section = ParseSection::PLAYERS;
             continue;
         }
-        // 当遇到下一个主要部分的标题时，退出当前解析状态
         if (line.find("RecordActivityMonitor dump time:") != std::string::npos || line.find("AudioDeviceBroker:") != std::string::npos) {
             current_section = ParseSection::NONE;
         }
 
-        // --- 数据解析逻辑 ---
         if (current_section == ParseSection::NONE) {
             continue;
         }
         
         try {
             if (current_section == ParseSection::FOCUS_STACK) {
-                // 在FOCUS_STACK模式下，持续查找所有持有焦点的UID
                 const std::string uid_marker = "-- uid: ";
                 size_t marker_pos = line.find(uid_marker);
                 if (marker_pos != std::string::npos) {
@@ -260,7 +241,6 @@ void SystemMonitor::update_audio_state() {
                     }
                 }
             } else if (current_section == ParseSection::PLAYERS) {
-                // 在PLAYERS模式下，持续查找所有正在播放的媒体播放器UID
                 if (line.find("state:started") != std::string::npos && line.find("usage=USAGE_MEDIA") != std::string::npos) {
                     const std::string upid_marker = "u/pid:";
                     size_t upid_marker_pos = line.find(upid_marker);
@@ -278,13 +258,11 @@ void SystemMonitor::update_audio_state() {
     }
     pclose(pipe);
 
-    // 核心逻辑：取两个集合的交集，得到真正播放音频的UID
     std::set<int> active_media_uids;
     std::set_intersection(focus_uids.begin(), focus_uids.end(),
                           started_player_uids.begin(), started_player_uids.end(),
                           std::inserter(active_media_uids, active_media_uids.begin()));
 
-    // 更新全局状态
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_media_uids) {
@@ -296,8 +274,6 @@ void SystemMonitor::update_audio_state() {
         }
     }
 }
-// =========================================================================================
-
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
@@ -581,11 +557,6 @@ bool SystemMonitor::is_uid_using_location(int uid) {
     return uids_using_location_.count(uid) > 0;
 }
 
-GlobalStatsData SystemMonitor::get_global_stats() const {
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    return current_stats_;
-}
-
 void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_mem_kb, long& total_swap_kb, float& total_cpu_percent) {
     total_mem_kb = 0;
     total_swap_kb = 0;
@@ -674,8 +645,8 @@ void SystemMonitor::update_cpu_usage(float& usage) {
         long long delta_total = current_total - prev_total;
         if (delta_total > 0) {
             long long delta_idle = current_times.idle_total() - prev_total_cpu_times_.idle_total();
-            usage = 100.0f * static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total);
-            usage = std::max(0.0f, std::min(100.0f, usage));
+            float cpu_usage = 100.0f * static_cast<float>(delta_total - delta_idle) / static_cast<float>(delta_total);
+            usage = std::max(0.0f, std::min(100.0f, cpu_usage));
         } else {
             usage = 0.0f;
         }
