@@ -60,7 +60,10 @@ data class LogEntry(
 data class MetricsRecord(
     val timestamp: Long,
     val cpuUsagePercent: Float,
-    val memUsedKb: Long,
+    val memTotalKb: Long,
+    val memAvailableKb: Long,
+    val swapTotalKb: Long,
+    val swapFreeKb: Long,
     val batteryLevel: Int,
     val batteryTempCelsius: Float,
     val batteryPowerWatt: Float,

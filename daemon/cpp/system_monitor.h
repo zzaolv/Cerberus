@@ -2,7 +2,7 @@
 #ifndef CERBERUS_SYSTEM_MONITOR_H
 #define CERBERUS_SYSTEM_MONITOR_H
 
-#include "time_series_database.h" // [新增] 引入新的头文件
+#include "time_series_database.h"
 #include <string>
 #include <mutex>
 #include <map>
@@ -11,15 +11,10 @@
 #include <thread>
 #include <atomic>
 #include <functional>
-#include <optional> // [新增]
+#include <optional>
 
-struct GlobalStatsData {
-    float total_cpu_usage_percent = 0.0f;
-    long total_mem_kb = 0;
-    long avail_mem_kb = 0;
-    long swap_total_kb = 0;
-    long swap_free_kb = 0;
-};
+// [移除] GlobalStatsData 结构体已完全被 MetricsRecord 取代
+// struct GlobalStatsData { ... };
 
 struct CpuTimeSlice {
     long long app_jiffies = 0;
@@ -44,10 +39,10 @@ public:
     SystemMonitor();
     ~SystemMonitor();
     
-    // [修改] 接口现在返回一个完整的 MetricsRecord
     std::optional<MetricsRecord> collect_current_metrics();
     
-    GlobalStatsData get_global_stats() const;
+    // [移除] get_global_stats() 接口，所有数据通过 collect_current_metrics() 提供
+    // GlobalStatsData get_global_stats() const;
 
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
     std::string get_app_name_from_pid(int pid);
@@ -69,13 +64,15 @@ public:
     NetworkSpeed get_cached_network_speed(int uid);
 
 private:
-    // [新增] 增加新的私有采集函数
     void update_cpu_usage(float& usage);
     void update_mem_info(long& total, long& available, long& swap_total, long& swap_free);
     bool get_screen_state();
     void get_battery_stats(int& level, float& temp, float& power, bool& charging);
 
     int get_pid_from_pkg(const std::string& pkg_name);
+
+    // [新增] 重新添加缺失的函数声明
+    void top_app_monitor_thread();
 
     struct TotalCpuTimes {
         long long user = 0, nice = 0, system = 0, idle = 0;
@@ -85,11 +82,11 @@ private:
     };
     
     mutable std::mutex data_mutex_;
-    GlobalStatsData current_stats_;
+    // [移除] current_stats_ 成员变量
+    // GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
-    // ... (其他私有成员保持不变)
     std::set<int> last_known_top_pids_;
     std::thread monitor_thread_;
     std::atomic<bool> monitoring_active_{false};

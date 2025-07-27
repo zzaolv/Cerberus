@@ -30,6 +30,21 @@
 
 namespace fs = std::filesystem;
 
+// [修复] 将 exec_shell_pipe 移到文件顶部，确保在使用前已定义
+static std::string exec_shell_pipe(const char* cmd) {
+    std::array<char, 256> buffer;
+    std::string result;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) {
+        LOGE("popen() failed for cmd: %s!", cmd);
+        return "";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
 // [新增] 辅助函数，安全读取文件内容
 static std::optional<long> read_long_from_file(const std::string& path) {
     std::ifstream file(path);
@@ -57,7 +72,7 @@ SystemMonitor::SystemMonitor() {
         LOGE("Could not find top-app tasks file. Active monitoring disabled.");
     }
     float dummy_usage;
-    update_cpu_usage(dummy_usage)
+    update_cpu_usage(dummy_usage);
 }
 
 SystemMonitor::~SystemMonitor() {
@@ -72,13 +87,11 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
         std::chrono::system_clock::now().time_since_epoch()).count();
     
     update_cpu_usage(record.cpu_usage_percent);
-    update_mem_info(current_stats_.total_mem_kb, record.mem_used_kb, current_stats_.swap_total_kb, current_stats_.swap_free_kb);
-    record.mem_used_kb = current_stats_.total_mem_kb - record.mem_used_kb; // 计算已用内存
+    update_mem_info(record.mem_total_kb, record.mem_available_kb, record.swap_total_kb, record.swap_free_kb);
     
     get_battery_stats(record.battery_level, record.battery_temp_celsius, record.battery_power_watt, record.is_charging);
     record.is_screen_on = get_screen_state();
 
-    // 复用现有已更新的状态
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         record.is_audio_playing = !uids_playing_audio_.empty();
@@ -87,16 +100,10 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
         std::lock_guard<std::mutex> lock(location_uids_mutex_);
         record.is_location_active = !uids_using_location_.empty();
     }
-    
-    // 更新内部的 GlobalStatsData (部分数据)
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        current_stats_.total_cpu_usage_percent = record.cpu_usage_percent;
-        current_stats_.avail_mem_kb = current_stats_.total_mem_kb - record.mem_used_kb;
-    }
 
     return record;
 }
+
 
 // [新增] 获取屏幕状态
 bool SystemMonitor::get_screen_state() {
@@ -379,20 +386,6 @@ NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
     return NetworkSpeed();
 }
 
-static std::string exec_shell_pipe(const char* cmd) {
-    std::array<char, 128> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-    if (!pipe) {
-        LOGE("popen() failed!");
-        return "";
-    }
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    return result;
-}
-
 std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
     std::map<int, TrafficStats> snapshot;
     const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
@@ -586,11 +579,6 @@ int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
 bool SystemMonitor::is_uid_using_location(int uid) {
     std::lock_guard<std::mutex> lock(location_uids_mutex_);
     return uids_using_location_.count(uid) > 0;
-}
-
-void SystemMonitor::update_global_stats() {
-    update_cpu_usage();
-    update_mem_info();
 }
 
 GlobalStatsData SystemMonitor::get_global_stats() const {

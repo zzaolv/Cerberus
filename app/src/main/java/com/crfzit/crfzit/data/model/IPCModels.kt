@@ -123,7 +123,10 @@ data class LogEntryPayload(
 data class MetricsRecordPayload(
     val timestamp: Long,
     @SerializedName("cpu_usage_percent") val cpuUsagePercent: Float,
-    @SerializedName("mem_used_kb") val memUsedKb: Long,
+    @SerializedName("mem_total_kb") val memTotalKb: Long,
+    @SerializedName("mem_available_kb") val memAvailableKb: Long,
+    @SerializedName("swap_total_kb") val swapTotalKb: Long,
+    @SerializedName("swap_free_kb") val swapFreeKb: Long,
     @SerializedName("battery_level") val batteryLevel: Int,
     @SerializedName("battery_temp_celsius") val batteryTempCelsius: Float,
     @SerializedName("battery_power_watt") val batteryPowerWatt: Float,

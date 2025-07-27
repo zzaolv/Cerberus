@@ -66,11 +66,9 @@ private:
 
 class StateManager {
 public:
-    // [修改] 构造函数注入新依赖
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
-    // [新增] 新的数据处理入口
     void process_new_metrics(const MetricsRecord& record);
     bool tick_state_machine();
     bool perform_deep_scan();
@@ -80,7 +78,6 @@ public:
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
-
     void on_wakeup_request(const json& payload);
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
@@ -88,6 +85,7 @@ public:
 
 private:
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
+
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
     bool reconcile_process_state_full(); 
     void load_all_configs();
@@ -96,30 +94,26 @@ private:
     void remove_pid_from_app(int pid);
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
-    
     bool is_app_playing_audio(const AppRuntimeState& app);
-    
-    // [核心新增] 定时解冻相关的辅助函数
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
-
     bool check_timers();
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
-    std::shared_ptr<Logger> logger_; // [新增]
-    std::shared_ptr<TimeSeriesDatabase> ts_db_; // [新增]
+    std::shared_ptr<Logger> logger_;
+    std::shared_ptr<TimeSeriesDatabase> ts_db_;
     
     MasterConfig master_config_;
-    std::unique_ptr<DozeManager> doze_manager_; // [新增]
+    std::unique_ptr<DozeManager> doze_manager_;
+
     std::mutex state_mutex_;
     std::set<int> last_known_top_pids_;
     
     std::optional<MetricsRecord> last_metrics_record_;
     
-    // [核心新增] 时间线环形缓冲区和时针
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     

@@ -2,18 +2,20 @@
 #include "time_series_database.h"
 #include "uds_server.h"
 
-// [新增] 全局UdsServer引用，用于实时数据广播
 extern std::unique_ptr<UdsServer> g_server;
 
 std::shared_ptr<TimeSeriesDatabase> TimeSeriesDatabase::instance_ = nullptr;
 std::mutex TimeSeriesDatabase::instance_mutex_;
 
-// [新增] MetricsRecord 序列化为 JSON
+// [修改] 更新 to_json() 以匹配新的结构体
 json MetricsRecord::to_json() const {
     return json{
         {"timestamp", timestamp_ms},
         {"cpu_usage_percent", cpu_usage_percent},
-        {"mem_used_kb", mem_used_kb},
+        {"mem_total_kb", mem_total_kb},
+        {"mem_available_kb", mem_available_kb},
+        {"swap_total_kb", swap_total_kb},
+        {"swap_free_kb", swap_free_kb},
         {"battery_level", battery_level},
         {"battery_temp_celsius", battery_temp_celsius},
         {"battery_power_watt", battery_power_watt},
@@ -46,7 +48,6 @@ void TimeSeriesDatabase::add_record(const MetricsRecord& record) {
         records_.push_back(record);
     }
     
-    // [新增] 广播新的记录给UI客户端
     if (g_server) {
         g_server->broadcast_message(json{
             {"type", "stream.new_stats_record"},

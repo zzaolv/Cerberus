@@ -1058,19 +1058,18 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
 json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     json payload;
-    GlobalStatsData global_stats = sys_monitor_->get_global_stats();
     if (last_metrics_record_) {
         payload["global_stats"] = {
             {"total_cpu_usage_percent", last_metrics_record_->cpu_usage_percent},
-            {"total_mem_kb", global_stats.total_mem_kb},
-            {"avail_mem_kb", global_stats.avail_mem_kb},
-            {"swap_total_kb", global_stats.swap_total_kb},
-            {"swap_free_kb", global_stats.swap_free_kb},
+            {"total_mem_kb", last_metrics_record_->mem_total_kb},
+            {"avail_mem_kb", last_metrics_record_->mem_available_kb},
+            {"swap_total_kb", last_metrics_record_->swap_total_kb},
+            {"swap_free_kb", last_metrics_record_->swap_free_kb},
         };
     } else {
         payload["global_stats"] = json::object();
     }
-
+    
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
         if (app.pids.empty() && app.config.policy == AppPolicy::EXEMPTED && !app.is_foreground) {
