@@ -21,8 +21,9 @@
 #include <chrono>
 #include <string>
 #include <memory>
+#include <map>
 
-#define LOG_TAG "cerberusd_monitor_v20_fixed"
+#define LOG_TAG "cerberusd_monitor_v22_strict_audio"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -133,8 +134,8 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
-        double current_a = static_cast<double>(*current_now_ua) / 1000.0;
-        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0;
+        double current_a = static_cast<double>(*current_now_ua) / 1000000.0; // uA to A
+        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0; // uV to V
         power = static_cast<float>(std::abs(current_a * voltage_v));
     } else {
         power = 0.0f;
@@ -197,9 +198,14 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+// [核心修复] 采用新的、更严格的音频状态检测逻辑
 void SystemMonitor::update_audio_state() {
-    std::set<int> focus_uids;
-    std::set<int> started_player_uids;
+    struct PlayerStates {
+        int started_count = 0;
+        int total_count = 0;
+    };
+    std::map<int, PlayerStates> uid_player_states;
+    
     std::array<char, 2048> buffer;
 
     FILE* pipe = popen("dumpsys audio", "r");
@@ -208,69 +214,74 @@ void SystemMonitor::update_audio_state() {
         return;
     }
 
-    enum class ParseSection { NONE, FOCUS_STACK, PLAYERS };
-    ParseSection current_section = ParseSection::NONE;
-
+    bool in_players_section = false;
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
-        if (line.find("Audio Focus stack entries") != std::string::npos) {
-            current_section = ParseSection::FOCUS_STACK;
-            continue;
-        }
+        // 定位到 "players:" 部分的开始
         if (line.rfind("  players:", 0) == 0) {
-            current_section = ParseSection::PLAYERS;
-            continue;
-        }
-        if (line.find("RecordActivityMonitor dump time:") != std::string::npos || line.find("AudioDeviceBroker:") != std::string::npos) {
-            current_section = ParseSection::NONE;
-        }
-
-        if (current_section == ParseSection::NONE) {
+            in_players_section = true;
             continue;
         }
         
-        try {
-            if (current_section == ParseSection::FOCUS_STACK) {
-                const std::string uid_marker = "-- uid: ";
-                size_t marker_pos = line.find(uid_marker);
-                if (marker_pos != std::string::npos) {
-                    int uid = std::stoi(line.substr(marker_pos + uid_marker.length()));
-                    if (uid >= 10000) {
-                        focus_uids.insert(uid);
-                    }
-                }
-            } else if (current_section == ParseSection::PLAYERS) {
-                if (line.find("state:started") != std::string::npos && line.find("usage=USAGE_MEDIA") != std::string::npos) {
-                    const std::string upid_marker = "u/pid:";
-                    size_t upid_marker_pos = line.find(upid_marker);
-                    if (upid_marker_pos != std::string::npos) {
-                        int uid = 0;
-                        std::stringstream ss(line.substr(upid_marker_pos + upid_marker.length()));
+        if (in_players_section) {
+            // "players:" 部分结束的标志
+            if (line.find("  ducked players piids:") == 0 || line.find("  faded out players piids:") == 0) {
+                in_players_section = false;
+                break; // 已完成players部分的解析，可以提前退出循环
+            }
+            
+            // 解析每一行播放器信息
+            if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
+                try {
+                    int uid = -1;
+                    std::string state_str;
+
+                    // 提取 u/pid:
+                    size_t upid_pos = line.find("u/pid:");
+                    if (upid_pos != std::string::npos) {
+                        std::stringstream ss(line.substr(upid_pos + 6));
                         ss >> uid;
-                        if (uid >= 10000) {
-                            started_player_uids.insert(uid);
-                        }
                     }
+                    if (uid < 10000) continue; // 只关心应用UID
+
+                    // 提取 state:
+                    size_t state_pos = line.find(" state:");
+                    if (state_pos != std::string::npos) {
+                        std::stringstream ss(line.substr(state_pos + 7));
+                        ss >> state_str;
+                    }
+
+                    // 更新状态统计
+                    uid_player_states[uid].total_count++;
+                    if (state_str == "started") {
+                        uid_player_states[uid].started_count++;
+                    }
+                } catch (const std::exception& e) {
+                    // 忽略解析错误
                 }
             }
-        } catch (const std::exception& e) { /* 忽略解析错误 */ }
+        }
     }
     pclose(pipe);
 
-    std::set<int> active_media_uids;
-    std::set_intersection(focus_uids.begin(), focus_uids.end(),
-                          started_player_uids.begin(), started_player_uids.end(),
-                          std::inserter(active_media_uids, active_media_uids.begin()));
-
+    // [核心修复] 根据新的、严格的规则生成最终的活跃UID列表
+    std::set<int> active_uids;
+    for (const auto& [uid, states] : uid_player_states) {
+        // 只有当该UID存在播放器，并且所有播放器都是 'started' 状态时，才认为其活跃
+        if (states.total_count > 0 && states.started_count == states.total_count) {
+            active_uids.insert(uid);
+        }
+    }
+    
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
-        if (uids_playing_audio_ != active_media_uids) {
+        if (uids_playing_audio_ != active_uids) {
             std::stringstream ss;
-            for(int uid : active_media_uids) { ss << uid << " "; }
-            LOGI("Active audio UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
-                 uids_playing_audio_.size(), active_media_uids.size(), ss.str().c_str());
-            uids_playing_audio_ = active_media_uids;
+            for(int uid : active_uids) { ss << uid << " "; }
+            LOGI("Active audio UIDs changed (strict policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+                 uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
+            uids_playing_audio_ = active_uids;
         }
     }
 }
@@ -615,6 +626,7 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
             if (line.rfind("Name:", 0) == 0) {
                 std::string name = line.substr(line.find(":") + 1);
                 name.erase(0, name.find_first_not_of(" \t"));
+                name.erase(name.find_last_not_of(" \t\n") + 1);
                 return name;
             }
         }

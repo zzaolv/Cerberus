@@ -8,9 +8,12 @@
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-enum class FreezeMethod {
-    CGROUP_V2,
-    METHOD_SIGSTOP
+// [新增] 引入binder_frozen_status_info结构体定义，用于查询状态
+struct binder_frozen_status_info {
+    __u32 pid;
+    __u32 is_frozen;
+    __u32 sync_recv;
+    __u32 async_recv;
 };
 
 class ActionExecutor {
@@ -19,8 +22,8 @@ public:
     ~ActionExecutor();
 
     /**
-     * @brief 尝试冻结一个应用实例，采用新的分级策略。
-     * @return 0: 成功 | 1: 需要重试 (主进程软失败) | -1: 彻底失败
+     * @brief 尝试冻结一个应用实例，采用新的分级和自适应协调策略。
+     * @return 0: 成功 | 1: 需要重试 | -1: 彻底失败
      */
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
     
@@ -31,16 +34,17 @@ private:
     void cleanup_binder();
     
     /**
-     * @brief 严格模式的Binder冻结，用于主进程。
-     * @return 0: 成功 | 1: 软失败(EAGAIN) | -1: 硬失败或致命失败
+     * @brief 查询指定PID的Binder是否已冻结。
+     * @return true 如果已冻结，false 如果未冻结或查询失败。
      */
-    int handle_binder_freeze_strict(const std::vector<int>& pids, bool freeze);
+    bool is_pid_binder_frozen(int pid);
 
     /**
-     * @brief 宽容模式的Binder冻结/解冻，用于次要进程和所有解冻操作。
+     * @brief 智能协调版的Binder冻结/解冻操作。
+     * @return 0: 成功 | 1: 软失败(EAGAIN) | -1: 硬失败或致命失败
      */
-    void handle_binder_freeze_lenient(const std::vector<int>& pids, bool freeze);
-
+    int handle_binder_op_with_coordination(int pid, bool freeze);
+    
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();
     std::string get_instance_cgroup_path(const AppInstanceKey& key) const;
