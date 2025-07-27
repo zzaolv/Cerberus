@@ -5,17 +5,12 @@
 #include <string>
 #include <vector>
 #include <utility> 
-#include <linux/android/binder.h> // [核心修复] 包含系统头文件来获取结构体定义
+#include <linux/android/binder.h>
 
-// [核心修复] 移除我们自己的重复定义
-/*
-struct binder_frozen_status_info {
-    __u32 pid;
-    __u32 is_frozen;
-    __u32 sync_recv;
-    __u32 async_recv;
-};
-*/
+// [核心修复] 将 AppInstanceKey 的定义移到这里，因为这是第一个需要它的头文件
+using AppInstanceKey = std::pair<std::string, int>;
+
+struct binder_frozen_status_info; // 前向声明，因为完整的定义在 <linux/android/binder.h>
 
 class ActionExecutor {
 public:

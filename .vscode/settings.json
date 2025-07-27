@@ -5,6 +5,7 @@
         "filesystem": "cpp",
         "xstring": "cpp",
         "set": "cpp",
-        "memory": "cpp"
+        "memory": "cpp",
+        "vector": "cpp"
     }
 }

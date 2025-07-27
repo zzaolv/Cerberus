@@ -13,11 +13,14 @@
 #include <chrono> 
 #include "database_manager.h"
 #include "system_monitor.h"
-#include "action_executor.h"
+#include "action_executor.h" // 这个头文件现在提供了 AppInstanceKey
 #include "logger.h"                 
 #include "time_series_database.h"   
 
 using json = nlohmann::json;
+
+// [核心修复] AppInstanceKey 的定义已移至 action_executor.h，这里不再需要
+// using AppInstanceKey = std::pair<std::string, int>; 
 
 struct AppRuntimeState {
     enum class Status { 
@@ -110,13 +113,12 @@ private:
     std::set<int> last_known_top_pids_;
     
     std::optional<MetricsRecord> last_metrics_record_;
-    // [核心修复] 用于电量计算的状态变量
     std::optional<std::pair<int, long long>> last_battery_level_info_; 
     
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     
-    using AppInstanceKey = std::pair<std::string, int>; 
+    // AppInstanceKey is now defined in action_executor.h, which is included above
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
