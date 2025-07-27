@@ -123,12 +123,12 @@ std::vector<LogEntry> Logger::get_history(int limit) const {
 void Logger::ensure_log_file() {
     time_t now = time(nullptr);
     tm ltm;
-    localtime_r(&now, <m);
+    localtime_r(&now, &ltm);  // 修正：<m -> &ltm
 
     if (ltm.tm_yday != current_day_) {
         current_day_ = ltm.tm_yday;
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d", <m);
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &ltm);  // 修正：<m -> &ltm
         current_log_file_path_ = fs::path(log_dir_path_) / (std::string("events-") + buf + ".log");
     }
 }
