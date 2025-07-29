@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v24_final_log"
+#define LOG_TAG "cerberusd_state_v25_strategy"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -78,8 +78,6 @@ void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
     }
 }
 
-
-
 DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record) {
     auto now = std::chrono::steady_clock::now();
     auto duration_in_state = std::chrono::duration_cast<std::chrono::seconds>(now - state_change_timestamp_).count();
@@ -121,8 +119,6 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
 
     return DozeEvent::NONE;
 }
-
-
 
 // --- StateManager 实现 ---
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act,
@@ -481,11 +477,30 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-   
     load_all_configs();
     reconcile_process_state_full();
     last_battery_level_info_ = std::nullopt;    
     LOGI("StateManager Initialized.");
+}
+
+// [战略调整] 新的主逻辑入口
+bool StateManager::evaluate_and_execute_strategy() {
+    bool state_has_changed = false;
+
+    // 阶段一：权威识别
+    auto visible_packages = sys_monitor_->get_visible_packages();
+    state_has_changed |= update_foreground_state(visible_packages);
+
+    // 阶段二：深度审计
+    if(state_has_changed) { // 仅在前台应用列表变化时才需要重新审计
+        auto process_tree = sys_monitor_->get_full_process_tree();
+        audit_app_structures(process_tree);
+    }
+    
+    // 阶段三：决策与打击 (通过定时器)
+    state_has_changed |= tick_state_machine();
+    
+    return state_has_changed;
 }
 
 void StateManager::process_new_metrics(const MetricsRecord& record) {
@@ -513,11 +528,10 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [核心新增] Doze 退出报告生成
 void StateManager::generate_doze_exit_report() {
     using AppCpuActivity = std::pair<std::string, double>;
     std::vector<AppCpuActivity> activity_list;
-    const long TCK = sysconf(_SC_CLK_TCK); // Ticks per second
+    const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
 
     for (const auto& [key, app] : managed_apps_) {
@@ -525,17 +539,13 @@ void StateManager::generate_doze_exit_report() {
         
         long long start_jiffies = 0;
         auto it = doze_start_cpu_jiffies_.find(key);
-        if (it != doze_start_cpu_jiffies_.end()) {
-            start_jiffies = it->second;
-        }
+        if (it != doze_start_cpu_jiffies_.end()) start_jiffies = it->second;
 
         long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids(app.pids);
         
         if (end_jiffies > start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) { // 只报告有明显活动的
-                activity_list.push_back({app.app_name, cpu_seconds});
-            }
+            if (cpu_seconds > 0.01) activity_list.push_back({app.app_name, cpu_seconds});
         }
     }
     
@@ -545,13 +555,9 @@ void StateManager::generate_doze_exit_report() {
     }
     
     std::sort(activity_list.begin(), activity_list.end(), 
-              [](const AppCpuActivity& a, const AppCpuActivity& b) {
-        return a.second > b.second;
-    });
+              [](const AppCpuActivity& a, const AppCpuActivity& b) { return a.second > b.second; });
 
-    std::stringstream report_ss;
-    report_ss << "Doze期间应用的CPU活跃时间:";
-    logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
+    logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间:");
 
     for (const auto& activity : activity_list) {
         std::stringstream line_ss;
@@ -560,7 +566,6 @@ void StateManager::generate_doze_exit_report() {
     }
 }
 
-// [核心新增] 充电状态变化日志
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (old_record.is_charging != new_record.is_charging) {
         if (new_record.is_charging) {
@@ -570,7 +575,6 @@ void StateManager::handle_charging_state_change(const MetricsRecord& old_record,
         }
     }
 }
-
 
 void StateManager::analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (new_record.is_charging || new_record.battery_level < 0) {
@@ -597,15 +601,10 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
            << "[功率: " << std::fixed << std::setprecision(2) << new_record.battery_power_watt << "W] "
            << "[温度: " << std::fixed << std::setprecision(1) << new_record.battery_temp_celsius << "°C]";
         
-        LogLevel level = LogLevel::BATTERY;
-        std::string category = "电量";
-        if (time_per_percent_ms < 300000) {
-            level = LogLevel::WARN;
-            category = "电量警告";
-            ss << " (耗电较快)";
-        } else {
-            ss << " (状态更新)";
-        }
+        LogLevel level = (time_per_percent_ms < 300000) ? LogLevel::WARN : LogLevel::BATTERY;
+        std::string category = (time_per_percent_ms < 300000) ? "电量警告" : "电量";
+        if (level == LogLevel::WARN) ss << " (耗电较快)";
+        else ss << " (状态更新)";
         
         logger_->log(level, category, ss.str());
         
@@ -634,6 +633,119 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
+// [战略调整] “深度审计”实现
+void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for(auto& [key, app] : managed_apps_) {
+        // 重置审计状态
+        app.has_rogue_structure = false;
+        app.rogue_puppet_pid = -1;
+        app.rogue_master_pid = -1;
+
+        if (app.is_foreground || app.pids.size() < 2) continue;
+
+        for (int pid : app.pids) {
+            auto it_pid = process_tree.find(pid);
+            if (it_pid == process_tree.end()) continue;
+            
+            const auto& child_info = it_pid->second;
+            // 检查子进程是否为前台adj
+            if (child_info.oom_score_adj <= 0) { // 0 or lower is typically foreground
+                auto it_ppid = process_tree.find(child_info.ppid);
+                // 检查父进程是否也属于此应用
+                if (it_ppid != process_tree.end() && it_ppid->second.pkg_name == app.package_name) {
+                    const auto& parent_info = it_ppid->second;
+                    // 检查父进程是否为后台adj
+                    if (parent_info.oom_score_adj > 200) { // >200 is background
+                        LOGW("AUDIT: Rogue structure detected in %s! Puppet: pid=%d (adj=%d), Master: pid=%d (adj=%d)",
+                            app.package_name.c_str(), child_info.pid, child_info.oom_score_adj,
+                            parent_info.pid, parent_info.oom_score_adj);
+                        logger_->log(LogLevel::WARN, "审计", "检测到流氓进程结构", app.package_name, app.user_id);
+                        app.has_rogue_structure = true;
+                        app.rogue_puppet_pid = child_info.pid;
+                        app.rogue_master_pid = parent_info.pid;
+                        break; // 找到一个就够了
+                    }
+                }
+            }
+        }
+    }
+}
+
+// [战略调整] "权威识别" - 使用 dumpsys 结果更新前台状态
+bool StateManager::update_foreground_state(const std::set<std::string>& visible_packages) {
+    bool state_has_changed = false;
+    bool probe_config_needs_update = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (visible_packages == last_known_visible_packages_) {
+            return false;
+        }
+        
+        last_known_visible_packages_ = visible_packages;
+        
+        std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
+        if (!current_ime_pkg.empty()) {
+            last_known_visible_packages_.insert(current_ime_pkg);
+        }
+
+        std::set<AppInstanceKey> prev_foreground_keys;
+        for (const auto& [key, app] : managed_apps_) {
+            if (app.is_foreground) prev_foreground_keys.insert(key);
+        }
+
+        std::set<AppInstanceKey> final_foreground_keys;
+        for (const auto& [key, app] : managed_apps_) {
+            if (last_known_visible_packages_.count(key.first) > 0) {
+                final_foreground_keys.insert(key);
+            }
+        }
+        
+        time_t now = time(nullptr);
+        for (auto& [key, app] : managed_apps_) {
+            bool is_now_foreground = final_foreground_keys.count(key);
+            if (app.is_foreground != is_now_foreground) {
+                state_has_changed = true;
+                app.is_foreground = is_now_foreground;
+
+                if (is_now_foreground) { // 切换到前台
+                    if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
+                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
+                         app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    }
+                    if (unfreeze_and_observe_nolock(app, "切换至前台")) {
+                        probe_config_needs_update = true;
+                    }
+                    app.observation_since = 0;
+                    app.background_since = 0;
+                    app.freeze_retry_count = 0;
+                } else { // 切换到后台
+                     if (prev_foreground_keys.count(key) > 0) {
+                        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        long long current_runtime_ms = (app.last_foreground_timestamp_ms > 0) ? (now_ms - app.last_foreground_timestamp_ms) : 0;
+                        app.total_runtime_ms += current_runtime_ms;
+                        long total_seconds = app.total_runtime_ms / 1000;
+                        std::stringstream ss_msg;
+                        ss_msg << "已关闭 [本次: " << (current_runtime_ms / 1000) << "s] [累计: "
+                               << (total_seconds / 3600) << "h" << ((total_seconds % 3600) / 60) << "m" << (total_seconds % 60) << "s]";
+                        logger_->log(LogLevel::ACTION_CLOSE, "关闭", ss_msg.str(), app.package_name, app.user_id);
+                    }
+                    if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
+                        app.observation_since = now;
+                    }
+                }
+            }
+        }
+    }
+
+    if (probe_config_needs_update) {
+        notify_probe_of_config_change();
+    }
+    return state_has_changed;
+}
+
+// ... on_wakeup_request, on_temp_unfreeze, update_master_config 等函数保持不变 ...
 void StateManager::on_wakeup_request(const json& payload) {
     bool state_changed = false;
     try {
@@ -760,121 +872,6 @@ void StateManager::update_master_config(const MasterConfig& config) {
     logger_->log(LogLevel::EVENT, "配置", "核心配置已更新");
 }
 
-bool StateManager::update_foreground_state(const std::set<int>& top_pids) {
-    bool state_has_changed = false;
-    bool probe_config_needs_update = false;
-
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (top_pids == last_known_top_pids_) {
-            return false;
-        }
-        
-        last_known_top_pids_ = top_pids;
-        
-        std::set<AppInstanceKey> prev_foreground_keys;
-        for (auto& [key, app] : managed_apps_) {
-            if (app.is_foreground) {
-                prev_foreground_keys.insert(key);
-            }
-        }
-        
-        std::set<AppInstanceKey> top_apps;
-        for (int pid : top_pids) {
-            auto it = pid_to_app_map_.find(pid);
-            if (it != pid_to_app_map_.end()) {
-                top_apps.insert({it->second->package_name, it->second->user_id});
-            }
-        }
-        std::set<AppInstanceKey> final_foreground_keys = top_apps;
-        if (top_apps.size() > 1) {
-            std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
-            if (!current_ime_pkg.empty()) {
-                std::set<AppInstanceKey> non_ime_top_apps;
-                for (const auto& key : top_apps) {
-                    if (key.first != current_ime_pkg) non_ime_top_apps.insert(key);
-                }
-                if (!non_ime_top_apps.empty()) final_foreground_keys = non_ime_top_apps;
-            }
-        }
-
-        // [日志修复] 规范化打开/关闭日志
-        for (const auto& key : final_foreground_keys) {
-            if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
-                auto it = managed_apps_.find(key);
-                if (it != managed_apps_.end()) {
-                    AppRuntimeState& app = it->second;
-                    if (app.current_status == AppRuntimeState::Status::FROZEN) {
-                         unfreeze_and_observe_nolock(app, "切换至前台");
-                    }
-                    // message 只包含事件本身
-                    logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
-                    app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count();
-                }
-            }
-        }
-        for (const auto& key : prev_foreground_keys) {
-            if (final_foreground_keys.find(key) == final_foreground_keys.end()) {
-                auto it = managed_apps_.find(key);
-                if (it != managed_apps_.end()) {
-                    AppRuntimeState& app = it->second;
-                    long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count();
-                    long long current_runtime_ms = 0;
-                    if (app.last_foreground_timestamp_ms > 0) {
-                        current_runtime_ms = now_ms - app.last_foreground_timestamp_ms;
-                        app.total_runtime_ms += current_runtime_ms;
-                    }
-                    long total_seconds = app.total_runtime_ms / 1000;
-                    long hours = total_seconds / 3600;
-                    long minutes = (total_seconds % 3600) / 60;
-                    long seconds = total_seconds % 60;
-                    std::stringstream ss_msg;
-                    // message 只包含事件详情
-                    ss_msg << "已关闭 [本次: " << (current_runtime_ms / 1000) << "s] [累计: "
-                           << hours << "h" << minutes << "m" << seconds << "s]";
-                    logger_->log(LogLevel::ACTION_CLOSE, "关闭", ss_msg.str(), app.package_name, app.user_id);
-                }
-            }
-        }
-        
-        time_t now = time(nullptr);
-        for (auto& [key, app] : managed_apps_) {
-            bool is_now_foreground = final_foreground_keys.count(key);
-            if (app.is_foreground != is_now_foreground) {
-                state_has_changed = true;
-                app.is_foreground = is_now_foreground;
-                if (is_now_foreground) {
-                    if (app.observation_since > 0 || app.background_since > 0) {
-                        LOGI("State: Timers cancelled for %s (became foreground).", key.first.c_str());
-                    }
-                    app.observation_since = 0;
-                    app.background_since = 0;
-                    app.freeze_retry_count = 0;
-                    if (unfreeze_and_observe_nolock(app, "切换至前台")) {
-                        probe_config_needs_update = true;
-                    }
-                } else {
-                    app.background_since = 0;
-                    if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
-                        LOGI("State: Observation period started for %s (became background).", key.first.c_str());
-                        app.observation_since = now;
-                    } else {
-                        app.observation_since = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    if (probe_config_needs_update) {
-        notify_probe_of_config_change();
-    }
-    return state_has_changed;
-}
 
 bool StateManager::tick_state_machine() {
     bool changed1 = check_timers();
@@ -886,6 +883,7 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
+// [战略调整] "精确打击" - 在 check_timers 中实现
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -921,18 +919,13 @@ bool StateManager::check_timers() {
                     for (size_t i = 0; i < active_reasons.size(); ++i) {
                         reason_str += active_reasons[i] + (i < active_reasons.size() - 1 ? " / " : "");
                     }
-                    LOGI("TICK: %s is active due to %s, restarting observation.", app.package_name.c_str(), reason_str.c_str());
-                    
-                    // [日志修复] message只包含事件描述
                     std::string log_msg = "因 " + reason_str + " 活跃而推迟冻结";
                     logger_->log(LogLevel::ACTION_DELAY, "延迟", log_msg, app.package_name, app.user_id);
-                    
                     app.observation_since = now;
                     changed = true;
                     continue;
                 }
                 
-                LOGI("TICK: %s is inactive, starting freeze timer.", app.package_name.c_str());
                 app.background_since = now;
                 app.freeze_retry_count = 0;
                 changed = true;
@@ -942,19 +935,30 @@ bool StateManager::check_timers() {
                 int timeout_sec = 0;
                 if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
                 else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
-                
-                if (app.freeze_retry_count > 0) {
-                    timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
-                }
+                if (app.freeze_retry_count > 0) timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
 
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                    LOGI("TICK: Timeout for %s. Attempting to freeze (try #%d)...", app.package_name.c_str(), app.freeze_retry_count + 1);
-                    
-                    int freeze_result = action_executor_->freeze(key, app.pids);
+                    std::vector<int> pids_to_freeze;
+                    std::string strategy_log_msg;
+
+                    // [核心战术选择]
+                    if (app.has_rogue_structure) {
+                        strategy_log_msg = "检测到流氓结构，执行“斩首行动”";
+                        for (int pid : app.pids) {
+                            if (pid != app.rogue_puppet_pid) {
+                                pids_to_freeze.push_back(pid);
+                            }
+                        }
+                    } else {
+                        strategy_log_msg = "执行“常规打击”";
+                        pids_to_freeze = app.pids;
+                    }
+
+                    logger_->log(LogLevel::INFO, "冻结", strategy_log_msg, app.package_name, app.user_id);
+                    int freeze_result = action_executor_->freeze(key, pids_to_freeze);
 
                     switch (freeze_result) {
                         case 0:
-                            LOGI("STRATEGY: Freeze successful for %s.", key.first.c_str());
                             app.current_status = AppRuntimeState::Status::FROZEN;
                             logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结", app.package_name, app.user_id);
                             schedule_timed_unfreeze(app);
@@ -962,24 +966,19 @@ bool StateManager::check_timers() {
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
-                        
                         case 1:
                             app.freeze_retry_count++;
                             if (app.freeze_retry_count > MAX_FREEZE_RETRIES) {
-                                LOGW("STRATEGY: Giving up on freezing %s after %d retries.", key.first.c_str(), MAX_FREEZE_RETRIES);
                                 logger_->log(LogLevel::WARN, "冻结", "多次尝试冻结失败，已放弃", app.package_name, app.user_id);
                                 app.background_since = 0;
                                 app.freeze_retry_count = 0;
                             } else {
-                                LOGW("STRATEGY: Freeze for %s needs retry. Scheduling next attempt.", key.first.c_str());
                                 logger_->log(LogLevel::INFO, "冻结", "冻结遇到软失败，将重试", app.package_name, app.user_id);
                                 app.background_since = now; 
                             }
                             break;
-
                         case -1:
                         default:
-                            LOGE("STRATEGY: Freeze for %s failed fatally. Aborting.", key.first.c_str());
                              logger_->log(LogLevel::ERROR, "冻结", "冻结遇到致命错误，已中止", app.package_name, app.user_id);
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
@@ -996,6 +995,7 @@ bool StateManager::check_timers() {
     }
     return changed;
 }
+// ... 其他函数保持不变 ...
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
     if (!master_config_.is_timed_unfreeze_enabled || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
@@ -1366,8 +1366,8 @@ void StateManager::remove_pid_from_app(int pid) {
             app->is_foreground = false;
             app->background_since = 0;
             app->observation_since = 0;
-            app->freeze_retry_count = 0;
-            app->undetected_since = 0;
+            app.freeze_retry_count = 0;
+            app.undetected_since = 0;
             cancel_timed_unfreeze(*app);
         }
     }

@@ -23,7 +23,7 @@
 #include <memory>
 #include <map>
 
-#define LOG_TAG "cerberusd_monitor_v22_strict_audio"
+#define LOG_TAG "cerberusd_monitor_v23_strategy"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -79,6 +79,97 @@ SystemMonitor::~SystemMonitor() {
     stop_top_app_monitor();
     stop_network_snapshot_thread();
 }
+
+// [核心实现] "权威识别" - 解析 dumpsys activity
+std::set<std::string> SystemMonitor::get_visible_packages() {
+    std::set<std::string> visible_packages;
+    std::string result = exec_shell_pipe("dumpsys activity activities");
+    std::stringstream ss(result);
+    std::string line;
+
+    while (std::getline(ss, line)) {
+        bool found = false;
+        // 查找两个关键行
+        if (line.find("ResumedActivity:") != std::string::npos) {
+            found = true;
+        } else if (line.find("VisibleActivityProcess:") != std::string::npos) {
+            found = true;
+        }
+        
+        if (found) {
+            std::stringstream line_ss(line);
+            std::string token;
+            // 跳过前面的部分，直到找到 "u<id>" 格式的用户标识
+            while (line_ss >> token && (token.find('u') != 0 || !std::isdigit(token[1]))) {
+                // do nothing
+            }
+
+            // 下一个 token 应该就是包名
+            if (line_ss >> token) {
+                size_t slash_pos = token.find('/');
+                if (slash_pos != std::string::npos) {
+                    visible_packages.insert(token.substr(0, slash_pos));
+                }
+            }
+        }
+    }
+    return visible_packages;
+}
+
+// [核心实现] "深度审计数据" - 获取完整的进程树信息
+std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
+    std::map<int, ProcessInfo> process_map;
+    constexpr int PER_USER_RANGE = 100000;
+
+    for (const auto& entry : fs::directory_iterator("/proc")) {
+        if (!entry.is_directory()) continue;
+        
+        int pid = 0;
+        try {
+            pid = std::stoi(entry.path().filename().string());
+        } catch (...) { continue; }
+
+        char path_buffer[256];
+        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+        struct stat st;
+        if (stat(path_buffer, &st) != 0 || st.st_uid < 10000) continue;
+
+        ProcessInfo info;
+        info.pid = pid;
+        info.uid = st.st_uid;
+        info.user_id = info.uid / PER_USER_RANGE;
+        
+        // 读取 /stat 获取 ppid
+        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/stat", pid);
+        std::ifstream stat_file(path_buffer);
+        if (stat_file.is_open()) {
+            std::string s;
+            stat_file >> s >> s >> s >> info.ppid;
+        }
+
+        // 读取 /oom_score_adj
+        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/oom_score_adj", pid);
+        info.oom_score_adj = read_long_from_file(path_buffer).value_or(1001);
+
+        // 读取 /cmdline 获取包名
+        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
+        std::ifstream cmdline_file(path_buffer);
+        if (cmdline_file.is_open()) {
+            std::string cmdline;
+            std::getline(cmdline_file, cmdline, '\0');
+             if (!cmdline.empty() && cmdline.find('.') != std::string::npos) {
+                size_t colon_pos = cmdline.find(':');
+                info.pkg_name = (colon_pos != std::string::npos) ? cmdline.substr(0, colon_pos) : cmdline;
+            }
+        }
+
+        if (!info.pkg_name.empty()) {
+            process_map[pid] = info;
+        }
+    }
+    return process_map;
+}
+
 
 long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& pids) {
     long long total_jiffies = 0;
@@ -150,7 +241,7 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
-        double current_a = static_cast<double>(*current_now_ua) / 1000000.0;
+        double current_a = static_cast<double>(*current_now_ua) / 1000.0;
         double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0;
         power = static_cast<float>(std::abs(current_a * voltage_v));
     } else {
@@ -241,7 +332,6 @@ void SystemMonitor::update_audio_state() {
         if (in_players_section) {
             if (line.find("  ducked players piids:") == 0 || line.find("  faded out players piids:") == 0) {
                 in_players_section = false;
-                // [核心修复] 移除 break; 让循环继续读取完所有输出
             }
             
             if (line.find("AudioPlaybackConfiguration") != std::string::npos) {

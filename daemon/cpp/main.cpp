@@ -7,8 +7,8 @@
 #include "main.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
-#include "logger.h"                 // [新增]
-#include "time_series_database.h"   // [新增]
+#include "logger.h"
+#include "time_series_database.h"
 #include <csignal>
 #include <thread>
 #include <chrono>
@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v19_timeline"
+#define LOG_TAG "cerberusd_main_v21_hotfix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -27,12 +27,11 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// [修改] 全局变量定义
-std::unique_ptr<UdsServer> g_server; // 改为非静态
+std::unique_ptr<UdsServer> g_server;
 static std::shared_ptr<StateManager> g_state_manager;
 static std::shared_ptr<SystemMonitor> g_sys_monitor;
-static std::shared_ptr<Logger> g_logger; // [新增]
-static std::shared_ptr<TimeSeriesDatabase> g_ts_db; // [新增]
+static std::shared_ptr<Logger> g_logger;
+static std::shared_ptr<TimeSeriesDatabase> g_ts_db;
 static std::atomic<bool> g_is_running = true;
 std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
@@ -43,31 +42,18 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        // [新增] 日志与统计相关的API处理
         if (type == "query.get_all_logs") {
             auto logs = g_logger->get_history(msg.value("limit", 200));
             json log_array = json::array();
-            for(const auto& log : logs) {
-                log_array.push_back(log.to_json());
-            }
-            g_server->send_message(client_fd, json{
-                {"type", "resp.all_logs"},
-                {"req_id", msg.value("req_id", "")},
-                {"payload", log_array}
-            }.dump());
-            return; // 处理完毕，直接返回
+            for(const auto& log : logs) { log_array.push_back(log.to_json()); }
+            g_server->send_message(client_fd, json{ {"type", "resp.all_logs"}, {"req_id", msg.value("req_id", "")}, {"payload", log_array} }.dump());
+            return;
         } else if (type == "query.get_history_stats") {
             auto records = g_ts_db->get_all_records();
             json record_array = json::array();
-            for(const auto& record : records) {
-                record_array.push_back(record.to_json());
-            }
-            g_server->send_message(client_fd, json{
-                {"type", "resp.history_stats"},
-                {"req_id", msg.value("req_id", "")},
-                {"payload", record_array}
-            }.dump());
-            return; // 处理完毕，直接返回
+            for(const auto& record : records) { record_array.push_back(record.to_json()); }
+            g_server->send_message(client_fd, json{ {"type", "resp.history_stats"}, {"req_id", msg.value("req_id", "")}, {"payload", record_array} }.dump());
+            return;
         }
 
         if (!g_state_manager) return;
@@ -87,7 +73,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             }
             g_top_app_refresh_tickets = 1; 
         } 
-        // [核心修改] 更新 cmd.set_master_config 的处理逻辑
         else if (type == "cmd.set_master_config") {
             MasterConfig cfg;
             const auto& payload = msg.at("payload");
@@ -107,7 +92,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
-
 
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);
@@ -136,72 +120,62 @@ void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
     if (g_server) g_server->stop();
-    if (g_logger) g_logger->stop(); // [新增] 确保日志记录器也停止
+    if (g_logger) g_logger->stop();
 }
 
-// [修改] 工作线程主循环
 void worker_thread_func() {
     LOGI("Worker thread started.");
-    g_top_app_refresh_tickets = 2; 
+    g_top_app_refresh_tickets = 2;
     
-    int deep_scan_countdown = 10;
-    int audio_scan_countdown = 3;
-    int location_scan_countdown = 15;
+    // [核心修复] 重新加入轮询计时器
+    int audio_scan_countdown = 5;
+    int location_scan_countdown = 7;
     
-    // 主循环采样周期（秒）
     const int SAMPLING_INTERVAL_SEC = 2;
 
     while (g_is_running) {
         auto loop_start_time = std::chrono::steady_clock::now();
+        bool state_changed = false;
 
-        // 1. [数据采集] 采集当前系统指标
+        // 1. [数据采集]
         auto metrics_opt = g_sys_monitor->collect_current_metrics();
         if (metrics_opt) {
-            // 2. [数据存储] 存入时间序列数据库
             g_ts_db->add_record(*metrics_opt);
-            
-            // 3. [数据分析与决策] 将新记录传递给状态管理器进行处理
             g_state_manager->process_new_metrics(*metrics_opt);
         }
 
-        // 4. [状态机推进]
-        bool needs_broadcast = false;
-        
+        // 2. [情报与决策]
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
-            auto top_pids = g_sys_monitor->read_top_app_pids();
-            if (g_state_manager->update_foreground_state(top_pids)) {
-                needs_broadcast = true;
-            }
+            state_changed = true;
         }
         
-        // 降低非核心监控的频率，以节省资源
+        // 核心战略执行
+        if (g_state_manager->evaluate_and_execute_strategy()) {
+            state_changed = true;
+        }
+
+        // 定期深度扫描，同步进程列表
+        if (g_state_manager->perform_deep_scan()) {
+            state_changed = true;
+        }
+        
+        // [核心修复] 重新加入音频和定位状态的周期性检查
         if (--audio_scan_countdown <= 0) {
             g_sys_monitor->update_audio_state();
             audio_scan_countdown = 3; // ~6 seconds
         }
-
         if (--location_scan_countdown <= 0) {
             g_sys_monitor->update_location_state();
-            location_scan_countdown = 7; // ~30 seconds
+            location_scan_countdown = 15; // ~30 seconds
         }
 
-        if (g_state_manager->tick_state_machine()) {
-            needs_broadcast = true;
-        }
-
-        if (--deep_scan_countdown <= 0) {
-            if (g_state_manager->perform_deep_scan()) {
-                needs_broadcast = true;
-            }
-            deep_scan_countdown = 10; // ~20 seconds
-        }
-
-        if (needs_broadcast) {
+        // 3. [同步]
+        if (state_changed) {
             broadcast_dashboard_update();
         }
 
-        // 5. [循环周期控制]
+        // 4. [循环周期控制]
         auto loop_end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(loop_end_time - loop_start_time);
         if (duration.count() < SAMPLING_INTERVAL_SEC) {
@@ -219,24 +193,23 @@ int main(int argc, char *argv[]) {
 
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
-    const std::string LOG_DIR = DATA_DIR + "/logs"; // [新增] 日志目录
+    const std::string LOG_DIR = DATA_DIR + "/logs";
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
     
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
-        if (!fs::exists(LOG_DIR)) fs::create_directories(LOG_DIR); // [新增]
+        if (!fs::exists(LOG_DIR)) fs::create_directories(LOG_DIR);
     } catch(const fs::filesystem_error& e) {
         LOGE("Failed to create data dir: %s", e.what());
         return 1;
     }
 
-    // [修改] 初始化所有核心组件
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
     auto action_executor = std::make_shared<ActionExecutor>();
     g_sys_monitor = std::make_shared<SystemMonitor>();
-    g_logger = Logger::get_instance(LOG_DIR); // [新增]
-    g_ts_db = TimeSeriesDatabase::get_instance(); // [新增]
-    g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db); // [修改] 注入新依赖
+    g_logger = Logger::get_instance(LOG_DIR);
+    g_ts_db = TimeSeriesDatabase::get_instance();
+    g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
     
     g_logger->log(LogLevel::EVENT, "Daemon", "守护进程已启动");
     

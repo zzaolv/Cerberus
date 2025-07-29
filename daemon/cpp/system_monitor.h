@@ -28,6 +28,16 @@ struct TrafficStats {
     long long tx_bytes = 0;
 };
 
+// [核心实现] 新增结构体，用于深度审计
+struct ProcessInfo {
+    int pid = 0;
+    int ppid = 0;
+    int oom_score_adj = 1001; // 默认为一个无效/后台值
+    std::string pkg_name;
+    int user_id = -1;
+    int uid = -1;
+};
+
 
 extern std::atomic<int> g_top_app_refresh_tickets;
 
@@ -41,16 +51,17 @@ public:
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
     std::string get_app_name_from_pid(int pid);
 
-    /**
-     * @brief [新增] 获取指定PID列表的总CPU Jiffies，用于Doze报告。
-     * @return pids的总CPU Jiffies，如果pids为空或无法读取则返回0。
-     */
     long long get_total_cpu_jiffies_for_pids(const std::vector<int>& pids);
 
     void start_top_app_monitor();
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
     
+    // [核心实现] “权威识别”接口
+    std::set<std::string> get_visible_packages();
+    // [核心实现] “深度审计”的数据来源接口
+    std::map<int, ProcessInfo> get_full_process_tree();
+
     void update_audio_state();
     bool is_uid_playing_audio(int uid);
     
