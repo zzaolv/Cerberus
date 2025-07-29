@@ -32,8 +32,9 @@ class ProbeHook : IXposedHookLoadPackage {
     private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v19_Final"
+        private const val TAG = "CerberusProbe_v21_Robust_Hook"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
+        private const val PER_USER_RANGE = 100000
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -45,9 +46,9 @@ class ProbeHook : IXposedHookLoadPackage {
 
         try {
             val classLoader = lpparam.classLoader
-            
+
             hookActivityStarter(classLoader)
-            hookAMSForProcessStateChanges(classLoader)
+            hookAMSForProcessStateChanges(classLoader) // 关键修复点
             hookWakelocksAndAlarms(classLoader)
             hookServicesAndBroadcasts(classLoader)
             hookNotificationService(classLoader)
@@ -68,9 +69,8 @@ class ProbeHook : IXposedHookLoadPackage {
                         if (request != null) {
                             val intent = XposedHelpers.getObjectField(request, "intent") as? Intent
                             val callingUid = XposedHelpers.getIntField(request, "callingUid")
-                            
+
                             intent?.component?.packageName?.let { packageName ->
-                                // [终极修复] 直接从 Request 对象中获取最权威的 userId
                                 val userId = XposedHelpers.getIntField(request, "userId")
 
                                 if (callingUid >= Process.FIRST_APPLICATION_UID) {
@@ -94,42 +94,49 @@ class ProbeHook : IXposedHookLoadPackage {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
 
+    // [核心修复] findAndHookMethod 增加更详细的错误日志
     private fun findAndHookMethod(
         clazz: Class<*>?,
         methodName: String,
         hook: XC_MethodHook,
         vararg parameterTypes: Any
     ) {
-        if (clazz == null) return
+        if (clazz == null) {
+            logError("Cannot hook $methodName because class is null.")
+            return
+        }
         try {
             XposedHelpers.findAndHookMethod(clazz, methodName, *parameterTypes, hook)
-            log("SUCCESS: Hooked ${clazz.simpleName}#$methodName (exact match).")
-        } catch (e: NoSuchMethodError) {
-            var hooked = false
-            clazz.declaredMethods
-                .filter { it.name == methodName && it.parameterCount >= parameterTypes.size }
-                .forEach {
-                    XposedBridge.hookMethod(it, hook)
-                    hooked = true
-                }
-            if(hooked) log("SUCCESS: Hooked ${clazz.simpleName}#$methodName (fuzzy match).")
+            log("SUCCESS: Hooked ${clazz.simpleName}#$methodName.")
         } catch (t: Throwable) {
-            logError("Failed to hook ${clazz.simpleName}#$methodName: $t")
+            logError("Failed to hook ${clazz.simpleName}#$methodName with specific signature: $t")
         }
     }
 
+    // [核心修复] 重点修正此函数
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
+        val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader)
+        if (processRecordClass == null) {
+            logError("FATAL: Could not find com.android.server.am.ProcessRecord class!")
+            return
+        }
+
+        val hook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                handleProcessStateChange(param.thisObject)
+            }
+        }
+
         try {
-            val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader) ?: return
-            findAndHookMethod(processRecordClass, "setCurProcState", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleProcessStateChange(param.thisObject)
-                }
-            }, Int::class.javaPrimitiveType as Any)
-        } catch (t: Throwable) {
-            logError("Failed to place process state hook: $t")
+            XposedHelpers.findAndHookMethod(processRecordClass, "setCurProcState", Int::class.javaPrimitiveType, hook)
+            log("SUCCESS: Hooked ProcessRecord#setCurProcState(int).")
+        } catch (e: NoSuchMethodError) {
+            logError("FATAL: Could not find ProcessRecord#setCurProcState(int). Process state changes will not be detected! Error: $e")
+        } catch(t: Throwable) {
+            logError("FATAL: An unexpected error occurred while hooking ProcessRecord#setCurProcState: $t")
         }
     }
+
 
     private fun handleProcessStateChange(processRecord: Any) {
         val appInfo = XposedHelpers.getObjectField(processRecord, "info") as? ApplicationInfo ?: return
@@ -143,14 +150,34 @@ class ProbeHook : IXposedHookLoadPackage {
         if (foregroundStatusCache.put(uid, isForeground) == isForeground) return
 
         val packageName = appInfo.packageName
-        val userId = UserHandle.getUserId(uid)
+        val userId = uid / PER_USER_RANGE
         val eventType = if (isForeground) "event.app_foreground" else "event.app_background"
         log("EVENT: App ${packageName}(${userId}) -> ${if(isForeground) "foreground" else "background"}")
         sendEventToDaemon(eventType, mapOf("package_name" to packageName, "user_id" to userId))
     }
 
-     private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {
-        findAndHookMethod(findClass("com.android.server.power.PowerManagerService", classLoader), "acquireWakeLockInternal", object : XC_MethodHook() {
+    // [改进] 对于防御性hook，可以使用更宽容的模糊匹配
+    private fun findAndHookMethodFuzzy(
+        clazz: Class<*>?,
+        methodName: String,
+        hook: XC_MethodHook
+    ) {
+        if (clazz == null) return
+        var hooked = false
+        clazz.declaredMethods
+            .filter { it.name == methodName }
+            .forEach {
+                XposedBridge.hookMethod(it, hook)
+                hooked = true
+            }
+        if (hooked) {
+            log("SUCCESS: Hooked ${clazz.simpleName}#$methodName (fuzzy).")
+        }
+    }
+
+
+    private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {
+        findAndHookMethodFuzzy(findClass("com.android.server.power.PowerManagerService", classLoader), "acquireWakeLockInternal", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val uid = param.args.find { it is Int && it >= Process.FIRST_APPLICATION_UID } as? Int ?: return
                 if (ConfigManager.isUidFrozen(uid)) {
@@ -173,12 +200,12 @@ class ProbeHook : IXposedHookLoadPackage {
                     }
                 }
             })
-            log("SUCCESS: Dynamic hook placed on AlarmManagerService#triggerAlarmsLocked.")
+            log("SUCCESS: Hooked AlarmManagerService#triggerAlarmsLocked (all overloads).")
         }
     }
 
     private fun hookServicesAndBroadcasts(classLoader: ClassLoader) {
-        findAndHookMethod(findClass("com.android.server.am.ActiveServices", classLoader), "bringUpServiceLocked", object: XC_MethodHook() {
+        findAndHookMethodFuzzy(findClass("com.android.server.am.ActiveServices", classLoader), "bringUpServiceLocked", object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val serviceRecord = param.args.find { it != null && it::class.java.name.endsWith("ServiceRecord") } ?: return
                 val appInfo = XposedHelpers.getObjectField(serviceRecord, "appInfo") as? ApplicationInfo ?: return
@@ -191,7 +218,7 @@ class ProbeHook : IXposedHookLoadPackage {
     }
 
     private fun hookNotificationService(classLoader: ClassLoader) {
-        findAndHookMethod(findClass("com.android.server.notification.NotificationManagerService", classLoader), "enqueueNotificationInternal", object: XC_MethodHook() {
+        findAndHookMethodFuzzy(findClass("com.android.server.notification.NotificationManagerService", classLoader), "enqueueNotificationInternal", object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val uid = param.args.find { it is Int } as? Int ?: return
                 if (ConfigManager.isUidFrozen(uid)) {
@@ -221,7 +248,7 @@ class ProbeHook : IXposedHookLoadPackage {
         try {
             XposedHelpers.findAndHookMethod(Process::class.java, "sendSignal", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, hook)
             XposedHelpers.findAndHookMethod(Process::class.java, "sendSignalQuiet", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, hook)
-            log("SUCCESS: Hooked Process#sendSignal(Quiet).")
+            log("SUCCESS: Hooked Process#sendSignal and sendSignalQuiet.")
         } catch (t: Throwable) {
             logError("Failed to hook Process#sendSignal: $t")
         }
@@ -247,7 +274,7 @@ class ProbeHook : IXposedHookLoadPackage {
     }
 
     private fun hookMediaAndAudio(classLoader: ClassLoader) {
-        findAndHookMethod(findClass("com.android.server.audio.FocusRequester", classLoader), "handleFocusGain", object: XC_MethodHook() {
+        findAndHookMethodFuzzy(findClass("com.android.server.audio.FocusRequester", classLoader), "handleFocusGain", object: XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val uid = XposedHelpers.getIntField(param.thisObject, "mCallingUid")
                 if (ConfigManager.isUidFrozen(uid)) {
@@ -342,7 +369,7 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
                 if (payload.has("frozen_pids")) {
                     frozenPids = payload.getAsJsonArray("frozen_pids").map { it.asInt }.toSet()
-                    if (frozenPids.isNotEmpty() || frozenUids.isNotEmpty()) {
+                    if (frozenUids.isNotEmpty() || frozenPids.isNotEmpty()) {
                         XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs and ${frozenPids.size} PIDs.")
                     }
                 }
