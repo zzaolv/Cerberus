@@ -12,7 +12,7 @@
 #include <set>
 #include <chrono> 
 #include "database_manager.h"
-#include "system_monitor.h" // AppInstanceKey is now here
+#include "system_monitor.h"
 #include "action_executor.h"
 #include "logger.h"                 
 #include "time_series_database.h"   
@@ -42,6 +42,8 @@ struct AppRuntimeState {
     bool has_rogue_structure = false;
     int rogue_puppet_pid = -1;
     int rogue_master_pid = -1;
+    
+    bool has_logged_rogue_warning = false;
 
     int scheduled_unfreeze_idx = -1;
 
@@ -86,6 +88,10 @@ public:
     json get_full_config_for_ui();
     json get_probe_config_payload();
     void on_wakeup_request(const json& payload);
+    
+    // [核心修复] 新增主动解冻接口
+    void on_proactive_unfreeze_request(const json& payload);
+
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
@@ -108,7 +114,6 @@ private:
     void cancel_timed_unfreeze(AppRuntimeState& app);
     bool check_timers();
 
-    // [核心修复] 参数类型变更
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
 
@@ -122,7 +127,6 @@ private:
     std::unique_ptr<DozeManager> doze_manager_;
 
     std::mutex state_mutex_;
-    // [核心修复] 状态变量类型变更
     std::set<AppInstanceKey> last_known_visible_app_keys_;
     
     std::optional<MetricsRecord> last_metrics_record_;

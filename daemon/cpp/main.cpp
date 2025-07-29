@@ -58,7 +58,11 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (!g_state_manager) return;
 
-        if (type == "cmd.request_temp_unfreeze_pkg") {
+        // [核心修复] 添加对主动解冻指令的处理
+        if (type == "cmd.proactive_unfreeze") {
+            g_state_manager->on_proactive_unfreeze_request(msg.at("payload"));
+        }
+        else if (type == "cmd.request_temp_unfreeze_pkg") {
             g_state_manager->on_temp_unfreeze_request_by_pkg(msg.at("payload"));
         } else if (type == "cmd.request_temp_unfreeze_uid") {
             g_state_manager->on_temp_unfreeze_request_by_uid(msg.at("payload"));

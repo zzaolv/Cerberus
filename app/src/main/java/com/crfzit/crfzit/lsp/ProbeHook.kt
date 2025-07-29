@@ -5,6 +5,7 @@ import android.app.Notification
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Process
+import android.os.UserHandle
 import com.crfzit.crfzit.data.model.CerberusMessage
 import com.crfzit.crfzit.data.uds.UdsClient
 import com.google.gson.Gson
@@ -28,10 +29,10 @@ class ProbeHook : IXposedHookLoadPackage {
 
     private val foregroundStatusCache = ConcurrentHashMap<Int, Boolean>()
     private val unfreezeRequestTimestamps = ConcurrentHashMap<String, Long>()
-    private val THROTTLE_INTERVAL_MS = 5000 // 5秒节流
+    private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v15_Ultimate"
+        private const val TAG = "CerberusProbe_v19_Final"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
     }
 
@@ -44,6 +45,8 @@ class ProbeHook : IXposedHookLoadPackage {
 
         try {
             val classLoader = lpparam.classLoader
+            
+            hookActivityStarter(classLoader)
             hookAMSForProcessStateChanges(classLoader)
             hookWakelocksAndAlarms(classLoader)
             hookServicesAndBroadcasts(classLoader)
@@ -56,7 +59,37 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // --- 健壮的方法/类查找器 ---
+    private fun hookActivityStarter(classLoader: ClassLoader) {
+        findClass("com.android.server.wm.ActivityStarter", classLoader)?.let { clazz ->
+            val executeHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    try {
+                        val request = param.args.find { it != null && it::class.java.name == "com.android.server.wm.ActivityStarter\$Request" }
+                        if (request != null) {
+                            val intent = XposedHelpers.getObjectField(request, "intent") as? Intent
+                            val callingUid = XposedHelpers.getIntField(request, "callingUid")
+                            
+                            intent?.component?.packageName?.let { packageName ->
+                                // [终极修复] 直接从 Request 对象中获取最权威的 userId
+                                val userId = XposedHelpers.getIntField(request, "userId")
+
+                                if (callingUid >= Process.FIRST_APPLICATION_UID) {
+                                    log("PROACTIVE: Activity start detected for $packageName (user $userId). Requesting unfreeze.")
+                                    sendEventToDaemon("cmd.proactive_unfreeze", mapOf("package_name" to packageName, "user_id" to userId))
+                                }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        logError("Error in ActivityStarter#execute hook: $t")
+                    }
+                }
+            }
+            XposedBridge.hookAllMethods(clazz, "execute", executeHook)
+            log("SUCCESS: Hooked com.android.server.wm.ActivityStarter#execute for proactive unfreezing.")
+        } ?: logError("FATAL: Could not find com.android.server.wm.ActivityStarter class!")
+    }
+
+
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
@@ -72,7 +105,6 @@ class ProbeHook : IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(clazz, methodName, *parameterTypes, hook)
             log("SUCCESS: Hooked ${clazz.simpleName}#$methodName (exact match).")
         } catch (e: NoSuchMethodError) {
-            // 模糊匹配：查找所有同名方法，尝试匹配参数数量
             var hooked = false
             clazz.declaredMethods
                 .filter { it.name == methodName && it.parameterCount >= parameterTypes.size }
@@ -86,12 +118,9 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // --- 1. 核心监控：进程状态 ---
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
         try {
             val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader) ?: return
-            // setCurProcState 是更新进程adj/state后最终调用的核心方法，非常稳定
-            // [**已修复**] 将 Int::class.javaPrimitiveType 强制转换为 Any
             findAndHookMethod(processRecordClass, "setCurProcState", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     handleProcessStateChange(param.thisObject)
@@ -109,20 +138,18 @@ class ProbeHook : IXposedHookLoadPackage {
 
         val adj = XposedHelpers.getIntField(processRecord, "mCurAdj")
         val procState = XposedHelpers.getIntField(processRecord, "mCurProcState")
-        // PERCEPTIBLE_APP_ADJ = 200, PROCESS_STATE_TOP = 2
         val isForeground = adj <= 200 || procState == 2
 
         if (foregroundStatusCache.put(uid, isForeground) == isForeground) return
 
         val packageName = appInfo.packageName
-        val userId = uid / 100000
+        val userId = UserHandle.getUserId(uid)
         val eventType = if (isForeground) "event.app_foreground" else "event.app_background"
         log("EVENT: App ${packageName}(${userId}) -> ${if(isForeground) "foreground" else "background"}")
         sendEventToDaemon(eventType, mapOf("package_name" to packageName, "user_id" to userId))
     }
 
-    // --- 2. 唤醒防御：Wakelock & Alarm ---
-    private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {
+     private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {
         findAndHookMethod(findClass("com.android.server.power.PowerManagerService", classLoader), "acquireWakeLockInternal", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val uid = param.args.find { it is Int && it >= Process.FIRST_APPLICATION_UID } as? Int ?: return
@@ -150,7 +177,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // --- 3. 唤醒防御：Service & Broadcast ---
     private fun hookServicesAndBroadcasts(classLoader: ClassLoader) {
         findAndHookMethod(findClass("com.android.server.am.ActiveServices", classLoader), "bringUpServiceLocked", object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
@@ -164,7 +190,6 @@ class ProbeHook : IXposedHookLoadPackage {
         })
     }
 
-    // --- 4. 唤醒防御：通知 ---
     private fun hookNotificationService(classLoader: ClassLoader) {
         findAndHookMethod(findClass("com.android.server.notification.NotificationManagerService", classLoader), "enqueueNotificationInternal", object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
@@ -181,16 +206,15 @@ class ProbeHook : IXposedHookLoadPackage {
         })
     }
 
-    // --- 5. 冻结保护：信号 & ANR ---
     private fun hookProcessSignal(classLoader: ClassLoader) {
         val hook = object: XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val pid = param.args[0] as Int
                 val signal = param.args[1] as Int
-                if (signal == 9 && ConfigManager.isPidFrozen(pid)) { // 9 = SIGKILL
+                if (signal == 9 && ConfigManager.isPidFrozen(pid)) {
                     log("PROTECT: Intercepted SIGKILL for frozen PID: $pid. Thawing.")
                     requestTempUnfreezeForPid(pid)
-                    param.result = null // 阻止发送SIGKILL
+                    param.result = null
                 }
             }
         }
@@ -222,9 +246,7 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // --- 6. 智能解冻：媒体 & 音频焦点 & FCM ---
     private fun hookMediaAndAudio(classLoader: ClassLoader) {
-        // 音频焦点获取
         findAndHookMethod(findClass("com.android.server.audio.FocusRequester", classLoader), "handleFocusGain", object: XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val uid = XposedHelpers.getIntField(param.thisObject, "mCallingUid")
@@ -235,7 +257,6 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         })
 
-        // FCM (通过修改广播Intent)
         findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { amsClass ->
             amsClass.declaredMethods.find {
                 it.name == "broadcastIntent" && it.parameterCount > 5 && it.parameterTypes.any { clazz -> clazz == Intent::class.java }
@@ -257,7 +278,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // --- 辅助与通信 ---
     private fun isGcmOrFcmIntent(intent: Intent): Boolean {
         val action = intent.action ?: return false
         return action == "com.google.android.c2dm.intent.RECEIVE" || action == "com.google.firebase.MESSAGING_EVENT"

@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v26_final_fix"
+#define LOG_TAG "cerberusd_state_v27_log_dedup"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,6 +21,7 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// ... (status_to_string and DozeManager implementations are unchanged) ...
 static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
@@ -50,7 +51,6 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
     return "BACKGROUND";
 }
 
-// --- DozeManager 实现 ---
 DozeManager::DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor)
     : logger_(logger), action_executor_(executor) {
     state_change_timestamp_ = std::chrono::steady_clock::now();
@@ -120,7 +120,7 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
     return DozeEvent::NONE;
 }
 
-// --- StateManager 实现 ---
+// --- StateManager Implementation ---
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act,
                            std::shared_ptr<Logger> logger, std::shared_ptr<TimeSeriesDatabase> ts_db)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), logger_(logger), ts_db_(ts_db) {
@@ -487,18 +487,14 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
 
-    // 阶段一：权威识别
-    // [编译修复] 调用正确的函数名 get_visible_app_keys
     auto visible_app_keys = sys_monitor_->get_visible_app_keys();
     state_has_changed |= update_foreground_state(visible_app_keys);
 
-    // 阶段二：深度审计
     if(state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
     }
     
-    // 阶段三：决策与打击
     state_has_changed |= tick_state_machine();
     
     return state_has_changed;
@@ -634,6 +630,7 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
+// [核心修复] 实现日志去重逻辑
 void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     for(auto& [key, app] : managed_apps_) {
@@ -653,10 +650,13 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
                 if (it_ppid != process_tree.end() && it_ppid->second.pkg_name == app.package_name) {
                     const auto& parent_info = it_ppid->second;
                     if (parent_info.oom_score_adj > 200) {
-                        LOGW("AUDIT: Rogue structure detected in %s! Puppet: pid=%d (adj=%d), Master: pid=%d (adj=%d)",
-                            app.package_name.c_str(), child_info.pid, child_info.oom_score_adj,
-                            parent_info.pid, parent_info.oom_score_adj);
-                        logger_->log(LogLevel::WARN, "审计", "检测到流氓进程结构", app.package_name, app.user_id);
+                        if (!app.has_logged_rogue_warning) {
+                            LOGW("AUDIT: Rogue structure detected in %s! Puppet: pid=%d (adj=%d), Master: pid=%d (adj=%d)",
+                                app.package_name.c_str(), child_info.pid, child_info.oom_score_adj,
+                                parent_info.pid, parent_info.oom_score_adj);
+                            logger_->log(LogLevel::WARN, "审计", "检测到流氓进程结构", app.package_name, app.user_id);
+                            app.has_logged_rogue_warning = true;
+                        }
                         app.has_rogue_structure = true;
                         app.rogue_puppet_pid = child_info.pid;
                         app.rogue_master_pid = parent_info.pid;
@@ -668,7 +668,7 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
     }
 }
 
-// [编译修复] 修正函数签名和内部变量名
+// [核心修复] 修正函数签名，加入输入法豁免和日志标志重置
 bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
@@ -683,7 +683,6 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
         
         std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
         if (!current_ime_pkg.empty()) {
-            // 输入法通常在 User 0 运行
             last_known_visible_app_keys_.insert({current_ime_pkg, 0});
         }
 
@@ -702,6 +701,7 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
                 app.is_foreground = is_now_foreground;
 
                 if (is_now_foreground) {
+                    app.has_logged_rogue_warning = false; // 重置日志标志
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
                          logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1361,4 +1361,35 @@ void StateManager::remove_pid_from_app(int pid) {
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
     return critical_system_apps_.count(package_name) > 0;
+}
+
+// [核心修复] 实现主动解冻逻辑
+void StateManager::on_proactive_unfreeze_request(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+
+        LOGD("PROACTIVE: Received unfreeze request for %s (user %d)", package_name.c_str(), user_id);
+        
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        AppInstanceKey key = {package_name, user_id};
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end()) {
+            // 只解冻，不进入观察期，因为马上要变前台
+            if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
+                 logger_->log(LogLevel::ACTION_UNFREEZE, "预解冻", "为响应启动请求而解冻", package_name, user_id);
+                 action_executor_->unfreeze(key, it->second.pids);
+                 it->second.current_status = AppRuntimeState::Status::RUNNING;
+                 it->second.background_since = 0;
+                 it->second.observation_since = 0; // 不进入观察期
+                 it->second.freeze_retry_count = 0;
+                 
+                 // 立即广播一次，让UI知道状态已变更
+                 broadcast_dashboard_update();
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing proactive unfreeze request: %s", e.what());
+    }
 }
