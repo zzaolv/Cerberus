@@ -1,7 +1,7 @@
-# magisk/module.prop
-id=cerberus
-name=Project Cerberus
-version=v1.1.1
-versionCode=111
+# D:/project/Cerberus/Cerberus_Module/module.prop
+id=CerberusDaemon
+name=Cerberus Daemon
+version=1.2
+versionCode=3
 author=zzaolv
-description=Initializing... A system-level guardian for performance and battery.
+description=A system-level guardian for performance and battery. Please reboot to activate.

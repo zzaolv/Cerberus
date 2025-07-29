@@ -1,54 +1,35 @@
-# magisk/sepolicy.rule
-#
-# ==============================================
-#      Project Cerberus SELinux Policy V1.1.1
-# ==============================================
+# D:/project/Cerberus/Cerberus_Module/sepolicy.rule
 
-# --- 1. 定义我们的守护进程类型 ---
-# 定义一个名为 cerberus_daemon_t 的新安全域（domain）
-# 定义守护进程可执行文件（cerberusd）的文件类型
-type cerberus_daemon_t, domain;
-type cerberus_daemon_exec_t, exec_type, file_type, vendor_file_type;
+# 1. 定义我们自己的类型
+type cerberusd, domain;
+type cerberusd_exec, exec_type, file_type, system_file_type;
+type cerberus_socket, file_type;
 
-# --- 2. 赋予启动权限 ---
-# 允许 init 域（Magisk通过此域启动服务）来启动我们的守护进程，
-# 并允许进程从 init 域转换到我们自己的 cerberus_daemon_t 域。
-init_daemon_domain(cerberus_daemon_t)
+# 2. 将我们的域设置为宽容模式
+permissive cerberusd;
 
-# --- 3. 赋予数据目录完全控制权限 ---
-# 定义 /data/adb/cerberus 目录的文件类型
-type cerberus_data_file, file_type, data_file_type;
-# 允许守护进程在此目录中创建、搜索、写入、删除目录和文件。
-# 这是存放数据库、日志、Socket文件所必需的。
-allow cerberus_daemon_t cerberus_data_file:dir { create search write add_name remove_name rmdir getattr setattr };
-allow cerberus_daemon_t cerberus_data_file:file { create open read write append getattr setattr unlink };
+# 3. 允许init启动守护进程
+type_transition init system_file:process cerberusd;
 
-# --- 4. 赋予 Unix Domain Socket (UDS) 通信权限 ---
-# 允许守护进程创建、监听和读写自己的UDS。
-allow cerberus_daemon_t self:unix_stream_socket { create listen accept bind read write shutdown getattr setattr };
-# 允许UI(untrusted_app)和Probe(system_server)连接到我们的UDS。
-allow { untrusted_app system_server }:unix_stream_socket connectto;
-allow cerberus_daemon_t { untrusted_app system_server }:unix_stream_socket { read write shutdown };
+# 4. 为守护进程授权
+allow cerberusd self:unix_stream_socket create_socket_perms;
+type_transition cerberusd self:unix_stream_socket cerberus_socket;
 
-# --- 5. 赋予核心冻结机制权限 (cgroup) ---
-# 这是"外科手术式PID精准冻结"的核心权限。
-# 允许守护进程在 cgroupfs 和 cgroup_v2 文件系统下创建我们自己的 'cerberus_frozen' 子目录，
-# 并将目标进程的PID写入其中的文件。
-allow cerberus_daemon_t cgroupfs:dir { create search write add_name remove_name rmdir };
-allow cerberus_daemon_t cgroupfs:file { open read write append getattr };
-allow cerberus_daemon_t cgroup_v2:dir { create search write add_name remove_name rmdir };
-allow cerberus_daemon_t cgroup_v2:file { open read write append getattr };
-# 允许守护进程读取其他进程的cgroup信息以进行状态判断。
-allow cerberus_daemon_t { app_data_file cgroup }:dir search;
+# 5. 授权给客户端（前端App和Probe）
+allow system_server cerberusd:unix_stream_socket connectto;
+allow system_server cerberus_socket:sock_file write;
+allow untrusted_app cerberusd:unix_stream_socket connectto;
+allow untrusted_app cerberus_socket:sock_file write;
 
-# --- 6. 赋予辅助工具权限 ---
-# 允许守护进程执行 shell (sh) 和 toolbox (ls, cat等)
-allow cerberus_daemon_t shell_exec:file rx_file_perms;
-allow cerberus_daemon_t toolbox_exec:file rx_file_perms;
-# 允许访问 /proc 文件系统以获取进程信息。
-allow cerberus_daemon_t proc:dir search;
-allow cerberus_daemon_t proc_stat:file { read open getattr };
+# 6. 修复 CPU 占用问题
+allow cerberusd { app_domain system_server_domain }:{ dir file lnk_file } { search getattr read open };
+allow cerberusd { app_domain system_server_domain }:process { getattr ptrace };
+allow cerberusd shell_exec:file { read execute execute_no_trans open };
+allow cerberusd system_file:file execute_no_trans;
 
-# --- 7. 赋予动态更新模块描述的权限 ---
-# 允许守护进程写入 Magisk 模块自身的属性文件 (module.prop)。
-allow cerberus_daemon_t magisk_file:file { write open };
+# 7. 授权给 service.sh (magisk_service)
+# 允许 magisk_service 查找 (search) 和获取 (getattr) cerberusd 进程的属性
+allow magisk_service cerberusd:process { search getattr };
+# 允许 magisk_service 读/写/打开位于模块目录下的文件 (module.prop)
+allow magisk_service module_data_file:dir { search write add_name remove_name };
+allow magisk_service module_data_file:file { create open read write getattr setattr };

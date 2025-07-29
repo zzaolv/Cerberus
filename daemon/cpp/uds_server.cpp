@@ -11,8 +11,9 @@
 #include <cstddef>
 #include <sys/select.h>
 #include <thread>
+#include <sys/stat.h> // [核心新增] 引入 stat.h 用于 chmod
 
-#define LOG_TAG "cerberusd_uds_v7_hotfix"
+#define LOG_TAG "cerberusd_uds_v8_perms_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -162,8 +163,20 @@ void UdsServer::run() {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    
+    // Abstract Namespace Socket
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
+    
+    // 对于 Filesystem Namespace Socket, 需要 unlink 旧文件并 chmod
+    // 但 Abstract Namespace Socket 不需要，这里我们假设使用 Abstract
+    // 如果需要改为 Filesystem Socket，需要取消下面的注释
+    /*
+    std::string socket_path = "/data/adb/cerberus/" + socket_name_;
+    unlink(socket_path.c_str());
+    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+    */
+
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_name_.length() + 1;
 
     if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
@@ -171,6 +184,13 @@ void UdsServer::run() {
         close(server_fd_);
         return;
     }
+
+    /*
+    // 如果使用 Filesystem Socket，需要在这里 chmod
+    if (chmod(socket_path.c_str(), 0666) < 0) {
+        LOGE("Failed to chmod socket '%s': %s", socket_path.c_str(), strerror(errno));
+    }
+    */
 
     if (listen(server_fd_, 5) == -1) {
         LOGE("Failed to listen on socket: %s", strerror(errno));
