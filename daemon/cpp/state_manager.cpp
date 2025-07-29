@@ -51,8 +51,8 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
 }
 
 // --- DozeManager 实现 ---
-DozeManager::DozeManager(std::shared_ptr<Logger> logger)
-    : logger_(logger) {
+DozeManager::DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor)
+    : logger_(logger), action_executor_(executor) {
     state_change_timestamp_ = std::chrono::steady_clock::now();
 }
 
@@ -64,7 +64,6 @@ void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
 
     switch(new_state) {
         case State::AWAKE:
-            // 退出日志由 process_metrics 触发，这里不重复记录
             break;
         case State::IDLE:
              logger_->log(LogLevel::DOZE, "Doze", "进入IDLE (息屏, 未充电)");
@@ -78,6 +77,7 @@ void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
             break;
     }
 }
+
 
 
 DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record) {
@@ -121,6 +121,7 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
 
     return DozeEvent::NONE;
 }
+
 
 
 // --- StateManager 实现 ---

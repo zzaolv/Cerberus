@@ -13,14 +13,11 @@
 #include <chrono> 
 #include "database_manager.h"
 #include "system_monitor.h"
-#include "action_executor.h" // 这个头文件现在提供了 AppInstanceKey
+#include "action_executor.h"
 #include "logger.h"                 
 #include "time_series_database.h"   
 
 using json = nlohmann::json;
-
-// [核心修复] AppInstanceKey 的定义已移至 action_executor.h，这里不再需要
-// using AppInstanceKey = std::pair<std::string, int>; 
 
 struct AppRuntimeState {
     enum class Status { 
@@ -56,7 +53,8 @@ public:
     enum class State { AWAKE, IDLE, INACTIVE, DEEP_DOZE };
     enum class DozeEvent { NONE, ENTERED_DEEP_DOZE, EXITED_DEEP_DOZE };
     
-    DozeManager(std::shared_ptr<Logger> logger);
+    // [核心修复] 恢复 ActionExecutor 依赖
+    DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor);
     DozeEvent process_metrics(const MetricsRecord& record);
 
 private:
@@ -64,8 +62,10 @@ private:
     
     State current_state_ = State::AWAKE;
     std::chrono::steady_clock::time_point state_change_timestamp_;
-    std::chrono::steady_clock::time_point deep_doze_start_time_; // [新增]
+    std::chrono::steady_clock::time_point deep_doze_start_time_;
     std::shared_ptr<Logger> logger_;
+    // [核心修复] 恢复 ActionExecutor 成员
+    std::shared_ptr<ActionExecutor> action_executor_;
 };
 
 class StateManager {
@@ -89,9 +89,8 @@ public:
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
-    void generate_doze_exit_report(); // [新增]
+    void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
-
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
     bool reconcile_process_state_full(); 
     void load_all_configs();
@@ -124,8 +123,8 @@ private:
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     
-    // AppInstanceKey is now defined in action_executor.h, which is included above
     std::map<AppInstanceKey, long long> doze_start_cpu_jiffies_;
+    
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
