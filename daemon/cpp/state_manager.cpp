@@ -1,5 +1,5 @@
 // daemon/cpp/state_manager.cpp
-#include "state_manager.h"
+#include "state_manager.hh"
 #include "main.h"
 #include <android/log.h>
 #include <filesystem>
@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v25_strategy"
+#define LOG_TAG "cerberusd_state_v25_strategy_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -477,6 +477,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
+   
     load_all_configs();
     reconcile_process_state_full();
     last_battery_level_info_ = std::nullopt;    
@@ -633,11 +634,9 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
-// [战略调整] “深度审计”实现
 void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     for(auto& [key, app] : managed_apps_) {
-        // 重置审计状态
         app.has_rogue_structure = false;
         app.rogue_puppet_pid = -1;
         app.rogue_master_pid = -1;
@@ -649,14 +648,11 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
             if (it_pid == process_tree.end()) continue;
             
             const auto& child_info = it_pid->second;
-            // 检查子进程是否为前台adj
-            if (child_info.oom_score_adj <= 0) { // 0 or lower is typically foreground
+            if (child_info.oom_score_adj <= 0) {
                 auto it_ppid = process_tree.find(child_info.ppid);
-                // 检查父进程是否也属于此应用
                 if (it_ppid != process_tree.end() && it_ppid->second.pkg_name == app.package_name) {
                     const auto& parent_info = it_ppid->second;
-                    // 检查父进程是否为后台adj
-                    if (parent_info.oom_score_adj > 200) { // >200 is background
+                    if (parent_info.oom_score_adj > 200) {
                         LOGW("AUDIT: Rogue structure detected in %s! Puppet: pid=%d (adj=%d), Master: pid=%d (adj=%d)",
                             app.package_name.c_str(), child_info.pid, child_info.oom_score_adj,
                             parent_info.pid, parent_info.oom_score_adj);
@@ -664,7 +660,7 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
                         app.has_rogue_structure = true;
                         app.rogue_puppet_pid = child_info.pid;
                         app.rogue_master_pid = parent_info.pid;
-                        break; // 找到一个就够了
+                        break;
                     }
                 }
             }
@@ -672,7 +668,6 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
     }
 }
 
-// [战略调整] "权威识别" - 使用 dumpsys 结果更新前台状态
 bool StateManager::update_foreground_state(const std::set<std::string>& visible_packages) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
@@ -709,7 +704,7 @@ bool StateManager::update_foreground_state(const std::set<std::string>& visible_
                 state_has_changed = true;
                 app.is_foreground = is_now_foreground;
 
-                if (is_now_foreground) { // 切换到前台
+                if (is_now_foreground) {
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
                          logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -720,7 +715,7 @@ bool StateManager::update_foreground_state(const std::set<std::string>& visible_
                     app.observation_since = 0;
                     app.background_since = 0;
                     app.freeze_retry_count = 0;
-                } else { // 切换到后台
+                } else {
                      if (prev_foreground_keys.count(key) > 0) {
                         long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                         long long current_runtime_ms = (app.last_foreground_timestamp_ms > 0) ? (now_ms - app.last_foreground_timestamp_ms) : 0;
@@ -745,7 +740,6 @@ bool StateManager::update_foreground_state(const std::set<std::string>& visible_
     return state_has_changed;
 }
 
-// ... on_wakeup_request, on_temp_unfreeze, update_master_config 等函数保持不变 ...
 void StateManager::on_wakeup_request(const json& payload) {
     bool state_changed = false;
     try {
@@ -872,7 +866,6 @@ void StateManager::update_master_config(const MasterConfig& config) {
     logger_->log(LogLevel::EVENT, "配置", "核心配置已更新");
 }
 
-
 bool StateManager::tick_state_machine() {
     bool changed1 = check_timers();
     bool changed2 = check_timed_unfreeze();
@@ -883,7 +876,6 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
-// [战略调整] "精确打击" - 在 check_timers 中实现
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -941,7 +933,6 @@ bool StateManager::check_timers() {
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
 
-                    // [核心战术选择]
                     if (app.has_rogue_structure) {
                         strategy_log_msg = "检测到流氓结构，执行“斩首行动”";
                         for (int pid : app.pids) {
@@ -995,8 +986,6 @@ bool StateManager::check_timers() {
     }
     return changed;
 }
-// ... 其他函数保持不变 ...
-
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
     if (!master_config_.is_timed_unfreeze_enabled || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
         return;
@@ -1366,8 +1355,9 @@ void StateManager::remove_pid_from_app(int pid) {
             app->is_foreground = false;
             app->background_since = 0;
             app->observation_since = 0;
-            app.freeze_retry_count = 0;
-            app.undetected_since = 0;
+            // [核心修复] 使用 -> 访问指针成员
+            app->freeze_retry_count = 0;
+            app->undetected_since = 0;
             cancel_timed_unfreeze(*app);
         }
     }
