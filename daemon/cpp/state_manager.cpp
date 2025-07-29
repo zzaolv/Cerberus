@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v25_strategy_fix"
+#define LOG_TAG "cerberusd_state_v26_final_fix"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -484,21 +484,21 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized.");
 }
 
-// [战略调整] 新的主逻辑入口
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
 
     // 阶段一：权威识别
-    auto visible_packages = sys_monitor_->get_visible_packages();
-    state_has_changed |= update_foreground_state(visible_packages);
+    // [编译修复] 调用正确的函数名 get_visible_app_keys
+    auto visible_app_keys = sys_monitor_->get_visible_app_keys();
+    state_has_changed |= update_foreground_state(visible_app_keys);
 
     // 阶段二：深度审计
-    if(state_has_changed) { // 仅在前台应用列表变化时才需要重新审计
+    if(state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
     }
     
-    // 阶段三：决策与打击 (通过定时器)
+    // 阶段三：决策与打击
     state_has_changed |= tick_state_machine();
     
     return state_has_changed;
@@ -668,21 +668,23 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
     }
 }
 
-bool StateManager::update_foreground_state(const std::set<std::string>& visible_packages) {
+// [编译修复] 修正函数签名和内部变量名
+bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (visible_packages == last_known_visible_packages_) {
+        if (visible_app_keys == last_known_visible_app_keys_) {
             return false;
         }
         
-        last_known_visible_packages_ = visible_packages;
+        last_known_visible_app_keys_ = visible_app_keys;
         
         std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
         if (!current_ime_pkg.empty()) {
-            last_known_visible_packages_.insert(current_ime_pkg);
+            // 输入法通常在 User 0 运行
+            last_known_visible_app_keys_.insert({current_ime_pkg, 0});
         }
 
         std::set<AppInstanceKey> prev_foreground_keys;
@@ -690,12 +692,7 @@ bool StateManager::update_foreground_state(const std::set<std::string>& visible_
             if (app.is_foreground) prev_foreground_keys.insert(key);
         }
 
-        std::set<AppInstanceKey> final_foreground_keys;
-        for (const auto& [key, app] : managed_apps_) {
-            if (last_known_visible_packages_.count(key.first) > 0) {
-                final_foreground_keys.insert(key);
-            }
-        }
+        const auto& final_foreground_keys = last_known_visible_app_keys_;
         
         time_t now = time(nullptr);
         for (auto& [key, app] : managed_apps_) {
@@ -1355,7 +1352,6 @@ void StateManager::remove_pid_from_app(int pid) {
             app->is_foreground = false;
             app->background_since = 0;
             app->observation_since = 0;
-            // [核心修复] 使用 -> 访问指针成员
             app->freeze_retry_count = 0;
             app->undetected_since = 0;
             cancel_timed_unfreeze(*app);
