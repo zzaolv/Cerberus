@@ -1393,3 +1393,47 @@ void StateManager::on_proactive_unfreeze_request(const json& payload) {
         LOGE("Error processing proactive unfreeze request: %s", e.what());
     }
 }
+
+// [核心架构] 实现前台事件处理
+void StateManager::on_app_foreground_event(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+
+        LOGD("EVENT: Received foreground event for %s (user %d)", package_name.c_str(), user_id);
+        
+        // 我们相信Probe的事件，但只用它来触发一次权威验证
+        g_top_app_refresh_tickets = 1;
+
+    } catch (const json::exception& e) {
+        LOGE("Error processing foreground event: %s", e.what());
+    }
+}
+
+void StateManager::on_app_background_event(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+        
+        LOGD("EVENT: Received background event for %s (user %d)", package_name.c_str(), user_id);
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            AppInstanceKey key = {package_name, user_id};
+            auto it = managed_apps_.find(key);
+            if (it != managed_apps_.end() && it->second.is_foreground) {
+                // 立即启动观察期，不等主循环
+                it->second.is_foreground = false;
+                it->second.observation_since = time(nullptr);
+            }
+        }
+        
+        // 同样，触发一次权威验证
+        g_top_app_refresh_tickets = 1;
+
+    } catch (const json::exception& e) {
+        LOGE("Error processing background event: %s", e.what());
+    }
+}

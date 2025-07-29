@@ -58,9 +58,13 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (!g_state_manager) return;
 
-        // [核心修复] 添加对主动解冻指令的处理
+        // [核心架构] 完整处理所有来自Probe的事件
         if (type == "cmd.proactive_unfreeze") {
             g_state_manager->on_proactive_unfreeze_request(msg.at("payload"));
+        } else if (type == "event.app_foreground") {
+            g_state_manager->on_app_foreground_event(msg.at("payload"));
+        } else if (type == "event.app_background") {
+            g_state_manager->on_app_background_event(msg.at("payload"));
         }
         else if (type == "cmd.request_temp_unfreeze_pkg") {
             g_state_manager->on_temp_unfreeze_request_by_pkg(msg.at("payload"));

@@ -95,6 +95,9 @@ public:
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
+    // [核心架构] 添加处理前后台事件的接口
+    void on_app_foreground_event(const json& payload);
+    void on_app_background_event(const json& payload);    
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
