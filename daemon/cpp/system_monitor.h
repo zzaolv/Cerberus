@@ -12,6 +12,10 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <utility> // For std::pair
+
+// [核心修复] AppInstanceKey 现在在这里定义，以便多处使用
+using AppInstanceKey = std::pair<std::string, int>;
 
 struct CpuTimeSlice {
     long long app_jiffies = 0;
@@ -28,11 +32,10 @@ struct TrafficStats {
     long long tx_bytes = 0;
 };
 
-// [核心实现] 新增结构体，用于深度审计
 struct ProcessInfo {
     int pid = 0;
     int ppid = 0;
-    int oom_score_adj = 1001; // 默认为一个无效/后台值
+    int oom_score_adj = 1001;
     std::string pkg_name;
     int user_id = -1;
     int uid = -1;
@@ -57,9 +60,8 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
     
-    // [核心实现] “权威识别”接口
-    std::set<std::string> get_visible_packages();
-    // [核心实现] “深度审计”的数据来源接口
+    // [核心修复] 返回值变更为 Set<AppInstanceKey> 以支持分身
+    std::set<AppInstanceKey> get_visible_app_keys();
     std::map<int, ProcessInfo> get_full_process_tree();
 
     void update_audio_state();

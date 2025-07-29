@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v13_robust" // 使用新的版本号
+#define LOG_TAG "cerberusd_action_v14_aggressive"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -31,6 +31,7 @@ ActionExecutor::~ActionExecutor() {
     cleanup_binder();
 }
 
+// [核心修复] 实现"主动压制"策略
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (pids.empty()) return 0;
 
@@ -42,12 +43,20 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
         return -1;
     }
 
+    // 新策略：如果遇到软失败 (EAGAIN)，立即升级为 SIGSTOP
     if (binder_result > 0) {
-        LOGW("Binder freeze for %s resulted in soft failure. Rolling back and retrying later.", key.first.c_str());
-        handle_binder_freeze(pids, false);
-        return 1;
+        LOGW("Binder freeze for %s was resisted (EAGAIN). Escalating to SIGSTOP.", key.first.c_str());
+        freeze_sigstop(pids); // 强制暂停
+        // 即使SIGSTOP了，我们依然尝试cgroup，因为它更节能
+        bool cgroup_ok = freeze_cgroup(key, pids);
+        if (!cgroup_ok) {
+             LOGW("Cgroup freeze failed for %s after SIGSTOP.", key.first.c_str());
+        }
+        // 报告成功，因为进程已经被暂停了
+        return 0;
     }
     
+    // 原有逻辑：Binder成功，继续cgroup
     LOGI("Binder freeze phase for %s completed. Proceeding with physical freeze.", key.first.c_str());
     bool physical_ok = freeze_cgroup(key, pids);
     if (!physical_ok) {
@@ -58,6 +67,7 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
     return 0;
 }
 
+
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     unfreeze_cgroup(key);
     unfreeze_sigstop(pids);
@@ -66,7 +76,6 @@ bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>&
     return true;
 }
 
-// [核心修复] 采用更健壮的“宽容跳过”策略
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
     
@@ -91,20 +100,17 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
                 usleep(50000);
                 continue;
             } 
-            // [核心逻辑] 当我们无权操作某个进程时 (冻结时)，记录警告并跳过它，而不是让整个操作失败
             else if (freeze && (errno == EINVAL || errno == EPERM)) {
                 LOGW("Cannot freeze pid %d (error: %s), likely a privileged process. Skipping this PID.", pid, strerror(errno));
-                op_success = true; // 假装成功，以继续处理下一个pid
-                break; // 跳出重试循环，处理下一个pid
+                op_success = true;
+                break;
             }
-            // 对于其他真正无法恢复的错误，我们才认为是致命失败
             else {
                 LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
                 return -1;
             }
         }
         
-        // 只有在既不是操作成功，也不是软失败的情况下，才认为是致命错误
         if (!op_success && !has_soft_failure) {
             return -1;
         }
@@ -113,7 +119,6 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
     return has_soft_failure ? 1 : 0;
 }
 
-// 这个函数不再被主流程调用，但可以保留以备将来调试
 bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
     struct stat proc_stat;
     char path_buffer[64];

@@ -12,7 +12,7 @@
 #include <set>
 #include <chrono> 
 #include "database_manager.h"
-#include "system_monitor.h"
+#include "system_monitor.h" // AppInstanceKey is now here
 #include "action_executor.h"
 #include "logger.h"                 
 #include "time_series_database.h"   
@@ -39,10 +39,9 @@ struct AppRuntimeState {
     time_t undetected_since = 0;
     int freeze_retry_count = 0;
 
-    // [核心实现] 深度审计结果字段
     bool has_rogue_structure = false;
-    int rogue_puppet_pid = -1; // "傀儡"进程
-    int rogue_master_pid = -1; // "真身"进程
+    int rogue_puppet_pid = -1;
+    int rogue_master_pid = -1;
 
     int scheduled_unfreeze_idx = -1;
 
@@ -76,7 +75,6 @@ public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
-    // [战略调整] 新的主逻辑入口
     bool evaluate_and_execute_strategy();
 
     void process_new_metrics(const MetricsRecord& record);
@@ -110,8 +108,8 @@ private:
     void cancel_timed_unfreeze(AppRuntimeState& app);
     bool check_timers();
 
-    // [战略调整] 新的私有方法
-    bool update_foreground_state(const std::set<std::string>& visible_packages);
+    // [核心修复] 参数类型变更
+    bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
 
     std::shared_ptr<DatabaseManager> db_manager_;
@@ -124,7 +122,8 @@ private:
     std::unique_ptr<DozeManager> doze_manager_;
 
     std::mutex state_mutex_;
-    std::set<std::string> last_known_visible_packages_;
+    // [核心修复] 状态变量类型变更
+    std::set<AppInstanceKey> last_known_visible_app_keys_;
     
     std::optional<MetricsRecord> last_metrics_record_;
     std::optional<std::pair<int, long long>> last_battery_level_info_; 

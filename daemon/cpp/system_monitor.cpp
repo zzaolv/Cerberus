@@ -23,7 +23,7 @@
 #include <memory>
 #include <map>
 
-#define LOG_TAG "cerberusd_monitor_v23_strategy"
+#define LOG_TAG "cerberusd_monitor_v24_clones"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -80,43 +80,61 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-// [核心实现] "权威识别" - 解析 dumpsys activity
-std::set<std::string> SystemMonitor::get_visible_packages() {
-    std::set<std::string> visible_packages;
+// [核心修复] "权威识别" - 解析 dumpsys activity 并提取 UserID
+std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
+    std::set<AppInstanceKey> visible_keys;
     std::string result = exec_shell_pipe("dumpsys activity activities");
     std::stringstream ss(result);
     std::string line;
 
-    while (std::getline(ss, line)) {
-        bool found = false;
-        // 查找两个关键行
-        if (line.find("ResumedActivity:") != std::string::npos) {
-            found = true;
-        } else if (line.find("VisibleActivityProcess:") != std::string::npos) {
-            found = true;
-        }
-        
-        if (found) {
-            std::stringstream line_ss(line);
-            std::string token;
-            // 跳过前面的部分，直到找到 "u<id>" 格式的用户标识
-            while (line_ss >> token && (token.find('u') != 0 || !std::isdigit(token[1]))) {
-                // do nothing
-            }
+    auto parse_and_insert = [&](const std::string& line_to_parse) {
+        std::stringstream line_ss(line_to_parse);
+        std::string token;
+        int user_id = -1;
+        std::string package_name;
 
-            // 下一个 token 应该就是包名
-            if (line_ss >> token) {
-                size_t slash_pos = token.find('/');
-                if (slash_pos != std::string::npos) {
-                    visible_packages.insert(token.substr(0, slash_pos));
+        while (line_ss >> token) {
+            // 匹配 u<number> 格式, 例如 u0, u999
+            if (token.length() > 1 && token[0] == 'u' && std::all_of(token.begin() + 1, token.end(), ::isdigit)) {
+                try {
+                    user_id = std::stoi(token.substr(1));
+                    // 下一个token就是包名/Activity
+                    if (line_ss >> token) {
+                        size_t slash_pos = token.find('/');
+                        if (slash_pos != std::string::npos) {
+                            package_name = token.substr(0, slash_pos);
+                        }
+                        break; // 找到后就退出当前行的解析
+                    }
+                } catch (...) {
+                    user_id = -1;
                 }
             }
         }
+        if (user_id != -1 && !package_name.empty()) {
+            visible_keys.insert({package_name, user_id});
+        }
+    };
+    
+    while (std::getline(ss, line)) {
+        if (line.find("ResumedActivity:") != std::string::npos) {
+            parse_and_insert(line);
+        } else if (line.find("VisibleActivityProcess:") != std::string::npos) {
+            std::string process_line = line.substr(line.find('[') + 1);
+            process_line = process_line.substr(0, process_line.find(']'));
+            std::stringstream pss(process_line);
+            std::string proc_record;
+            // 处理可能有多个可见进程的情况
+            while(std::getline(pss, proc_record, ',')) {
+                 parse_and_insert(proc_record);
+            }
+        }
     }
-    return visible_packages;
+    return visible_keys;
 }
 
-// [核心实现] "深度审计数据" - 获取完整的进程树信息
+
+// "深度审计数据" - 获取完整的进程树信息
 std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
     std::map<int, ProcessInfo> process_map;
     constexpr int PER_USER_RANGE = 100000;
@@ -139,7 +157,6 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
         info.uid = st.st_uid;
         info.user_id = info.uid / PER_USER_RANGE;
         
-        // 读取 /stat 获取 ppid
         snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/stat", pid);
         std::ifstream stat_file(path_buffer);
         if (stat_file.is_open()) {
@@ -147,11 +164,9 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
             stat_file >> s >> s >> s >> info.ppid;
         }
 
-        // 读取 /oom_score_adj
         snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/oom_score_adj", pid);
         info.oom_score_adj = read_long_from_file(path_buffer).value_or(1001);
 
-        // 读取 /cmdline 获取包名
         snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
         std::ifstream cmdline_file(path_buffer);
         if (cmdline_file.is_open()) {
