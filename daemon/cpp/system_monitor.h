@@ -13,9 +13,6 @@
 #include <functional>
 #include <optional>
 
-// [移除] GlobalStatsData 结构体已完全被 MetricsRecord 取代
-// struct GlobalStatsData { ... };
-
 struct CpuTimeSlice {
     long long app_jiffies = 0;
     long long total_jiffies = 0;
@@ -41,11 +38,14 @@ public:
     
     std::optional<MetricsRecord> collect_current_metrics();
     
-    // [移除] get_global_stats() 接口，所有数据通过 collect_current_metrics() 提供
-    // GlobalStatsData get_global_stats() const;
-
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
     std::string get_app_name_from_pid(int pid);
+
+    /**
+     * @brief [新增] 获取指定PID列表的总CPU Jiffies，用于Doze报告。
+     * @return pids的总CPU Jiffies，如果pids为空或无法读取则返回0。
+     */
+    long long get_total_cpu_jiffies_for_pids(const std::vector<int>& pids);
 
     void start_top_app_monitor();
     void stop_top_app_monitor();
@@ -71,7 +71,6 @@ private:
 
     int get_pid_from_pkg(const std::string& pkg_name);
 
-    // [新增] 重新添加缺失的函数声明
     void top_app_monitor_thread();
 
     struct TotalCpuTimes {
@@ -82,8 +81,6 @@ private:
     };
     
     mutable std::mutex data_mutex_;
-    // [移除] current_stats_ 成员变量
-    // GlobalStatsData current_stats_;
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 

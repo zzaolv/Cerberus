@@ -41,8 +41,10 @@ class DaemonRepository(
             try {
                 val type = object : TypeToken<CerberusMessage<DashboardPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<DashboardPayload>>(jsonLine, type)
-                if (msg.type == "stream.dashboard_update") msg.payload else null
+                // [核心修复] 增加空值检查，防止闪退
+                if (msg?.type == "stream.dashboard_update") msg.payload else null
             } catch (e: Exception) {
+                Log.w("DaemonRepository", "Failed to parse DashboardPayload: ${e.message}")
                 null
             }
         }
@@ -52,11 +54,15 @@ class DaemonRepository(
             try {
                 val type = object : TypeToken<CerberusMessage<LogEntryPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<LogEntryPayload>>(jsonLine, type)
-                if (msg.type == "stream.new_log_entry") {
-                    val p = msg.payload
+                // [核心修复] 增加空值检查
+                if (msg?.type == "stream.new_log_entry") {
+                    val p = msg.payload ?: return@mapNotNull null // 如果payload为空，则忽略
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
                 } else null
-            } catch (e: Exception) { null }
+            } catch (e: Exception) {
+                Log.w("DaemonRepository", "Failed to parse LogEntryPayload: ${e.message}")
+                null
+            }
         }
 
     fun getStatsStream(): Flow<MetricsRecord> = udsClient.incomingMessages
@@ -64,9 +70,9 @@ class DaemonRepository(
             try {
                 val type = object : TypeToken<CerberusMessage<MetricsRecordPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<MetricsRecordPayload>>(jsonLine, type)
-                if (msg.type == "stream.new_stats_record") {
-                    val p = msg.payload
-                    // [修复] 使用 MetricsRecordPayload 中的正确字段来构造 MetricsRecord
+                // [核心修复] 增加空值检查
+                if (msg?.type == "stream.new_stats_record") {
+                    val p = msg.payload ?: return@mapNotNull null // 如果payload为空，则忽略
                     MetricsRecord(
                         timestamp = p.timestamp,
                         cpuUsagePercent = p.cpuUsagePercent,
@@ -83,12 +89,16 @@ class DaemonRepository(
                         isLocationActive = p.isLocationActive
                     )
                 } else null
-            } catch (e: Exception) { null }
+            } catch (e: Exception) {
+                Log.w("DaemonRepository", "Failed to parse MetricsRecordPayload: ${e.message}")
+                null
+            }
         }
 
     suspend fun getAllLogs(): List<LogEntry>? = query("query.get_all_logs") { json ->
         val type = object : TypeToken<List<LogEntryPayload>>() {}.type
-        val payloads = gson.fromJson<List<LogEntryPayload>>(json, type)
+        // [核心修复] GSON可能返回null list，用 elvis 操作符处理
+        val payloads = gson.fromJson<List<LogEntryPayload>>(json, type) ?: emptyList()
         payloads.map { p ->
             LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
         }
@@ -96,9 +106,9 @@ class DaemonRepository(
 
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->
         val type = object : TypeToken<List<MetricsRecordPayload>>() {}.type
-        val payloads = gson.fromJson<List<MetricsRecordPayload>>(json, type)
+        // [核心修复] GSON可能返回null list，用 elvis 操作符处理
+        val payloads = gson.fromJson<List<MetricsRecordPayload>>(json, type) ?: emptyList()
         payloads.map { p ->
-            // [修复] 使用 MetricsRecordPayload 中的正确字段来构造 MetricsRecord
             MetricsRecord(
                 timestamp = p.timestamp,
                 cpuUsagePercent = p.cpuUsagePercent,
@@ -127,14 +137,13 @@ class DaemonRepository(
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
-            // [优化] 动态生成响应类型字符串
             val expectedResponseType = queryType.replace("query.", "resp.")
 
             val baseMsg = gson.fromJson(responseJson, BaseMessageWithPayload::class.java)
-            if (baseMsg.type == expectedResponseType) {
+            if (baseMsg?.type == expectedResponseType && baseMsg.payload != null) {
                 payloadParser(baseMsg.payload.toString())
             } else {
-                Log.e("DaemonRepository", "Query '$queryType' received unexpected response type '${baseMsg.type}'")
+                Log.e("DaemonRepository", "Query '$queryType' received unexpected response type '${baseMsg?.type}' or null payload")
                 null
             }
         } catch (e: Exception) {
@@ -161,7 +170,7 @@ class DaemonRepository(
             val responseJson = withTimeout(5000) { deferred.await() }
             val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
             val message = gson.fromJson<CerberusMessage<FullConfigPayload>>(responseJson, type)
-            if (message.type == "resp.all_policies") message.payload else null
+            if (message?.type == "resp.all_policies") message.payload else null
         } catch (e: Exception) {
             Log.e("DaemonRepository", "Failed to get all policies: ${e.message}")
             pendingRequests.remove(reqId)
@@ -185,7 +194,7 @@ class DaemonRepository(
     private data class BaseMessageWithPayload(
         val type: String,
         @SerializedName("req_id") val requestId: String?,
-        val payload: com.google.gson.JsonElement
+        val payload: com.google.gson.JsonElement? // [核心修复] Payload可以为null
     )
 
     fun setMasterConfig(payload: Map<String, Any>) {

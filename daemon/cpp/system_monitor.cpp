@@ -83,6 +83,27 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
+// [核心新增] 实现获取 PID 列表总 Jiffies 的函数
+long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& pids) {
+    long long total_jiffies = 0;
+    for (int pid : pids) {
+        std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
+        std::ifstream stat_file(stat_path);
+        if (stat_file.is_open()) {
+            std::string line;
+            std::getline(stat_file, line);
+            std::stringstream ss(line);
+            std::string value;
+            // utime is the 14th field, stime is the 15th
+            for(int i = 0; i < 13; ++i) ss >> value;
+            long long utime = 0, stime = 0;
+            ss >> utime >> stime;
+            total_jiffies += (utime + stime);
+        }
+    }
+    return total_jiffies;
+}
+
 std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
     MetricsRecord record;
     record.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

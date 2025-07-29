@@ -51,21 +51,20 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
 }
 
 // --- DozeManager 实现 ---
-DozeManager::DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor)
-    : logger_(logger), action_executor_(executor) {
+DozeManager::DozeManager(std::shared_ptr<Logger> logger)
+    : logger_(logger) {
     state_change_timestamp_ = std::chrono::steady_clock::now();
 }
 
-void DozeManager::enter_state(State new_state) {
+void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
     if (new_state == current_state_) return;
     
-    State old_state = current_state_;
     current_state_ = new_state;
     state_change_timestamp_ = std::chrono::steady_clock::now();
-    
+
     switch(new_state) {
         case State::AWAKE:
-            if (old_state != State::AWAKE) logger_->log(LogLevel::DOZE, "Doze", "设备唤醒");
+            // 退出日志由 process_metrics 触发，这里不重复记录
             break;
         case State::IDLE:
              logger_->log(LogLevel::DOZE, "Doze", "进入IDLE (息屏, 未充电)");
@@ -74,39 +73,53 @@ void DozeManager::enter_state(State new_state) {
             logger_->log(LogLevel::DOZE, "Doze", "进入INACTIVE (检查期)");
             break;
         case State::DEEP_DOZE:
-            logger_->log(LogLevel::DOZE, "Doze", "进入DEEP DOZE (深度休眠)");
+            deep_doze_start_time_ = std::chrono::steady_clock::now();
+            logger_->log(LogLevel::DOZE, "Doze", "😴 进入深度Doze");
             break;
     }
 }
 
-void DozeManager::process_metrics(const MetricsRecord& record) {
+
+DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record) {
     auto now = std::chrono::steady_clock::now();
     auto duration_in_state = std::chrono::duration_cast<std::chrono::seconds>(now - state_change_timestamp_).count();
+    State old_state = current_state_;
 
     if (record.is_screen_on || record.is_charging) {
-        enter_state(State::AWAKE);
-        return;
-    }
-
-    if (current_state_ == State::AWAKE && !record.is_screen_on && !record.is_charging) {
-        enter_state(State::IDLE);
-    }
-
-    if (current_state_ == State::IDLE && duration_in_state > 30) { 
-        if (record.is_audio_playing || record.is_location_active) {
-            state_change_timestamp_ = now;
-        } else {
-            enter_state(State::INACTIVE);
+        enter_state(State::AWAKE, record);
+    } else {
+        if (current_state_ == State::AWAKE) {
+            enter_state(State::IDLE, record);
+        } else if (current_state_ == State::IDLE && duration_in_state > 30) { 
+            if (record.is_audio_playing || record.is_location_active) {
+                state_change_timestamp_ = now;
+            } else {
+                enter_state(State::INACTIVE, record);
+            }
+        } else if (current_state_ == State::INACTIVE && duration_in_state > 60) {
+             if (record.is_audio_playing || record.is_location_active) {
+                enter_state(State::IDLE, record); 
+            } else {
+                enter_state(State::DEEP_DOZE, record);
+            }
         }
+    }
+
+    if (old_state == State::DEEP_DOZE && current_state_ != State::DEEP_DOZE) {
+        auto doze_duration = std::chrono::duration_cast<std::chrono::seconds>(now - deep_doze_start_time_);
+        long minutes = doze_duration.count() / 60;
+        long seconds = doze_duration.count() % 60;
+        std::stringstream ss;
+        ss << "🤪 退出深度Doze，持续时长 " << minutes << "分" << seconds << "秒";
+        logger_->log(LogLevel::DOZE, "Doze", ss.str());
+        return DozeEvent::EXITED_DEEP_DOZE;
     }
     
-    if (current_state_ == State::INACTIVE && duration_in_state > 60) {
-         if (record.is_audio_playing || record.is_location_active) {
-            enter_state(State::IDLE); 
-        } else {
-            enter_state(State::DEEP_DOZE);
-        }
+    if (old_state != State::DEEP_DOZE && current_state_ == State::DEEP_DOZE) {
+        return DozeEvent::ENTERED_DEEP_DOZE;
     }
+
+    return DozeEvent::NONE;
 }
 
 
@@ -477,14 +490,86 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
 void StateManager::process_new_metrics(const MetricsRecord& record) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    doze_manager_->process_metrics(record);
+    auto doze_event = doze_manager_->process_metrics(record);
+
+    if (doze_event == DozeManager::DozeEvent::ENTERED_DEEP_DOZE) {
+        doze_start_cpu_jiffies_.clear();
+        for (const auto& [key, app] : managed_apps_) {
+            if (!app.pids.empty()) {
+                doze_start_cpu_jiffies_[key] = sys_monitor_->get_total_cpu_jiffies_for_pids(app.pids);
+            }
+        }
+    } else if (doze_event == DozeManager::DozeEvent::EXITED_DEEP_DOZE) {
+        generate_doze_exit_report();
+        doze_start_cpu_jiffies_.clear();
+    }
 
     if (last_metrics_record_) {
+        handle_charging_state_change(*last_metrics_record_, record);
         analyze_battery_change(*last_metrics_record_, record);
     }
 
     last_metrics_record_ = record;
 }
+
+// [核心新增] Doze 退出报告生成
+void StateManager::generate_doze_exit_report() {
+    using AppCpuActivity = std::pair<std::string, double>;
+    std::vector<AppCpuActivity> activity_list;
+    const long TCK = sysconf(_SC_CLK_TCK); // Ticks per second
+    if (TCK <= 0) return;
+
+    for (const auto& [key, app] : managed_apps_) {
+        if (app.pids.empty()) continue;
+        
+        long long start_jiffies = 0;
+        auto it = doze_start_cpu_jiffies_.find(key);
+        if (it != doze_start_cpu_jiffies_.end()) {
+            start_jiffies = it->second;
+        }
+
+        long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids(app.pids);
+        
+        if (end_jiffies > start_jiffies) {
+            double cpu_seconds = static_cast<double>(end_jiffies - start_jiffies) / TCK;
+            if (cpu_seconds > 0.01) { // 只报告有明显活动的
+                activity_list.push_back({app.app_name, cpu_seconds});
+            }
+        }
+    }
+    
+    if (activity_list.empty()) {
+        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动。");
+        return;
+    }
+    
+    std::sort(activity_list.begin(), activity_list.end(), 
+              [](const AppCpuActivity& a, const AppCpuActivity& b) {
+        return a.second > b.second;
+    });
+
+    std::stringstream report_ss;
+    report_ss << "Doze期间应用的CPU活跃时间:";
+    logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
+
+    for (const auto& activity : activity_list) {
+        std::stringstream line_ss;
+        line_ss << "| | [活跃: " << std::fixed << std::setprecision(3) << activity.second << "秒] | [" << activity.first << "]";
+        logger_->log(LogLevel::REPORT, "报告", line_ss.str());
+    }
+}
+
+// [核心新增] 充电状态变化日志
+void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
+    if (old_record.is_charging != new_record.is_charging) {
+        if (new_record.is_charging) {
+            logger_->log(LogLevel::BATTERY, "充电", "⚡️ 开始充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
+        } else {
+            logger_->log(LogLevel::BATTERY, "充电", "🔌 停止充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
+        }
+    }
+}
+
 
 void StateManager::analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (new_record.is_charging || new_record.battery_level < 0) {

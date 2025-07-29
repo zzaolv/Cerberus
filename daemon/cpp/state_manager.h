@@ -54,14 +54,18 @@ struct AppRuntimeState {
 class DozeManager {
 public:
     enum class State { AWAKE, IDLE, INACTIVE, DEEP_DOZE };
-    DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor);
-    void process_metrics(const MetricsRecord& record);
+    enum class DozeEvent { NONE, ENTERED_DEEP_DOZE, EXITED_DEEP_DOZE };
+    
+    DozeManager(std::shared_ptr<Logger> logger);
+    DozeEvent process_metrics(const MetricsRecord& record);
+
 private:
-    void enter_state(State new_state);
+    void enter_state(State new_state, const MetricsRecord& record);
+    
     State current_state_ = State::AWAKE;
     std::chrono::steady_clock::time_point state_change_timestamp_;
+    std::chrono::steady_clock::time_point deep_doze_start_time_; // [新增]
     std::shared_ptr<Logger> logger_;
-    std::shared_ptr<ActionExecutor> action_executor_;
 };
 
 class StateManager {
@@ -84,6 +88,8 @@ public:
     void on_temp_unfreeze_request_by_pid(const json& payload);
 
 private:
+    void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
+    void generate_doze_exit_report(); // [新增]
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
 
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
@@ -119,6 +125,7 @@ private:
     std::vector<int> unfrozen_timeline_;
     
     // AppInstanceKey is now defined in action_executor.h, which is included above
+    std::map<AppInstanceKey, long long> doze_start_cpu_jiffies_;
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
