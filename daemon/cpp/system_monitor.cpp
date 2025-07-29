@@ -31,7 +31,6 @@
 
 namespace fs = std::filesystem;
 
-// 静态辅助函数
 static std::string exec_shell_pipe(const char* cmd) {
     std::array<char, 256> buffer;
     std::string result;
@@ -64,8 +63,6 @@ int get_uid_from_pid(int pid) {
 }
 
 
-// --- SystemMonitor 类实现 ---
-
 SystemMonitor::SystemMonitor() {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
         top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
@@ -83,7 +80,6 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-// [核心新增] 实现获取 PID 列表总 Jiffies 的函数
 long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& pids) {
     long long total_jiffies = 0;
     for (int pid : pids) {
@@ -94,7 +90,6 @@ long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& 
             std::getline(stat_file, line);
             std::stringstream ss(line);
             std::string value;
-            // utime is the 14th field, stime is the 15th
             for(int i = 0; i < 13; ++i) ss >> value;
             long long utime = 0, stime = 0;
             ss >> utime >> stime;
@@ -155,8 +150,8 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
-        double current_a = static_cast<double>(*current_now_ua) / 1000.0; // uA to A
-        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0; // uV to V
+        double current_a = static_cast<double>(*current_now_ua) / 1000000.0;
+        double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0;
         power = static_cast<float>(std::abs(current_a * voltage_v));
     } else {
         power = 0.0f;
@@ -219,7 +214,6 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// [核心修复] 采用新的、更严格的音频状态检测逻辑
 void SystemMonitor::update_audio_state() {
     struct PlayerStates {
         int started_count = 0;
@@ -239,57 +233,47 @@ void SystemMonitor::update_audio_state() {
     while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
         std::string line(buffer.data());
 
-        // 定位到 "players:" 部分的开始
         if (line.rfind("  players:", 0) == 0) {
             in_players_section = true;
             continue;
         }
         
         if (in_players_section) {
-            // "players:" 部分结束的标志
             if (line.find("  ducked players piids:") == 0 || line.find("  faded out players piids:") == 0) {
                 in_players_section = false;
-                break; // 已完成players部分的解析，可以提前退出循环
+                // [核心修复] 移除 break; 让循环继续读取完所有输出
             }
             
-            // 解析每一行播放器信息
             if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
                 try {
                     int uid = -1;
                     std::string state_str;
 
-                    // 提取 u/pid:
                     size_t upid_pos = line.find("u/pid:");
                     if (upid_pos != std::string::npos) {
                         std::stringstream ss(line.substr(upid_pos + 6));
                         ss >> uid;
                     }
-                    if (uid < 10000) continue; // 只关心应用UID
+                    if (uid < 10000) continue;
 
-                    // 提取 state:
                     size_t state_pos = line.find(" state:");
                     if (state_pos != std::string::npos) {
                         std::stringstream ss(line.substr(state_pos + 7));
                         ss >> state_str;
                     }
 
-                    // 更新状态统计
                     uid_player_states[uid].total_count++;
                     if (state_str == "started") {
                         uid_player_states[uid].started_count++;
                     }
-                } catch (const std::exception& e) {
-                    // 忽略解析错误
-                }
+                } catch (const std::exception& e) {}
             }
         }
     }
     pclose(pipe);
 
-    // [核心修复] 根据新的、严格的规则生成最终的活跃UID列表
     std::set<int> active_uids;
     for (const auto& [uid, states] : uid_player_states) {
-        // 只有当该UID存在播放器，并且所有播放器都是 'started' 状态时，才认为其活跃
         if (states.total_count > 0 && states.started_count == states.total_count) {
             active_uids.insert(uid);
         }

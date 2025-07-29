@@ -33,7 +33,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // proguardFile("proguard-rules-disabler.pro")
+            proguardFile("proguard-rules-disabler.pro")
         }
         debug {
             isMinifyEnabled = false

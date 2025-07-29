@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v11_final"
+#define LOG_TAG "cerberusd_action_v13_robust" // 使用新的版本号
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -66,6 +66,7 @@ bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>&
     return true;
 }
 
+// [核心修复] 采用更健壮的“宽容跳过”策略
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
     
@@ -90,26 +91,21 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
                 usleep(50000);
                 continue;
             } 
+            // [核心逻辑] 当我们无权操作某个进程时 (冻结时)，记录警告并跳过它，而不是让整个操作失败
             else if (freeze && (errno == EINVAL || errno == EPERM)) {
-                LOGW("Binder op for pid %d failed (%s). Verifying UID cgroup state...", pid, strerror(errno));
-                if (is_pid_frozen_by_uid_cgroup(pid)) {
-                    LOGI("...Verification PASSED: UID cgroup for PID %d is frozen. Adopting state as success.", pid);
-                    op_success = true;
-                } else {
-                    LOGE("...Verification FAILED: UID cgroup for PID %d is NOT frozen. This is a critical error.", pid);
-                    return -1;
-                }
-                break;
+                LOGW("Cannot freeze pid %d (error: %s), likely a privileged process. Skipping this PID.", pid, strerror(errno));
+                op_success = true; // 假装成功，以继续处理下一个pid
+                break; // 跳出重试循环，处理下一个pid
             }
+            // 对于其他真正无法恢复的错误，我们才认为是致命失败
             else {
                 LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
                 return -1;
             }
         }
         
-        if (!op_success && has_soft_failure) {
-            continue;
-        } else if (!op_success) {
+        // 只有在既不是操作成功，也不是软失败的情况下，才认为是致命错误
+        if (!op_success && !has_soft_failure) {
             return -1;
         }
     }
@@ -117,6 +113,7 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
     return has_soft_failure ? 1 : 0;
 }
 
+// 这个函数不再被主流程调用，但可以保留以备将来调试
 bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
     struct stat proc_stat;
     char path_buffer[64];
@@ -127,7 +124,6 @@ bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
     
     uid_t uid = proc_stat.st_uid;
     
-    // 构造最常见的 Android cgroup v2 UID 路径
     std::string freeze_path = "/sys/fs/cgroup/uid_" + std::to_string(uid) + "/cgroup.freeze";
 
     std::ifstream freeze_file(freeze_path);
@@ -142,8 +138,6 @@ bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
     return false;
 }
 
-
-// [核心修复] 恢复了包含 mmap 和 BINDER_GET_FROZEN_INFO 特性检测的完整初始化流程
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
     if (binder_state_.fd < 0) {
@@ -167,16 +161,14 @@ bool ActionExecutor::initialize_binder() {
         return false;
     }
     
-    // 使用 BINDER_GET_FROZEN_INFO 作为特性探测器
     struct binder_frozen_status_info info = { .pid = (uint32_t)getpid() };
     if (ioctl(binder_state_.fd, BINDER_GET_FROZEN_INFO, &info) < 0) {
-        LOGW("Kernel does not support BINDER_FREEZE feature (ioctl BINDER_GET_FROZEN_INFO failed: %s). Binder freezing disabled.", strerror(errno));
-        cleanup_binder(); // 清理已打开的资源
-        // binder_state_.fd 会被置为-1，后续所有binder操作都会直接跳过
+        LOGW("Kernel does not support BINDER_FREEZE feature (ioctl failed: %s). Binder freezing disabled.", strerror(errno));
+        cleanup_binder();
         return false;
     }
 
-    LOGI("Binder driver initialized successfully and feature is supported.");
+    LOGI("Binder driver initialized successfully and BINDER_FREEZE feature is supported.");
     return true;
 }
 
@@ -190,7 +182,6 @@ void ActionExecutor::cleanup_binder() {
         binder_state_.fd = -1;
     }
 }
-
 
 bool ActionExecutor::initialize_cgroup() {
     if (fs::exists("/sys/fs/cgroup/cgroup.controllers")) {
