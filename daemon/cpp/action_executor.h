@@ -5,9 +5,8 @@
 #include <string>
 #include <vector>
 #include <utility> 
-#include <linux/android/binder.h> // 包含系统头文件
+#include <linux/android/binder.h>
 
-// AppInstanceKey 定义移到这里，因为它首先被这个文件需要
 using AppInstanceKey = std::pair<std::string, int>;
 
 class ActionExecutor {
@@ -16,8 +15,8 @@ public:
     ~ActionExecutor();
 
     /**
-     * @brief 尝试冻结一个应用实例，采用新的“乐观命令式重试”策略。
-     * @return 0: 成功 (可能部分pid是采纳的现有状态) | 1: 软失败，需要重试 | -1: 彻底失败
+     * @brief 尝试冻结一个应用实例，采用最终的“物理验证乐观”策略。
+     * @return 0: 成功 | 1: 软失败，需要重试 | -1: 彻底失败
      */
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
     
@@ -27,9 +26,14 @@ private:
     bool initialize_binder();
     void cleanup_binder();
     
-    // 这个函数现在是内部实现细节，不再分为 strict/lenient
     int handle_binder_freeze(const std::vector<int>& pids, bool freeze);
     
+    /**
+     * @brief [核心] 通过检查基于UID的cgroup.freeze文件来验证进程是否被物理冻结。
+     * @return true 如果进程被cgroup冻结，否则 false。
+     */
+    bool is_pid_frozen_by_uid_cgroup(int pid);
+
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();
     std::string get_instance_cgroup_path(const AppInstanceKey& key) const;

@@ -19,6 +19,9 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+        }
     }
 
     buildTypes {
@@ -65,8 +68,10 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+    androidResources {
+        localeFilters.addAll(listOf("en", "zh-rCN", "zh"))
+    }
 }
-
 dependencies {
     implementation(libs.accompanist.swiperefresh)
     implementation(libs.androidx.core.ktx)

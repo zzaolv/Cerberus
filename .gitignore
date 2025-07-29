@@ -23,3 +23,7 @@ daemon.py
 collo.py
 tree.py
 project_context.txt
+app/release/*
+magisk/magisk.zip
+magisk/system/bin/cerberusd
+magisk/system/Cerberus-UI/Cerberus-UI.apk

@@ -134,7 +134,7 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
     auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
-        double current_a = static_cast<double>(*current_now_ua) / 1000000.0; // uA to A
+        double current_a = static_cast<double>(*current_now_ua) / 1000.0; // uA to A
         double voltage_v = static_cast<double>(*voltage_now_uv) / 1000000.0; // uV to V
         power = static_cast<float>(std::abs(current_a * voltage_v));
     } else {

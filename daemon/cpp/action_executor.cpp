@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v7_realistic"
+#define LOG_TAG "cerberusd_action_v11_final"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -36,19 +36,18 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
 
     int binder_result = handle_binder_freeze(pids, true);
 
-    if (binder_result < 0) { // 致命错误
+    if (binder_result < 0) {
         LOGE("Binder freeze for %s failed critically. Rolling back...", key.first.c_str());
-        handle_binder_freeze(pids, false); // 尽力回滚
+        handle_binder_freeze(pids, false);
         return -1;
     }
 
-    if (binder_result > 0) { // 软失败 (EAGAIN)，需要重试
+    if (binder_result > 0) {
         LOGW("Binder freeze for %s resulted in soft failure. Rolling back and retrying later.", key.first.c_str());
-        handle_binder_freeze(pids, false); // 回滚
+        handle_binder_freeze(pids, false);
         return 1;
     }
     
-    // Binder 阶段成功 (完全成功或乐观采纳)
     LOGI("Binder freeze phase for %s completed. Proceeding with physical freeze.", key.first.c_str());
     bool physical_ok = freeze_cgroup(key, pids);
     if (!physical_ok) {
@@ -56,7 +55,7 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
         freeze_sigstop(pids);
     }
 
-    return 0; // 最终成功
+    return 0;
 }
 
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
@@ -67,7 +66,6 @@ bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>&
     return true;
 }
 
-// [核心重构] 实现“乐观命令式重试”策略
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
     
@@ -84,30 +82,68 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
                 break;
             }
             
-            // 如果ioctl失败，分析错误
             if (errno == EAGAIN) {
-                if (retry == 2) { // 微重试耗尽
+                if (retry == 2) {
                     LOGW("Binder op for pid %d still has pending transactions (EAGAIN). Marking as soft failure.", pid);
                     has_soft_failure = true;
                 }
                 usleep(50000);
-                continue; // 继续重试
-            } else if (freeze && (errno == EPERM || errno == EINVAL)) {
-                // 乐观采纳：在冻结时遇到这些错误，很可能是系统服务已将其冻结
-                LOGI("Binder op for pid %d failed (%s), likely already frozen by system. Adopting state.", pid, strerror(errno));
-                op_success = true; // 假装成功
+                continue;
+            } 
+            else if (freeze && (errno == EINVAL || errno == EPERM)) {
+                LOGW("Binder op for pid %d failed (%s). Verifying UID cgroup state...", pid, strerror(errno));
+                if (is_pid_frozen_by_uid_cgroup(pid)) {
+                    LOGI("...Verification PASSED: UID cgroup for PID %d is frozen. Adopting state as success.", pid);
+                    op_success = true;
+                } else {
+                    LOGE("...Verification FAILED: UID cgroup for PID %d is NOT frozen. This is a critical error.", pid);
+                    return -1;
+                }
                 break;
-            } else {
-                // 其他无法恢复的错误
-                LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
-                return -1; // 报告致命失败
             }
+            else {
+                LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
+                return -1;
+            }
+        }
+        
+        if (!op_success && has_soft_failure) {
+            continue;
+        } else if (!op_success) {
+            return -1;
         }
     }
     
     return has_soft_failure ? 1 : 0;
 }
 
+bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
+    struct stat proc_stat;
+    char path_buffer[64];
+    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
+    if (stat(path_buffer, &proc_stat) != 0) {
+        return false;
+    }
+    
+    uid_t uid = proc_stat.st_uid;
+    
+    // 构造最常见的 Android cgroup v2 UID 路径
+    std::string freeze_path = "/sys/fs/cgroup/uid_" + std::to_string(uid) + "/cgroup.freeze";
+
+    std::ifstream freeze_file(freeze_path);
+    if (freeze_file.is_open()) {
+        char state;
+        freeze_file >> state;
+        if (state == '1') {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+
+// [核心修复] 恢复了包含 mmap 和 BINDER_GET_FROZEN_INFO 特性检测的完整初始化流程
 bool ActionExecutor::initialize_binder() {
     binder_state_.fd = open("/dev/binder", O_RDWR | O_CLOEXEC);
     if (binder_state_.fd < 0) {
@@ -122,12 +158,30 @@ bool ActionExecutor::initialize_binder() {
         binder_state_.fd = -1;
         return false;
     }
-    LOGI("Binder driver initialized successfully.");
+
+    binder_state_.mapped = mmap(NULL, binder_state_.mapSize, PROT_READ, MAP_PRIVATE, binder_state_.fd, 0);
+    if (binder_state_.mapped == MAP_FAILED) {
+        LOGE("Binder mmap failed: %s", strerror(errno));
+        close(binder_state_.fd);
+        binder_state_.fd = -1;
+        return false;
+    }
+    
+    // 使用 BINDER_GET_FROZEN_INFO 作为特性探测器
+    struct binder_frozen_status_info info = { .pid = (uint32_t)getpid() };
+    if (ioctl(binder_state_.fd, BINDER_GET_FROZEN_INFO, &info) < 0) {
+        LOGW("Kernel does not support BINDER_FREEZE feature (ioctl BINDER_GET_FROZEN_INFO failed: %s). Binder freezing disabled.", strerror(errno));
+        cleanup_binder(); // 清理已打开的资源
+        // binder_state_.fd 会被置为-1，后续所有binder操作都会直接跳过
+        return false;
+    }
+
+    LOGI("Binder driver initialized successfully and feature is supported.");
     return true;
 }
 
 void ActionExecutor::cleanup_binder() {
-    if (binder_state_.mapped) {
+    if (binder_state_.mapped && binder_state_.mapped != MAP_FAILED) {
         munmap(binder_state_.mapped, binder_state_.mapSize);
         binder_state_.mapped = nullptr;
     }
