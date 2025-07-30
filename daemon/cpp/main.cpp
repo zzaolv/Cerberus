@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v27_staggered" // 版本号更新
+#define LOG_TAG "cerberusd_main_v28_heartbeat" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,10 +42,17 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
+        // [新增] 处理来自UI的hello消息
+        if (type == "hello.ui") {
+            g_server->identify_client_as_ui(client_fd);
+            return; // 处理完毕，直接返回
+        }
+
         if (type == "query.get_all_logs") {
             auto logs = g_logger->get_history(msg.value("limit", 200));
             json log_array = json::array();
             for(const auto& log : logs) { log_array.push_back(log.to_json()); }
+            // [修改] 直接使用send_message发送响应，因为这是请求-响应模式
             g_server->send_message(client_fd, json{ {"type", "resp.all_logs"}, {"req_id", msg.value("req_id", "")}, {"payload", log_array} }.dump());
             return;
         } else if (type == "query.get_history_stats") {
@@ -133,64 +140,48 @@ void worker_thread_func() {
     LOGI("Worker thread started.");
     g_top_app_refresh_tickets = 2; 
     
-    // [性能优化] 修改/新增计时器
-    int reconcile_countdown = 15; // 每 15 * 2 = 30 秒执行一次进程核对
+    int reconcile_countdown = 15;
     int audio_scan_countdown = 3;
-    int location_scan_countdown = 7;
-    int audit_countdown = 30; // 权威审计计时器，30 * 2s = 60s
-    
+    int location_scan_countdown = 15;
+    int audit_countdown = 30;
+    int heartbeat_countdown = 7; // [新增] 心跳计时器, 7 * 2s = 14s
+
     const int SAMPLING_INTERVAL_SEC = 2;
 
     while (g_is_running) {
         auto loop_start_time = std::chrono::steady_clock::now();
         bool state_changed = false;
 
-        // 1. [低成本] 采集性能指标 (保持)
         auto metrics_opt = g_sys_monitor->collect_current_metrics();
         if (metrics_opt) {
             g_ts_db->add_record(*metrics_opt);
             g_state_manager->process_new_metrics(*metrics_opt);
         }
 
-        // 2. [高频快速响应] 检查 inotify 触发器 (保持)
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
-            LOGI("PERF: Top app change detected by inotify, executing fast scan via /proc...");
-            if (g_state_manager->handle_top_app_change_fast()) {
-                state_changed = true;
-            }
+            if (g_state_manager->handle_top_app_change_fast()) state_changed = true;
             audit_countdown = 30; 
         }
         
-        // 3. [低频权威审计] (保持)
         if (--audit_countdown <= 0) {
-            LOGI("PERF: Periodic audit timer triggered, executing authoritative scan via dumpsys...");
-            if (g_state_manager->evaluate_and_execute_strategy()) {
-                state_changed = true;
-            }
+            if (g_state_manager->evaluate_and_execute_strategy()) state_changed = true;
             audit_countdown = 30;
         }
         
-        // 4. [低成本] 推进内部状态机 (保持)
         if (g_state_manager->tick_state_machine()) {
             state_changed = true;
         }
 
-        // 5. [性能优化] 新增的交错式扫描
-        // 只有当UI客户端连接时，才执行内存统计，避免后台不必要的CPU消耗
         if (g_server && g_server->has_clients()) {
             if (g_state_manager->perform_staggered_stats_scan()) {
-                state_changed = true; // 标记状态已改变，以便广播
+                state_changed = true;
             }
         }
 
-        // 6. [性能优化] 修改后的低频维护任务
         if (--reconcile_countdown <= 0) {
-            // 调用轻量化后的 deep_scan，只做进程核对和清理
-            if (g_state_manager->perform_deep_scan()) {
-                state_changed = true;
-            }
-            reconcile_countdown = 15; // 重置计时器
+            if (g_state_manager->perform_deep_scan()) state_changed = true;
+            reconcile_countdown = 15;
         }
         if (--audio_scan_countdown <= 0) {
             g_sys_monitor->update_audio_state();
@@ -201,12 +192,18 @@ void worker_thread_func() {
             location_scan_countdown = 15;
         }
 
-        // 7. [同步] (保持)
+        // [新增] 心跳逻辑
+        if (--heartbeat_countdown <= 0) {
+            if (g_server) {
+                g_server->broadcast_message_to_ui("{\"type\":\"ping\"}");
+            }
+            heartbeat_countdown = 7;
+        }
+
         if (state_changed) {
             broadcast_dashboard_update();
         }
 
-        // 8. [循环周期控制] (保持)
         auto loop_end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(loop_end_time - loop_start_time);
         if (duration.count() < SAMPLING_INTERVAL_SEC) {

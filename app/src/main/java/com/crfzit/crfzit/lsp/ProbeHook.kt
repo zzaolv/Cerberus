@@ -5,9 +5,7 @@ import android.app.Notification
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Process
-import android.os.UserHandle
 import com.crfzit.crfzit.data.model.CerberusMessage
-import com.crfzit.crfzit.data.uds.TcpClient // 确认这是您正确的 TcpClient 路径
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -16,37 +14,49 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlinx.coroutines.*
+import java.io.IOException
+import java.io.OutputStreamWriter
+import java.net.Socket
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import kotlin.coroutines.coroutineContext
 
-@OptIn(DelicateCoroutinesApi::class)
+// [修改] Probe不再需要复杂的长连接管理，移除DelicateCoroutinesApi
 class ProbeHook : IXposedHookLoadPackage {
 
-    private val probeScope = CoroutineScope(SupervisorJob() + Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private var tcpClient: TcpClient? = null
+    // [修改] 使用一个简单的IO调度器来执行一次性网络任务
+    private val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson = Gson()
+
+    // [移除] 不再需要长连接客户端
+    // private var tcpClient: TcpClient? = null
 
     private val foregroundStatusCache = ConcurrentHashMap<Int, Boolean>()
     private val unfreezeRequestTimestamps = ConcurrentHashMap<String, Long>()
     private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v23_Robust_State_Hook" // 更新版本号
+        private const val TAG = "CerberusProbe_v24_Short_Conn" // 更新版本号
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val PER_USER_RANGE = 100000
+        private const val DAEMON_HOST = "127.0.0.1"
+        private const val DAEMON_PORT = 28900
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
 
-        log("Loading into system_server (PID: ${Process.myPid()}).")
-        tcpClient = TcpClient(probeScope)
-        probeScope.launch { setupPersistentCommunication() } // 方法名修正为通用
+        log("Loading into system_server (PID: ${Process.myPid()}). Short-connection mode active.")
+
+        // [移除] 不再需要启动持久通信
+        // tcpClient = TcpClient(probeScope)
+        // probeScope.launch { setupPersistentCommunication() }
+
+        // [新增] 在启动时发送一次hello消息，让daemon获取配置
+        sendEventToDaemon("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
-
             hookActivityStarter(classLoader)
             hookAMSForProcessStateChanges(classLoader)
             hookWakelocksAndAlarms(classLoader)
@@ -60,6 +70,69 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
+    // [核心重构] 发送事件的方法，改为即用即弃的短连接
+    private fun sendEventToDaemon(type: String, payload: Any) {
+        probeScope.launch {
+            val message = CerberusMessage(type = type, payload = payload)
+            val jsonMessage = gson.toJson(message)
+            try {
+                Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
+                    socket.soTimeout = 2000 // 2秒超时
+                    OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
+                        writer.write(jsonMessage + "\n")
+                        writer.flush()
+                        // 如果是hello消息，需要等待配置返回
+                        if (type == "event.probe_hello") {
+                            try {
+                                val response = socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()
+                                if (response != null) {
+                                    ConfigManager.updateConfig(response)
+                                }
+                            } catch (e: Exception) {
+                                logError("Failed to read config response after hello: $e")
+                            }
+                        }
+                    }
+                }
+                // log("Short-conn event sent: $type")
+            } catch (e: IOException) {
+                logError("Daemon short-conn send error for $type: ${e.message}")
+            } catch (e: Exception) {
+                logError("Unexpected error during short-conn send for $type: $e")
+            }
+        }
+    }
+
+    // [移除] 不再需要持久通信管理
+    // private suspend fun setupPersistentCommunication() { ... }
+
+    // ConfigManager现在只在收到hello的响应时更新一次，或者未来可以通过其他机制更新
+    private object ConfigManager {
+        @Volatile private var frozenUids = emptySet<Int>()
+        @Volatile private var frozenPids = emptySet<Int>()
+
+        fun updateConfig(jsonString: String) {
+            try {
+                val payload = JsonParser.parseString(jsonString).asJsonObject.getAsJsonObject("payload")
+                if (payload.has("frozen_uids")) {
+                    frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
+                }
+                if (payload.has("frozen_pids")) {
+                    frozenPids = payload.getAsJsonArray("frozen_pids").map { it.asInt }.toSet()
+                }
+                if (frozenUids.isNotEmpty() || frozenPids.isNotEmpty()) {
+                    XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs and ${frozenPids.size} PIDs.")
+                }
+            } catch (e: Exception) { XposedBridge.log("[$TAG]: [ERROR] Failed to parse probe config: $e") }
+        }
+        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
+        fun isPidFrozen(pid: Int): Boolean = frozenPids.contains(pid)
+    }
+
+    private fun log(message: String) = XposedBridge.log("[$TAG] $message")
+    private fun logError(message: String) = XposedBridge.log("[$TAG] [ERROR] $message")
+
+    // ... 其他所有hooking函数保持不变 ...
     private fun hookActivityStarter(classLoader: ClassLoader) {
         findClass("com.android.server.wm.ActivityStarter", classLoader)?.let { clazz ->
             val executeHook = object : XC_MethodHook() {
@@ -93,7 +166,6 @@ class ProbeHook : IXposedHookLoadPackage {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
 
-    // [终极修复] 使用最健壮的方式 Hook setCurProcState
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
         val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader)
         if (processRecordClass == null) {
@@ -108,13 +180,12 @@ class ProbeHook : IXposedHookLoadPackage {
         }
 
         var success = false
-        // 遍历所有方法，手动匹配
         for (method in processRecordClass.declaredMethods) {
             if (method.name == "setCurProcState" && method.parameterTypes.size == 1 && method.parameterTypes[0] == Int::class.javaPrimitiveType) {
                 XposedBridge.hookMethod(method, hook)
                 log("SUCCESS: Hooked ProcessRecord#setCurProcState(int) via manual search.")
                 success = true
-                break // 找到就停止
+                break
             }
         }
 
@@ -310,60 +381,4 @@ class ProbeHook : IXposedHookLoadPackage {
     private fun requestTempUnfreezeForPid(pid: Int) {
         sendEventToDaemon("cmd.request_temp_unfreeze_pid", mapOf("pid" to pid))
     }
-
-    private fun sendEventToDaemon(type: String, payload: Any) {
-        probeScope.launch {
-            try {
-                val message = CerberusMessage(type = type, payload = payload)
-                tcpClient?.sendMessage(gson.toJson(message))
-            } catch (e: Exception) {
-                logError("Daemon send error for $type: $e")
-            }
-        }
-    }
-
-    private suspend fun setupPersistentCommunication() {
-        log("Persistent communication manager started.")
-        while (coroutineContext.isActive) {
-            try {
-                tcpClient?.start()
-                delay(1000)
-                val helloPayload = mapOf("pid" to Process.myPid(), "version" to TAG)
-                tcpClient?.sendMessage(gson.toJson(CerberusMessage(type = "event.probe_hello", payload = helloPayload)))
-                tcpClient?.incomingMessages?.collect { jsonLine -> ConfigManager.updateConfig(jsonLine) }
-                logError("TCP message stream ended. Reconnecting...")
-                tcpClient?.stop()
-            } catch (e: CancellationException) {
-                log("Communication scope cancelled."); break
-            } catch (e: Exception) {
-                logError("Exception in communication cycle: ${e.message}. Retrying...")
-            }
-            delay(5000L)
-        }
-    }
-
-    private object ConfigManager {
-        @Volatile private var frozenUids = emptySet<Int>()
-        @Volatile private var frozenPids = emptySet<Int>()
-
-        fun updateConfig(jsonString: String) {
-            try {
-                val payload = JsonParser.parseString(jsonString).asJsonObject.getAsJsonObject("payload")
-                if (payload.has("frozen_uids")) {
-                    frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
-                }
-                if (payload.has("frozen_pids")) {
-                    frozenPids = payload.getAsJsonArray("frozen_pids").map { it.asInt }.toSet()
-                    if (frozenUids.isNotEmpty() || frozenPids.isNotEmpty()) {
-                        XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs and ${frozenPids.size} PIDs.")
-                    }
-                }
-            } catch (e: Exception) { XposedBridge.log("[$TAG]: [ERROR] Failed to parse probe config: $e") }
-        }
-        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
-        fun isPidFrozen(pid: Int): Boolean = frozenPids.contains(pid)
-    }
-
-    private fun log(message: String) = XposedBridge.log("[$TAG] $message")
-    private fun logError(message: String) = XposedBridge.log("[$TAG] [ERROR] $message")
 }

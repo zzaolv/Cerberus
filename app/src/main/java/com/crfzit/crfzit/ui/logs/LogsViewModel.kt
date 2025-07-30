@@ -22,7 +22,6 @@ data class LogsUiState(
 
 class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
-    // 架构重构：获取唯一的单例实例
     private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     
@@ -31,10 +30,13 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
+            // 预加载应用信息缓存
             appInfoRepository.getAllApps(forceRefresh = true)
+            // [核心修复] 先加载历史日志
+            loadInitialLogs()
+            // 然后开始监听新的实时日志
+            listenForNewLogs()
         }
-        loadInitialLogs()
-        listenForNewLogs()
     }
     
     private fun loadInitialLogs() {
@@ -51,6 +53,7 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
             daemonRepository.getLogStream().collect { newLog ->
                 val newUiLog = mapToUiLog(newLog)
                 _uiState.update { currentState ->
+                    // 将新日志追加到现有列表的末尾
                     currentState.copy(logs = currentState.logs + newUiLog)
                 }
             }
@@ -66,6 +69,5 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        // 架构重构：ViewModel不再负责停止Repository
     }
 }
