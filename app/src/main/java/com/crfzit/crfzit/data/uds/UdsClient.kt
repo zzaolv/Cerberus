@@ -54,7 +54,7 @@ class UdsClient(private val scope: CoroutineScope) {
             }
         }
     }
-
+    
     fun sendMessage(message: String) {
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
@@ -81,7 +81,7 @@ class UdsClient(private val scope: CoroutineScope) {
                 while (currentSocket.isConnected && scope.isActive) {
                     val line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                        Log.d(TAG, "Rcvd: $line")
+                         Log.d(TAG, "Rcvd: $line")
                         _incomingMessages.emit(line)
                     }
                 }
