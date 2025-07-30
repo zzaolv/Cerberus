@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v28_optimal"
+#define LOG_TAG "cerberusd_state_v29_staggered" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -476,11 +476,50 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     };
    
    
+   
+   
     load_all_configs();
+    // [性能优化] 在构造函数中初始化迭代器
+    next_scan_iterator_ = managed_apps_.begin();
     reconcile_process_state_full();
     last_battery_level_info_ = std::nullopt;    
     LOGI("StateManager Initialized.");
 }
+
+// [性能优化] 新增的交错式扫描函数实现
+bool StateManager::perform_staggered_stats_scan() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (managed_apps_.empty()) {
+        return false;
+    }
+
+    // 每次主循环（2秒）只扫描2个应用，将CPU负载分散
+    const int APPS_PER_TICK = 2;
+
+    for (int i = 0; i < APPS_PER_TICK; ++i) {
+        // 如果迭代器到达末尾，则重置到开头
+        if (next_scan_iterator_ == managed_apps_.end()) {
+            next_scan_iterator_ = managed_apps_.begin();
+        }
+        // 如果重置后仍然是末尾（例如map为空），则退出
+        if (next_scan_iterator_ == managed_apps_.end()) {
+            break; 
+        }
+
+        auto& app = next_scan_iterator_->second;
+        if (!app.pids.empty()) {
+            // 调用高成本的 smaps_rollup 读取操作
+            sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
+        }
+        
+        // 移动迭代器到下一个应用
+        ++next_scan_iterator_;
+    }
+
+    // 总是返回true，因为即使数据没变，UI也可能需要刷新这个部分更新的状态
+    return true;
+}
+
 
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
@@ -1180,31 +1219,21 @@ bool StateManager::check_timed_unfreeze() {
     return state_changed;
 }
 
-void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
-    if (app.scheduled_unfreeze_idx != -1) {
-        if (app.scheduled_unfreeze_idx < unfrozen_timeline_.size()) {
-            if (unfrozen_timeline_[app.scheduled_unfreeze_idx] == app.uid) {
-                unfrozen_timeline_[app.scheduled_unfreeze_idx] = 0;
-                LOGD("TIMELINE: Cancelled scheduled unfreeze for %s at index %d.", app.package_name.c_str(), app.scheduled_unfreeze_idx);
-            }
-        }
-        app.scheduled_unfreeze_idx = -1;
-    }
-}
-
+// [性能优化] 修改此函数，移除高成本的 stats 扫描循环
 bool StateManager::perform_deep_scan() {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         
+        // 保留成本较低的进程状态核对
         changed = reconcile_process_state_full();
         
         time_t now = time(nullptr);
+
+        // [性能优化] 移除原有的高成本循环。内存统计现在由交错式扫描负责。
+        // 保留此循环的目的是清理那些已经没有进程的 "僵尸" 应用状态。
         for (auto& [key, app] : managed_apps_) {
-            if (!app.pids.empty()) {
-                app.undetected_since = 0;
-                sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
-            } else if (app.current_status != AppRuntimeState::Status::STOPPED) {
+            if (app.pids.empty() && app.current_status != AppRuntimeState::Status::STOPPED) {
                 if (app.undetected_since == 0) {
                     app.undetected_since = now;
                 } else if (now - app.undetected_since >= 3) {
@@ -1223,6 +1252,9 @@ bool StateManager::perform_deep_scan() {
                     app.undetected_since = 0;
                     changed = true;
                 }
+            } else if (!app.pids.empty()) {
+                // 如果进程又出现了，重置未检测计时器
+                app.undetected_since = 0;
             }
         }
     }

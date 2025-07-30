@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v26_optimal"
+#define LOG_TAG "cerberusd_main_v27_staggered" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -133,9 +133,10 @@ void worker_thread_func() {
     LOGI("Worker thread started.");
     g_top_app_refresh_tickets = 2; 
     
-    int deep_scan_countdown = 10; 
+    // [性能优化] 修改/新增计时器
+    int reconcile_countdown = 15; // 每 15 * 2 = 30 秒执行一次进程核对
     int audio_scan_countdown = 3;
-    int location_scan_countdown = 15;
+    int location_scan_countdown = 7;
     int audit_countdown = 30; // 权威审计计时器，30 * 2s = 60s
     
     const int SAMPLING_INTERVAL_SEC = 2;
@@ -144,14 +145,14 @@ void worker_thread_func() {
         auto loop_start_time = std::chrono::steady_clock::now();
         bool state_changed = false;
 
-        // 1. [低成本] 采集性能指标
+        // 1. [低成本] 采集性能指标 (保持)
         auto metrics_opt = g_sys_monitor->collect_current_metrics();
         if (metrics_opt) {
             g_ts_db->add_record(*metrics_opt);
             g_state_manager->process_new_metrics(*metrics_opt);
         }
 
-        // 2. [高频快速响应] 检查 inotify 触发器，执行极速扫描
+        // 2. [高频快速响应] 检查 inotify 触发器 (保持)
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
             LOGI("PERF: Top app change detected by inotify, executing fast scan via /proc...");
@@ -161,7 +162,7 @@ void worker_thread_func() {
             audit_countdown = 30; 
         }
         
-        // 3. [低频权威审计] 检查定时审计计时器，执行重量级扫描
+        // 3. [低频权威审计] (保持)
         if (--audit_countdown <= 0) {
             LOGI("PERF: Periodic audit timer triggered, executing authoritative scan via dumpsys...");
             if (g_state_manager->evaluate_and_execute_strategy()) {
@@ -170,17 +171,26 @@ void worker_thread_func() {
             audit_countdown = 30;
         }
         
-        // 4. [低成本] 推进内部状态机
+        // 4. [低成本] 推进内部状态机 (保持)
         if (g_state_manager->tick_state_machine()) {
             state_changed = true;
         }
 
-        // 5. [中等成本] 定期扫描
-        if (--deep_scan_countdown <= 0) {
+        // 5. [性能优化] 新增的交错式扫描
+        // 只有当UI客户端连接时，才执行内存统计，避免后台不必要的CPU消耗
+        if (g_server && g_server->has_clients()) {
+            if (g_state_manager->perform_staggered_stats_scan()) {
+                state_changed = true; // 标记状态已改变，以便广播
+            }
+        }
+
+        // 6. [性能优化] 修改后的低频维护任务
+        if (--reconcile_countdown <= 0) {
+            // 调用轻量化后的 deep_scan，只做进程核对和清理
             if (g_state_manager->perform_deep_scan()) {
                 state_changed = true;
             }
-            deep_scan_countdown = 10;
+            reconcile_countdown = 15; // 重置计时器
         }
         if (--audio_scan_countdown <= 0) {
             g_sys_monitor->update_audio_state();
@@ -191,12 +201,12 @@ void worker_thread_func() {
             location_scan_countdown = 15;
         }
 
-        // 6. [同步]
+        // 7. [同步] (保持)
         if (state_changed) {
             broadcast_dashboard_update();
         }
 
-        // 7. [循环周期控制]
+        // 8. [循环周期控制] (保持)
         auto loop_end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(loop_end_time - loop_start_time);
         if (duration.count() < SAMPLING_INTERVAL_SEC) {
@@ -238,9 +248,8 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
     
-    //g_server = std::make_unique<UdsServer>("cerberus_socket");
-    const int DAEMON_PORT = 28900; // 定义我们的通信端口
-    g_server = std::make_unique<UdsServer>(DAEMON_PORT); // [核心修改] 使用端口号实例化    
+    const int DAEMON_PORT = 28900;
+    g_server = std::make_unique<UdsServer>(DAEMON_PORT);
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
     g_server->run();

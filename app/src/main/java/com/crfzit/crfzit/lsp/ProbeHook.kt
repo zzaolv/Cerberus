@@ -7,7 +7,7 @@ import android.content.pm.ApplicationInfo
 import android.os.Process
 import android.os.UserHandle
 import com.crfzit.crfzit.data.model.CerberusMessage
-import com.crfzit.crfzit.data.uds.TcpClient // [核心修复] 引入 TcpClient
+import com.crfzit.crfzit.data.uds.TcpClient // 确认这是您正确的 TcpClient 路径
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -24,7 +24,6 @@ import kotlin.coroutines.coroutineContext
 class ProbeHook : IXposedHookLoadPackage {
 
     private val probeScope = CoroutineScope(SupervisorJob() + Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    // [核心修复] 变量类型和名称同步更新
     private var tcpClient: TcpClient? = null
     private val gson = Gson()
 
@@ -33,7 +32,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v22_TCP" // 更新版本号
+        private const val TAG = "CerberusProbe_v23_Robust_State_Hook" // 更新版本号
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val PER_USER_RANGE = 100000
     }
@@ -42,9 +41,8 @@ class ProbeHook : IXposedHookLoadPackage {
         if (lpparam.packageName != "android") return
 
         log("Loading into system_server (PID: ${Process.myPid()}).")
-        // [核心修复] 实例化 TcpClient
         tcpClient = TcpClient(probeScope)
-        probeScope.launch { setupPersistentUdsCommunication() }
+        probeScope.launch { setupPersistentCommunication() } // 方法名修正为通用
 
         try {
             val classLoader = lpparam.classLoader
@@ -91,29 +89,11 @@ class ProbeHook : IXposedHookLoadPackage {
         } ?: logError("FATAL: Could not find com.android.server.wm.ActivityStarter class!")
     }
 
-
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
 
-    private fun findAndHookMethod(
-        clazz: Class<*>?,
-        methodName: String,
-        hook: XC_MethodHook,
-        vararg parameterTypes: Any
-    ) {
-        if (clazz == null) {
-            logError("Cannot hook $methodName because class is null.")
-            return
-        }
-        try {
-            XposedHelpers.findAndHookMethod(clazz, methodName, *parameterTypes, hook)
-            log("SUCCESS: Hooked ${clazz.simpleName}#$methodName.")
-        } catch (t: Throwable) {
-            logError("Failed to hook ${clazz.simpleName}#$methodName with specific signature: $t")
-        }
-    }
-
+    // [终极修复] 使用最健壮的方式 Hook setCurProcState
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
         val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader)
         if (processRecordClass == null) {
@@ -127,13 +107,19 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         }
 
-        try {
-            XposedHelpers.findAndHookMethod(processRecordClass, "setCurProcState", Int::class.javaPrimitiveType, hook)
-            log("SUCCESS: Hooked ProcessRecord#setCurProcState(int).")
-        } catch (e: NoSuchMethodError) {
-            logError("FATAL: Could not find ProcessRecord#setCurProcState(int). Process state changes will not be detected! Error: $e")
-        } catch(t: Throwable) {
-            logError("FATAL: An unexpected error occurred while hooking ProcessRecord#setCurProcState: $t")
+        var success = false
+        // 遍历所有方法，手动匹配
+        for (method in processRecordClass.declaredMethods) {
+            if (method.name == "setCurProcState" && method.parameterTypes.size == 1 && method.parameterTypes[0] == Int::class.javaPrimitiveType) {
+                XposedBridge.hookMethod(method, hook)
+                log("SUCCESS: Hooked ProcessRecord#setCurProcState(int) via manual search.")
+                success = true
+                break // 找到就停止
+            }
+        }
+
+        if (!success) {
+            logError("FATAL: Failed to hook ProcessRecord#setCurProcState(int) after manual search. Process state changes will not be detected!")
         }
     }
 
@@ -329,7 +315,6 @@ class ProbeHook : IXposedHookLoadPackage {
         probeScope.launch {
             try {
                 val message = CerberusMessage(type = type, payload = payload)
-                // [核心修复] 使用 tcpClient 发送消息
                 tcpClient?.sendMessage(gson.toJson(message))
             } catch (e: Exception) {
                 logError("Daemon send error for $type: $e")
@@ -337,11 +322,10 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    private suspend fun setupPersistentUdsCommunication() {
+    private suspend fun setupPersistentCommunication() {
         log("Persistent communication manager started.")
         while (coroutineContext.isActive) {
             try {
-                // [核心修复] 调用 tcpClient 的方法
                 tcpClient?.start()
                 delay(1000)
                 val helloPayload = mapOf("pid" to Process.myPid(), "version" to TAG)
