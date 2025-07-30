@@ -12,16 +12,14 @@
 #include <sys/select.h>
 #include <thread>
 #include <sys/stat.h>
-#include <filesystem> // [核心新增] 引入 filesystem
 
-#define LOG_TAG "cerberusd_uds_v9_filesystem"
+#define LOG_TAG "cerberusd_uds_v10_abstract"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-namespace fs = std::filesystem; // [核心新增]
 
-// ... (UdsServer 构造、析构、set_handler等函数保持不变) ...
+// UdsServer 构造、析构、set_handler等函数保持不变
 UdsServer::UdsServer(const std::string& socket_name)
     : socket_name_(socket_name), server_fd_(-1), is_running_(false) {}
 
@@ -141,13 +139,10 @@ void UdsServer::stop() {
     if (!is_running_.exchange(false)) return;
     LOGI("Stopping UDS server...");
     
-    // [核心修改] 增加 unlink 操作
     if (server_fd_ != -1) {
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
         server_fd_ = -1;
-        // 确保停止时删除 socket 文件
-        fs::remove(socket_path_);
     }
 
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -166,31 +161,29 @@ void UdsServer::run() {
         return;
     }
 
-    // [核心修改] 创建文件系统 Socket 而不是抽象 Socket
-    const std::string socket_dir = "/data/adb/cerberus";
-    socket_path_ = socket_dir + "/" + socket_name_;
-    
-    // 确保目录存在
-    fs::create_directories(socket_dir);
-    
-    // 如果 socket 文件已存在，先删除它
-    fs::remove(socket_path_);
-
+    // [核心修复] 创建抽象命名空间 Socket
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+    // 第一个字节必须是空字符，表示这是一个抽象 Socket
+    addr.sun_path[0] = '\0';
+    // 将 socket 名字复制到空字符后面
+    strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
 
-    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        LOGE("Failed to bind filesystem socket at '%s': %s", socket_path_.c_str(), strerror(errno));
+    // 计算地址的实际长度
+    socklen_t addr_len = sizeof(addr.sun_family) + strlen(socket_name_.c_str()) + 1;
+
+    // 为了安全，先尝试取消绑定，防止旧的进程残留
+    // 对于抽象 Socket，这一步不是必须的，但对于调试和重启有好处
+    unlink(addr.sun_path);
+
+    if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
+        LOGE("Failed to bind abstract socket '@%s': %s", socket_name_.c_str(), strerror(errno));
         close(server_fd_);
         return;
     }
     
-    // [核心修改] 为 socket 文件设置 0666 权限
-    if (chmod(socket_path_.c_str(), 0666) < 0) {
-        LOGE("Failed to chmod socket '%s': %s", socket_path_.c_str(), strerror(errno));
-    }
+    // 抽象 Socket 不需要 chmod
 
     if (listen(server_fd_, 5) == -1) {
         LOGE("Failed to listen on socket: %s", strerror(errno));
@@ -198,10 +191,10 @@ void UdsServer::run() {
         return;
     }
 
-    LOGI("Server listening on filesystem UDS: %s", socket_path_.c_str());
+    LOGI("Server listening on abstract UDS: @%s", socket_name_.c_str());
     is_running_ = true;
 
-    // ... (主循环 select/accept/handle_client_data 保持不变) ...
+    // 主循环 select/accept/handle_client_data 保持不变
     while (is_running_) {
         fd_set read_fds;
         FD_ZERO(&read_fds);

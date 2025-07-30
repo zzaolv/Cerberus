@@ -16,11 +16,12 @@ class UdsClient(private val scope: CoroutineScope) {
     private var socket: LocalSocket? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
-    private val _incomingMessages = MutableSharedFlow<String>(replay = 10, extraBufferCapacity = 64) // 增加缓冲区
+    private val _incomingMessages = MutableSharedFlow<String>(replay = 10, extraBufferCapacity = 64)
     val incomingMessages = _incomingMessages.asSharedFlow()
 
     companion object {
         private const val TAG = "CerberusUdsClient"
+        // [核心修复] SOCKET_NAME 必须是简单的名字，而不是文件路径
         private const val SOCKET_NAME = "cerberus_socket"
         private const val RECONNECT_DELAY_MS = 3000L
     }
@@ -34,8 +35,10 @@ class UdsClient(private val scope: CoroutineScope) {
         connectionJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
+                    // [核心修复] 日志会显示为 @cerberus_socket
                     Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
                     socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
+                        // [核心修复] 使用 ABSTRACT 命名空间进行连接
                         it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
                         outputStream = it.outputStream
                     }
@@ -51,7 +54,7 @@ class UdsClient(private val scope: CoroutineScope) {
             }
         }
     }
-    
+
     fun sendMessage(message: String) {
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
@@ -78,7 +81,7 @@ class UdsClient(private val scope: CoroutineScope) {
                 while (currentSocket.isConnected && scope.isActive) {
                     val line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                         Log.d(TAG, "Rcvd: $line")
+                        Log.d(TAG, "Rcvd: $line")
                         _incomingMessages.emit(line)
                     }
                 }
