@@ -11,14 +11,17 @@
 #include <cstddef>
 #include <sys/select.h>
 #include <thread>
-#include <sys/stat.h> // [核心新增] 引入 stat.h 用于 chmod
+#include <sys/stat.h>
+#include <filesystem> // [核心新增] 引入 filesystem
 
-#define LOG_TAG "cerberusd_uds_v8_perms_fix"
+#define LOG_TAG "cerberusd_uds_v9_filesystem"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+namespace fs = std::filesystem; // [核心新增]
 
+// ... (UdsServer 构造、析构、set_handler等函数保持不变) ...
 UdsServer::UdsServer(const std::string& socket_name)
     : socket_name_(socket_name), server_fd_(-1), is_running_(false) {}
 
@@ -137,11 +140,14 @@ void UdsServer::handle_client_data(int client_fd) {
 void UdsServer::stop() {
     if (!is_running_.exchange(false)) return;
     LOGI("Stopping UDS server...");
-
+    
+    // [核心修改] 增加 unlink 操作
     if (server_fd_ != -1) {
         shutdown(server_fd_, SHUT_RDWR);
         close(server_fd_);
         server_fd_ = -1;
+        // 确保停止时删除 socket 文件
+        fs::remove(socket_path_);
     }
 
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -160,37 +166,31 @@ void UdsServer::run() {
         return;
     }
 
+    // [核心修改] 创建文件系统 Socket 而不是抽象 Socket
+    const std::string socket_dir = "/data/adb/cerberus";
+    socket_path_ = socket_dir + "/" + socket_name_;
+    
+    // 确保目录存在
+    fs::create_directories(socket_dir);
+    
+    // 如果 socket 文件已存在，先删除它
+    fs::remove(socket_path_);
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    
-    // Abstract Namespace Socket
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
-    
-    // 对于 Filesystem Namespace Socket, 需要 unlink 旧文件并 chmod
-    // 但 Abstract Namespace Socket 不需要，这里我们假设使用 Abstract
-    // 如果需要改为 Filesystem Socket，需要取消下面的注释
-    /*
-    std::string socket_path = "/data/adb/cerberus/" + socket_name_;
-    unlink(socket_path.c_str());
-    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-    */
+    strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
 
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + socket_name_.length() + 1;
-
-    if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
-        LOGE("Failed to bind abstract socket '@%s': %s", socket_name_.c_str(), strerror(errno));
+    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        LOGE("Failed to bind filesystem socket at '%s': %s", socket_path_.c_str(), strerror(errno));
         close(server_fd_);
         return;
     }
-
-    /*
-    // 如果使用 Filesystem Socket，需要在这里 chmod
-    if (chmod(socket_path.c_str(), 0666) < 0) {
-        LOGE("Failed to chmod socket '%s': %s", socket_path.c_str(), strerror(errno));
+    
+    // [核心修改] 为 socket 文件设置 0666 权限
+    if (chmod(socket_path_.c_str(), 0666) < 0) {
+        LOGE("Failed to chmod socket '%s': %s", socket_path_.c_str(), strerror(errno));
     }
-    */
 
     if (listen(server_fd_, 5) == -1) {
         LOGE("Failed to listen on socket: %s", strerror(errno));
@@ -198,9 +198,10 @@ void UdsServer::run() {
         return;
     }
 
-    LOGI("Server listening on abstract UDS: @%s", socket_name_.c_str());
+    LOGI("Server listening on filesystem UDS: %s", socket_path_.c_str());
     is_running_ = true;
 
+    // ... (主循环 select/accept/handle_client_data 保持不变) ...
     while (is_running_) {
         fd_set read_fds;
         FD_ZERO(&read_fds);

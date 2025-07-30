@@ -42,6 +42,7 @@ private:
     std::function<void(int, const std::string&)> on_message_received_;
     std::function<void(int)> on_disconnect_;
     std::map<int, std::string> client_buffers_;
+    std::string socket_path_; // [核心新增]
 };
 
 #endif //CERBERUSD_UDS_SERVER_H
