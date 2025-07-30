@@ -7,7 +7,7 @@ import android.content.pm.ApplicationInfo
 import android.os.Process
 import android.os.UserHandle
 import com.crfzit.crfzit.data.model.CerberusMessage
-import com.crfzit.crfzit.data.uds.UdsClient
+import com.crfzit.crfzit.data.uds.TcpClient // [核心修复] 引入 TcpClient
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import de.robv.android.xposed.IXposedHookLoadPackage
@@ -24,7 +24,8 @@ import kotlin.coroutines.coroutineContext
 class ProbeHook : IXposedHookLoadPackage {
 
     private val probeScope = CoroutineScope(SupervisorJob() + Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private var udsClient: UdsClient? = null
+    // [核心修复] 变量类型和名称同步更新
+    private var tcpClient: TcpClient? = null
     private val gson = Gson()
 
     private val foregroundStatusCache = ConcurrentHashMap<Int, Boolean>()
@@ -32,7 +33,7 @@ class ProbeHook : IXposedHookLoadPackage {
     private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v21_Robust_Hook"
+        private const val TAG = "CerberusProbe_v22_TCP" // 更新版本号
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val PER_USER_RANGE = 100000
     }
@@ -41,14 +42,15 @@ class ProbeHook : IXposedHookLoadPackage {
         if (lpparam.packageName != "android") return
 
         log("Loading into system_server (PID: ${Process.myPid()}).")
-        udsClient = UdsClient(probeScope)
+        // [核心修复] 实例化 TcpClient
+        tcpClient = TcpClient(probeScope)
         probeScope.launch { setupPersistentUdsCommunication() }
 
         try {
             val classLoader = lpparam.classLoader
 
             hookActivityStarter(classLoader)
-            hookAMSForProcessStateChanges(classLoader) // 关键修复点
+            hookAMSForProcessStateChanges(classLoader)
             hookWakelocksAndAlarms(classLoader)
             hookServicesAndBroadcasts(classLoader)
             hookNotificationService(classLoader)
@@ -94,7 +96,6 @@ class ProbeHook : IXposedHookLoadPackage {
         return XposedHelpers.findClassIfExists(className, classLoader)
     }
 
-    // [核心修复] findAndHookMethod 增加更详细的错误日志
     private fun findAndHookMethod(
         clazz: Class<*>?,
         methodName: String,
@@ -113,7 +114,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // [核心修复] 重点修正此函数
     private fun hookAMSForProcessStateChanges(classLoader: ClassLoader) {
         val processRecordClass = findClass("com.android.server.am.ProcessRecord", classLoader)
         if (processRecordClass == null) {
@@ -156,7 +156,6 @@ class ProbeHook : IXposedHookLoadPackage {
         sendEventToDaemon(eventType, mapOf("package_name" to packageName, "user_id" to userId))
     }
 
-    // [改进] 对于防御性hook，可以使用更宽容的模糊匹配
     private fun findAndHookMethodFuzzy(
         clazz: Class<*>?,
         methodName: String,
@@ -330,7 +329,8 @@ class ProbeHook : IXposedHookLoadPackage {
         probeScope.launch {
             try {
                 val message = CerberusMessage(type = type, payload = payload)
-                udsClient?.sendMessage(gson.toJson(message))
+                // [核心修复] 使用 tcpClient 发送消息
+                tcpClient?.sendMessage(gson.toJson(message))
             } catch (e: Exception) {
                 logError("Daemon send error for $type: $e")
             }
@@ -341,13 +341,14 @@ class ProbeHook : IXposedHookLoadPackage {
         log("Persistent communication manager started.")
         while (coroutineContext.isActive) {
             try {
-                udsClient?.start()
+                // [核心修复] 调用 tcpClient 的方法
+                tcpClient?.start()
                 delay(1000)
                 val helloPayload = mapOf("pid" to Process.myPid(), "version" to TAG)
-                udsClient?.sendMessage(gson.toJson(CerberusMessage(type = "event.probe_hello", payload = helloPayload)))
-                udsClient?.incomingMessages?.collect { jsonLine -> ConfigManager.updateConfig(jsonLine) }
-                logError("UDS message stream ended. Reconnecting...")
-                udsClient?.stop()
+                tcpClient?.sendMessage(gson.toJson(CerberusMessage(type = "event.probe_hello", payload = helloPayload)))
+                tcpClient?.incomingMessages?.collect { jsonLine -> ConfigManager.updateConfig(jsonLine) }
+                logError("TCP message stream ended. Reconnecting...")
+                tcpClient?.stop()
             } catch (e: CancellationException) {
                 log("Communication scope cancelled."); break
             } catch (e: Exception) {

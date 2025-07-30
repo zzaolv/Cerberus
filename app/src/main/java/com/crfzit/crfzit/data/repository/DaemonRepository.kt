@@ -3,7 +3,7 @@ package com.crfzit.crfzit.data.repository
 
 import android.util.Log
 import com.crfzit.crfzit.data.model.*
-import com.crfzit.crfzit.data.uds.UdsClient
+import com.crfzit.crfzit.data.uds.TcpClient
 import com.google.gson.Gson
 import com.google.gson.JsonSyntaxException
 import com.google.gson.annotations.SerializedName
@@ -13,17 +13,18 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-class DaemonRepository(
+// 架构重构：构造函数变为私有
+class DaemonRepository private constructor(
     private val scope: CoroutineScope
 ) {
-    private val udsClient = UdsClient(scope)
+    private val tcpClient = TcpClient(scope)
     private val gson = Gson()
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
 
     init {
-        udsClient.start()
+        tcpClient.start()
         scope.launch(Dispatchers.IO) {
-            udsClient.incomingMessages.collect { jsonLine ->
+            tcpClient.incomingMessages.collect { jsonLine ->
                 try {
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
                     if (baseMsg.type.startsWith("resp.") && baseMsg.requestId != null) {
@@ -36,12 +37,11 @@ class DaemonRepository(
         }
     }
 
-    fun getDashboardStream(): Flow<DashboardPayload> = udsClient.incomingMessages
+    fun getDashboardStream(): Flow<DashboardPayload> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
                 val type = object : TypeToken<CerberusMessage<DashboardPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<DashboardPayload>>(jsonLine, type)
-                // [核心修复] 增加空值检查，防止闪退
                 if (msg?.type == "stream.dashboard_update") msg.payload else null
             } catch (e: Exception) {
                 Log.w("DaemonRepository", "Failed to parse DashboardPayload: ${e.message}")
@@ -49,14 +49,13 @@ class DaemonRepository(
             }
         }
 
-    fun getLogStream(): Flow<LogEntry> = udsClient.incomingMessages
+    fun getLogStream(): Flow<LogEntry> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
                 val type = object : TypeToken<CerberusMessage<LogEntryPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<LogEntryPayload>>(jsonLine, type)
-                // [核心修复] 增加空值检查
                 if (msg?.type == "stream.new_log_entry") {
-                    val p = msg.payload ?: return@mapNotNull null // 如果payload为空，则忽略
+                    val p = msg.payload ?: return@mapNotNull null
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
                 } else null
             } catch (e: Exception) {
@@ -65,14 +64,13 @@ class DaemonRepository(
             }
         }
 
-    fun getStatsStream(): Flow<MetricsRecord> = udsClient.incomingMessages
+    fun getStatsStream(): Flow<MetricsRecord> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
                 val type = object : TypeToken<CerberusMessage<MetricsRecordPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<MetricsRecordPayload>>(jsonLine, type)
-                // [核心修复] 增加空值检查
                 if (msg?.type == "stream.new_stats_record") {
-                    val p = msg.payload ?: return@mapNotNull null // 如果payload为空，则忽略
+                    val p = msg.payload ?: return@mapNotNull null
                     MetricsRecord(
                         timestamp = p.timestamp,
                         cpuUsagePercent = p.cpuUsagePercent,
@@ -97,7 +95,6 @@ class DaemonRepository(
 
     suspend fun getAllLogs(): List<LogEntry>? = query("query.get_all_logs") { json ->
         val type = object : TypeToken<List<LogEntryPayload>>() {}.type
-        // [核心修复] GSON可能返回null list，用 elvis 操作符处理
         val payloads = gson.fromJson<List<LogEntryPayload>>(json, type) ?: emptyList()
         payloads.map { p ->
             LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
@@ -106,7 +103,6 @@ class DaemonRepository(
 
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->
         val type = object : TypeToken<List<MetricsRecordPayload>>() {}.type
-        // [核心修复] GSON可能返回null list，用 elvis 操作符处理
         val payloads = gson.fromJson<List<MetricsRecordPayload>>(json, type) ?: emptyList()
         payloads.map { p ->
             MetricsRecord(
@@ -133,7 +129,7 @@ class DaemonRepository(
         pendingRequests[reqId] = deferred
 
         val requestMsg = CerberusMessage(type = queryType, requestId = reqId, payload = EmptyPayload)
-        udsClient.sendMessage(gson.toJson(requestMsg))
+        tcpClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
@@ -155,7 +151,7 @@ class DaemonRepository(
 
     fun setPolicy(config: FullConfigPayload) {
         val message = CerberusMessage(type = "cmd.set_policy", payload = config)
-        udsClient.sendMessage(gson.toJson(message))
+        tcpClient.sendMessage(gson.toJson(message))
     }
 
     suspend fun getAllPolicies(): FullConfigPayload? {
@@ -164,7 +160,7 @@ class DaemonRepository(
         pendingRequests[reqId] = deferred
 
         val requestMsg = CerberusMessage(type = "query.get_all_policies", requestId = reqId, payload = EmptyPayload)
-        udsClient.sendMessage(gson.toJson(requestMsg))
+        tcpClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
@@ -180,13 +176,18 @@ class DaemonRepository(
 
     fun requestDashboardRefresh() {
         val message = CerberusMessage(type = "query.refresh_dashboard", payload = EmptyPayload)
-        udsClient.sendMessage(gson.toJson(message))
+        tcpClient.sendMessage(gson.toJson(message))
     }
 
     fun stop() {
-        udsClient.stop()
+        tcpClient.stop()
         pendingRequests.values.forEach { it.cancel("Repository is stopping.") }
         pendingRequests.clear()
+    }
+
+    fun setMasterConfig(payload: Map<String, Any>) {
+        val message = CerberusMessage(type = "cmd.set_master_config", payload = payload)
+        tcpClient.sendMessage(gson.toJson(message))
     }
 
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
@@ -194,11 +195,26 @@ class DaemonRepository(
     private data class BaseMessageWithPayload(
         val type: String,
         @SerializedName("req_id") val requestId: String?,
-        val payload: com.google.gson.JsonElement? // [核心修复] Payload可以为null
+        val payload: com.google.gson.JsonElement?
     )
 
-    fun setMasterConfig(payload: Map<String, Any>) {
-        val message = CerberusMessage(type = "cmd.set_master_config", payload = payload)
-        udsClient.sendMessage(gson.toJson(message))
+    // 架构重构：单例模式实现
+    companion object {
+        @Volatile
+        private var INSTANCE: DaemonRepository? = null
+
+        fun getInstance(scope: CoroutineScope? = null): DaemonRepository {
+            return INSTANCE ?: synchronized(this) {
+                val instance = INSTANCE
+                if (instance != null) {
+                    instance
+                } else {
+                    require(scope != null) { "CoroutineScope must be provided for the first initialization of DaemonRepository" }
+                    val newInstance = DaemonRepository(scope)
+                    INSTANCE = newInstance
+                    newInstance
+                }
+            }
+        }
     }
 }

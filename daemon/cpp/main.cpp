@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v21_hotfix"
+#define LOG_TAG "cerberusd_main_v26_optimal"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -58,7 +58,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (!g_state_manager) return;
 
-        // [核心架构] 完整处理所有来自Probe的事件
         if (type == "cmd.proactive_unfreeze") {
             g_state_manager->on_proactive_unfreeze_request(msg.at("payload"));
         } else if (type == "event.app_foreground") {
@@ -100,7 +99,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
-
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);
     if (client_fd == g_probe_fd.load()) {
@@ -133,11 +131,12 @@ void signal_handler(int signum) {
 
 void worker_thread_func() {
     LOGI("Worker thread started.");
-    g_top_app_refresh_tickets = 2;
+    g_top_app_refresh_tickets = 2; 
     
-    // [核心修复] 重新加入轮询计时器
-    int audio_scan_countdown = 5;
-    int location_scan_countdown = 7;
+    int deep_scan_countdown = 10; 
+    int audio_scan_countdown = 3;
+    int location_scan_countdown = 15;
+    int audit_countdown = 30; // 权威审计计时器，30 * 2s = 60s
     
     const int SAMPLING_INTERVAL_SEC = 2;
 
@@ -145,45 +144,59 @@ void worker_thread_func() {
         auto loop_start_time = std::chrono::steady_clock::now();
         bool state_changed = false;
 
-        // 1. [数据采集]
+        // 1. [低成本] 采集性能指标
         auto metrics_opt = g_sys_monitor->collect_current_metrics();
         if (metrics_opt) {
             g_ts_db->add_record(*metrics_opt);
             g_state_manager->process_new_metrics(*metrics_opt);
         }
 
-        // 2. [情报与决策]
+        // 2. [高频快速响应] 检查 inotify 触发器，执行极速扫描
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
-            state_changed = true;
+            LOGI("PERF: Top app change detected by inotify, executing fast scan via /proc...");
+            if (g_state_manager->handle_top_app_change_fast()) {
+                state_changed = true;
+            }
+            audit_countdown = 30; 
         }
         
-        // 核心战略执行
-        if (g_state_manager->evaluate_and_execute_strategy()) {
+        // 3. [低频权威审计] 检查定时审计计时器，执行重量级扫描
+        if (--audit_countdown <= 0) {
+            LOGI("PERF: Periodic audit timer triggered, executing authoritative scan via dumpsys...");
+            if (g_state_manager->evaluate_and_execute_strategy()) {
+                state_changed = true;
+            }
+            audit_countdown = 30;
+        }
+        
+        // 4. [低成本] 推进内部状态机
+        if (g_state_manager->tick_state_machine()) {
             state_changed = true;
         }
 
-        // 定期深度扫描，同步进程列表
-        if (g_state_manager->perform_deep_scan()) {
-            state_changed = true;
+        // 5. [中等成本] 定期扫描
+        if (--deep_scan_countdown <= 0) {
+            if (g_state_manager->perform_deep_scan()) {
+                state_changed = true;
+            }
+            deep_scan_countdown = 10;
         }
-        
-        // [核心修复] 重新加入音频和定位状态的周期性检查
         if (--audio_scan_countdown <= 0) {
             g_sys_monitor->update_audio_state();
-            audio_scan_countdown = 3; // ~6 seconds
+            audio_scan_countdown = 3;
         }
         if (--location_scan_countdown <= 0) {
             g_sys_monitor->update_location_state();
-            location_scan_countdown = 15; // ~30 seconds
+            location_scan_countdown = 15;
         }
 
-        // 3. [同步]
+        // 6. [同步]
         if (state_changed) {
             broadcast_dashboard_update();
         }
 
-        // 4. [循环周期控制]
+        // 7. [循环周期控制]
         auto loop_end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(loop_end_time - loop_start_time);
         if (duration.count() < SAMPLING_INTERVAL_SEC) {

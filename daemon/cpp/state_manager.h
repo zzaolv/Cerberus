@@ -78,6 +78,7 @@ public:
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
     bool evaluate_and_execute_strategy();
+    bool handle_top_app_change_fast();
 
     void process_new_metrics(const MetricsRecord& record);
     bool tick_state_machine();
@@ -87,17 +88,14 @@ public:
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
-    void on_wakeup_request(const json& payload);
     
-    // [核心修复] 新增主动解冻接口
+    void on_app_foreground_event(const json& payload);
+    void on_app_background_event(const json& payload);
     void on_proactive_unfreeze_request(const json& payload);
-
+    void on_wakeup_request(const json& payload);
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
-    // [核心架构] 添加处理前后台事件的接口
-    void on_app_foreground_event(const json& payload);
-    void on_app_background_event(const json& payload);    
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
@@ -117,6 +115,7 @@ private:
     void cancel_timed_unfreeze(AppRuntimeState& app);
     bool check_timers();
 
+    bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
 

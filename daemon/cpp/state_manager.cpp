@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v27_log_dedup"
+#define LOG_TAG "cerberusd_state_v28_optimal"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,7 +21,6 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// ... (status_to_string and DozeManager implementations are unchanged) ...
 static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
@@ -120,7 +119,6 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
     return DozeEvent::NONE;
 }
 
-// --- StateManager Implementation ---
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act,
                            std::shared_ptr<Logger> logger, std::shared_ptr<TimeSeriesDatabase> ts_db)
     : db_manager_(db), sys_monitor_(sys), action_executor_(act), logger_(logger), ts_db_(ts_db) {
@@ -495,9 +493,14 @@ bool StateManager::evaluate_and_execute_strategy() {
         audit_app_structures(process_tree);
     }
     
-    state_has_changed |= tick_state_machine();
+    // 定时器推进由主循环独立处理，这里只做审计
     
     return state_has_changed;
+}
+
+bool StateManager::handle_top_app_change_fast() {
+    auto top_pids = sys_monitor_->read_top_app_pids();
+    return update_foreground_state_from_pids(top_pids);
 }
 
 void StateManager::process_new_metrics(const MetricsRecord& record) {
@@ -630,7 +633,6 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
-// [核心修复] 实现日志去重逻辑
 void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     for(auto& [key, app] : managed_apps_) {
@@ -668,7 +670,6 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
     }
 }
 
-// [核心修复] 修正函数签名，加入输入法豁免和日志标志重置
 bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
@@ -701,12 +702,12 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
                 app.is_foreground = is_now_foreground;
 
                 if (is_now_foreground) {
-                    app.has_logged_rogue_warning = false; // 重置日志标志
+                    app.has_logged_rogue_warning = false;
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
                          logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     }
-                    if (unfreeze_and_observe_nolock(app, "切换至前台")) {
+                    if (unfreeze_and_observe_nolock(app, "切换至前台(权威)")) {
                         probe_config_needs_update = true;
                     }
                     app.observation_since = 0;
@@ -735,6 +736,150 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
         notify_probe_of_config_change();
     }
     return state_has_changed;
+}
+
+bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pids) {
+    bool state_has_changed = false;
+    bool probe_config_needs_update = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        
+        std::set<AppInstanceKey> top_app_keys;
+        for (int pid : top_pids) {
+            int uid = -1, user_id = -1;
+            std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
+            if (!pkg_name.empty() && user_id != -1) {
+                top_app_keys.insert({pkg_name, user_id});
+            }
+        }
+        
+        std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
+        if (!current_ime_pkg.empty()) {
+            top_app_keys.insert({current_ime_pkg, 0});
+        }
+        
+        std::set<AppInstanceKey> prev_foreground_keys;
+        for (const auto& [key, app] : managed_apps_) {
+            if (app.is_foreground) prev_foreground_keys.insert(key);
+        }
+
+        if (top_app_keys == prev_foreground_keys) {
+            return false;
+        }
+
+        const auto& final_foreground_keys = top_app_keys;
+        
+        time_t now = time(nullptr);
+        for (auto& [key, app] : managed_apps_) {
+            bool is_now_foreground = final_foreground_keys.count(key);
+            if (app.is_foreground != is_now_foreground) {
+                state_has_changed = true;
+                 app.is_foreground = is_now_foreground;
+
+                if (is_now_foreground) {
+                    app.has_logged_rogue_warning = false;
+                    if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
+                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
+                         app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    }
+                    if (unfreeze_and_observe_nolock(app, "切换至前台(快速)")) {
+                        probe_config_needs_update = true;
+                    }
+                    app.observation_since = 0;
+                    app.background_since = 0;
+                    app.freeze_retry_count = 0;
+                } else {
+                     if (prev_foreground_keys.count(key) > 0) {
+                        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        long long current_runtime_ms = (app.last_foreground_timestamp_ms > 0) ? (now_ms - app.last_foreground_timestamp_ms) : 0;
+                        app.total_runtime_ms += current_runtime_ms;
+                        long total_seconds = app.total_runtime_ms / 1000;
+                        std::stringstream ss_msg;
+                        ss_msg << "已关闭 [本次: " << (current_runtime_ms / 1000) << "s] [累计: "
+                               << (total_seconds / 3600) << "h" << ((total_seconds % 3600) / 60) << "m" << (total_seconds % 60) << "s]";
+                        logger_->log(LogLevel::ACTION_CLOSE, "关闭", ss_msg.str(), app.package_name, app.user_id);
+                    }
+                    if (app.current_status == AppRuntimeState::Status::RUNNING && (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) && !app.pids.empty()) {
+                        app.observation_since = now;
+                    }
+                }
+            }
+        }
+    }
+
+    if (probe_config_needs_update) {
+        notify_probe_of_config_change();
+    }
+    return state_has_changed;
+}
+
+void StateManager::on_app_foreground_event(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+
+        LOGD("EVENT: Received foreground event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
+        
+        g_top_app_refresh_tickets = 1;
+
+    } catch (const json::exception& e) {
+        LOGE("Error processing foreground event: %s", e.what());
+    }
+}
+
+void StateManager::on_app_background_event(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+        
+        LOGD("EVENT: Received background event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            AppInstanceKey key = {package_name, user_id};
+            auto it = managed_apps_.find(key);
+            if (it != managed_apps_.end() && it->second.is_foreground) {
+                it->second.is_foreground = false;
+                it->second.observation_since = time(nullptr);
+            }
+        }
+        
+        g_top_app_refresh_tickets = 1;
+
+    } catch (const json::exception& e) {
+        LOGE("Error processing background event: %s", e.what());
+    }
+}
+
+void StateManager::on_proactive_unfreeze_request(const json& payload) {
+    try {
+        std::string package_name = payload.value("package_name", "");
+        int user_id = payload.value("user_id", 0);
+        if (package_name.empty()) return;
+
+        LOGD("PROACTIVE: Received unfreeze request for %s (user %d)", package_name.c_str(), user_id);
+        
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        AppInstanceKey key = {package_name, user_id};
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end()) {
+            if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
+                 logger_->log(LogLevel::ACTION_UNFREEZE, "预解冻", "为响应启动请求而解冻", package_name, user_id);
+                 action_executor_->unfreeze(key, it->second.pids);
+                 it->second.current_status = AppRuntimeState::Status::RUNNING;
+                 it->second.background_since = 0;
+                 it->second.observation_since = 0;
+                 it->second.freeze_retry_count = 0;
+                 
+                 broadcast_dashboard_update();
+            }
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing proactive unfreeze request: %s", e.what());
+    }
 }
 
 void StateManager::on_wakeup_request(const json& payload) {
@@ -1361,79 +1506,4 @@ void StateManager::remove_pid_from_app(int pid) {
 
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
     return critical_system_apps_.count(package_name) > 0;
-}
-
-// [核心修复] 实现主动解冻逻辑
-void StateManager::on_proactive_unfreeze_request(const json& payload) {
-    try {
-        std::string package_name = payload.value("package_name", "");
-        int user_id = payload.value("user_id", 0);
-        if (package_name.empty()) return;
-
-        LOGD("PROACTIVE: Received unfreeze request for %s (user %d)", package_name.c_str(), user_id);
-        
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        AppInstanceKey key = {package_name, user_id};
-        auto it = managed_apps_.find(key);
-        if (it != managed_apps_.end()) {
-            // 只解冻，不进入观察期，因为马上要变前台
-            if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
-                 logger_->log(LogLevel::ACTION_UNFREEZE, "预解冻", "为响应启动请求而解冻", package_name, user_id);
-                 action_executor_->unfreeze(key, it->second.pids);
-                 it->second.current_status = AppRuntimeState::Status::RUNNING;
-                 it->second.background_since = 0;
-                 it->second.observation_since = 0; // 不进入观察期
-                 it->second.freeze_retry_count = 0;
-                 
-                 // 立即广播一次，让UI知道状态已变更
-                 broadcast_dashboard_update();
-            }
-        }
-    } catch (const json::exception& e) {
-        LOGE("Error processing proactive unfreeze request: %s", e.what());
-    }
-}
-
-// [核心架构] 实现前台事件处理
-void StateManager::on_app_foreground_event(const json& payload) {
-    try {
-        std::string package_name = payload.value("package_name", "");
-        int user_id = payload.value("user_id", 0);
-        if (package_name.empty()) return;
-
-        LOGD("EVENT: Received foreground event for %s (user %d)", package_name.c_str(), user_id);
-        
-        // 我们相信Probe的事件，但只用它来触发一次权威验证
-        g_top_app_refresh_tickets = 1;
-
-    } catch (const json::exception& e) {
-        LOGE("Error processing foreground event: %s", e.what());
-    }
-}
-
-void StateManager::on_app_background_event(const json& payload) {
-    try {
-        std::string package_name = payload.value("package_name", "");
-        int user_id = payload.value("user_id", 0);
-        if (package_name.empty()) return;
-        
-        LOGD("EVENT: Received background event for %s (user %d)", package_name.c_str(), user_id);
-
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            AppInstanceKey key = {package_name, user_id};
-            auto it = managed_apps_.find(key);
-            if (it != managed_apps_.end() && it->second.is_foreground) {
-                // 立即启动观察期，不等主循环
-                it->second.is_foreground = false;
-                it->second.observation_since = time(nullptr);
-            }
-        }
-        
-        // 同样，触发一次权威验证
-        g_top_app_refresh_tickets = 1;
-
-    } catch (const json::exception& e) {
-        LOGE("Error processing background event: %s", e.what());
-    }
 }

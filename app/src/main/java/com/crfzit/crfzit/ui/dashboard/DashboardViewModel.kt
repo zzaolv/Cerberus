@@ -33,7 +33,8 @@ data class DashboardUiState(
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val daemonRepository = DaemonRepository(viewModelScope)
+    // 架构重构：获取唯一的单例实例
+    private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
 
@@ -42,22 +43,17 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            // Pre-warm the app info cache
             appInfoRepository.getAllApps(forceRefresh = true)
 
-            // Combine the three streams: daemon data, network speed, and UI settings
             combine(
                 daemonRepository.getDashboardStream(),
                 networkMonitor.getSpeedStream(),
                 _uiState.map { it.showSystemApps }.distinctUntilChanged()
             ) { dashboardPayload, speed, showSystem ->
                 
-                // Map daemon data to UI data
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .mapNotNull { runtimeState ->
-                        // Use the repository to get app metadata (icon, name)
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
-                        // Only display if we can get metadata for it
                         appInfo?.let {
                             UiAppRuntime(
                                 runtimeState = runtimeState,
@@ -74,7 +70,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                             .thenByDescending { it.runtimeState.memUsageKb }
                     )
 
-                // Update the single UI state object
                 _uiState.value.copy(
                     isConnected = true,
                     isRefreshing = false,
@@ -105,6 +100,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         super.onCleared()
-        daemonRepository.stop()
+        // 架构重构：ViewModel不再负责停止Repository
     }
 }

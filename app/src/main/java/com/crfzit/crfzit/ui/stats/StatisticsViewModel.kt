@@ -14,7 +14,8 @@ data class StatisticsUiState(
 )
 
 class StatisticsViewModel : ViewModel() {
-    private val daemonRepository = DaemonRepository(viewModelScope)
+    // [核心修复] 获取唯一的单例实例，而不是自己创建
+    private val daemonRepository = DaemonRepository.getInstance()
     private val _uiState = MutableStateFlow(StatisticsUiState())
     val uiState: StateFlow<StatisticsUiState> = _uiState.asStateFlow()
 
@@ -45,7 +46,8 @@ class StatisticsViewModel : ViewModel() {
     }
 
     override fun onCleared() {
-        daemonRepository.stop()
+        // [核心修复] ViewModel不再负责停止Repository
+        // daemonRepository.stop()
         super.onCleared()
     }
 }

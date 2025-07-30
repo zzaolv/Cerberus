@@ -1,19 +1,17 @@
-// app/src/main/java/com/crfzit/crfzit/data/uds/UdsClient.kt
+// app/src/main/java/com/crfzit/crfzit/data/uds/TcpClient.kt
 package com.crfzit.crfzit.data.uds
 
-// [核心修改] 移除LocalSocket，引入标准Java Socket
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.io.IOException
 import java.io.OutputStream
-import java.net.Socket // 引入 TCP Socket
+import java.net.Socket
 import java.nio.charset.StandardCharsets
 
-class UdsClient(private val scope: CoroutineScope) {
+class TcpClient(private val scope: CoroutineScope) {
 
-    // [核心修改] socket 类型变为 java.net.Socket
     private var socket: Socket? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
@@ -21,7 +19,7 @@ class UdsClient(private val scope: CoroutineScope) {
     val incomingMessages = _incomingMessages.asSharedFlow()
 
     companion object {
-        private const val TAG = "CerberusTcpClient" // 重命名日志标签
+        private const val TAG = "CerberusTcpClient"
         private const val HOST = "127.0.0.1"
         private const val PORT = 28900
         private const val RECONNECT_DELAY_MS = 3000L
@@ -36,9 +34,7 @@ class UdsClient(private val scope: CoroutineScope) {
         connectionJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
-                    // [核心修改] 连接日志显示IP和端口
                     Log.i(TAG, "Attempting to connect to TCP server: $HOST:$PORT...")
-                    // [核心修改] 创建并连接标准 TCP Socket
                     socket = Socket(HOST, PORT).also {
                         outputStream = it.outputStream
                     }
@@ -54,8 +50,7 @@ class UdsClient(private val scope: CoroutineScope) {
             }
         }
     }
-
-    // sendMessage 和 listenForMessages 逻辑完全保持不变
+    
     fun sendMessage(message: String) {
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
@@ -81,7 +76,7 @@ class UdsClient(private val scope: CoroutineScope) {
                 while (currentSocket.isConnected && scope.isActive) {
                     val line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                        Log.d(TAG, "Rcvd: $line")
+                         Log.d(TAG, "Rcvd: $line")
                         _incomingMessages.emit(line)
                     }
                 }

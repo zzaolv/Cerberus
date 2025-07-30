@@ -28,7 +28,8 @@ data class ConfigurationUiState(
 
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val daemonRepository = DaemonRepository(viewModelScope)
+    // 架构重构：获取唯一的单例实例
+    private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val packageManager: PackageManager = application.packageManager
 
@@ -59,38 +60,31 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. [数据源1] 从守护进程获取当前已知的策略配置
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             } ?: emptyMap()
 
-            // 2. [数据源2] 获取手机上所有已安装的可启动应用 (主空间 User 0)
             val allLaunchableApps = getAllLaunchableApps()
 
-            // 3. [合并与丰富] 以可启动应用列表为基础，合并守护进程的数据
             val finalAppList = mutableListOf<AppInfo>()
             val seenPackages = mutableSetOf<String>()
 
-            // 3a. 遍历所有可启动的应用，这是列表的基础
             allLaunchableApps.forEach { appInfo ->
                 finalAppList.add(appInfo)
                 seenPackages.add(appInfo.packageName)
             }
 
-            // 3b. 遍历守护进程返回的策略，处理分身应用
             daemonPolicyMap.values.forEach { policy ->
-                // 如果是分身应用(userId != 0) 并且其主应用是可启动的
                 if (policy.userId != 0 && seenPackages.contains(policy.packageName)) {
                     val baseAppInfo = allLaunchableApps.find { it.packageName == policy.packageName }
-                    // 为分身应用创建一个AppInfo条目
                     finalAppList.add(
                         AppInfo(
                             packageName = policy.packageName,
                             appName = baseAppInfo?.appName ?: policy.packageName,
                             icon = baseAppInfo?.icon,
                             isSystemApp = baseAppInfo?.isSystemApp ?: false,
-                            userId = policy.userId // 关键：使用分身的userId
+                            userId = policy.userId
                         )
                     )
                 }
@@ -99,17 +93,14 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    allInstalledApps = finalAppList.distinctBy { app -> "${app.packageName}-${app.userId}" }, // 确保唯一性
+                    allInstalledApps = finalAppList.distinctBy { app -> "${app.packageName}-${app.userId}" },
                     policies = daemonPolicyMap,
                     fullConfig = configPayload
                 )
             }
         }
     }
-
-    /**
-     * [重写辅助函数] 获取系统中所有具有 LAUNCHER 入口的应用，并包装成 AppInfo 列表。
-     */
+    
     private suspend fun getAllLaunchableApps(): List<AppInfo> = withContext(Dispatchers.IO) {
         val intent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
@@ -123,10 +114,10 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                         appName = appInfo.loadLabel(packageManager).toString(),
                         icon = appInfo.loadIcon(packageManager),
                         isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                        userId = 0 // 这里获取的都是主空间的应用
+                        userId = 0
                     )
                 } catch (e: Exception) {
-                    null // 忽略无法加载的应用
+                    null
                 }
             }
     }
@@ -139,7 +130,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         val existingPolicyIndex = newPolicies.indexOfFirst { it.packageName == packageName && it.userId == userId }
 
         if (existingPolicyIndex != -1) {
-            // [**已修复**] 使用正确的变量名 existingPolicyIndex
             newPolicies[existingPolicyIndex] = newPolicies[existingPolicyIndex].copy(policy = newPolicyValue)
         } else {
             newPolicies.add(AppPolicyPayload(packageName, userId, newPolicyValue))
@@ -147,7 +137,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
         val newConfig = currentConfig.copy(policies = newPolicies)
 
-        // 乐观更新UI
         _uiState.update {
             it.copy(
                 policies = newPolicies.associateBy { p -> AppInstanceKey(p.packageName, p.userId) },
@@ -155,7 +144,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             )
         }
 
-        // 发送到守护进程
         daemonRepository.setPolicy(newConfig)
     }
 
@@ -169,6 +157,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
     override fun onCleared() {
         super.onCleared()
-        daemonRepository.stop()
+        // 架构重构：ViewModel不再负责停止Repository
     }
 }

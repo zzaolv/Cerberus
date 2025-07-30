@@ -17,7 +17,8 @@ data class SettingsUiState(
 )
 
 class SettingsViewModel : ViewModel() {
-    private val daemonRepository = DaemonRepository(viewModelScope)
+    // 架构重构：获取唯一的单例实例
+    private val daemonRepository = DaemonRepository.getInstance()
     
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState = _uiState.asStateFlow()
@@ -31,7 +32,6 @@ class SettingsViewModel : ViewModel() {
             _uiState.update { it.copy(isLoading = true) }
             val config = daemonRepository.getAllPolicies()
             if (config != null) {
-                // [核心修复] 因为 IPCModels.kt 已更新，现在可以直接、安全地访问这些字段
                 val masterConfig = config.masterConfig
                  _uiState.update {
                     it.copy(
@@ -48,9 +48,7 @@ class SettingsViewModel : ViewModel() {
     }
     
     fun setStandardTimeout(seconds: Int) {
-        // 乐观更新UI
         _uiState.update { it.copy(standardTimeoutSec = seconds) }
-        // 将完整配置发送到后端
         sendMasterConfigUpdate()
     }
 
@@ -77,7 +75,7 @@ class SettingsViewModel : ViewModel() {
     }
     
     override fun onCleared() {
-        daemonRepository.stop()
         super.onCleared()
+        // 架构重构：ViewModel不再负责停止Repository
     }
 }
