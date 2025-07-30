@@ -2,7 +2,8 @@
 #include "uds_server.h"
 #include <android/log.h>
 #include <sys/socket.h>
-#include <sys/un.h>
+#include <netinet/in.h> // [核心修改] 引入网络头文件
+#include <arpa/inet.h>  // [核心修改] 引入网络头文件
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -11,17 +12,15 @@
 #include <cstddef>
 #include <sys/select.h>
 #include <thread>
-#include <sys/stat.h>
 
-#define LOG_TAG "cerberusd_uds_v10_abstract"
+#define LOG_TAG "cerberusd_tcp_v1"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-
-// UdsServer 构造、析构、set_handler等函数保持不变
-UdsServer::UdsServer(const std::string& socket_name)
-    : socket_name_(socket_name), server_fd_(-1), is_running_(false) {}
+// [核心修改] 构造函数接受端口
+UdsServer::UdsServer(int port)
+    : port_(port), server_fd_(-1), is_running_(false) {}
 
 UdsServer::~UdsServer() {
     stop();
@@ -137,7 +136,7 @@ void UdsServer::handle_client_data(int client_fd) {
 
 void UdsServer::stop() {
     if (!is_running_.exchange(false)) return;
-    LOGI("Stopping UDS server...");
+    LOGI("Stopping TCP server...");
     
     if (server_fd_ != -1) {
         shutdown(server_fd_, SHUT_RDWR);
@@ -151,50 +150,48 @@ void UdsServer::stop() {
     }
     client_fds_.clear();
     client_buffers_.clear();
-    LOGI("UDS Server stopped and all clients disconnected.");
+    LOGI("TCP Server stopped and all clients disconnected.");
 }
 
 void UdsServer::run() {
-    server_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // [核心修改] 创建 AF_INET (TCP) socket
+    server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_ == -1) {
-        LOGE("Failed to create socket: %s", strerror(errno));
+        LOGE("Failed to create TCP socket: %s", strerror(errno));
         return;
     }
 
-    // [核心修复] 创建抽象命名空间 Socket
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    // 第一个字节必须是空字符，表示这是一个抽象 Socket
-    addr.sun_path[0] = '\0';
-    // 将 socket 名字复制到空字符后面
-    strncpy(addr.sun_path + 1, socket_name_.c_str(), sizeof(addr.sun_path) - 2);
-
-    // 计算地址的实际长度
-    socklen_t addr_len = sizeof(addr.sun_family) + strlen(socket_name_.c_str()) + 1;
-
-    // 为了安全，先尝试取消绑定，防止旧的进程残留
-    // 对于抽象 Socket，这一步不是必须的，但对于调试和重启有好处
-    unlink(addr.sun_path);
-
-    if (bind(server_fd_, (struct sockaddr*)&addr, addr_len) == -1) {
-        LOGE("Failed to bind abstract socket '@%s': %s", socket_name_.c_str(), strerror(errno));
+    // [核心修改] 设置 SO_REUSEADDR 允许服务器快速重启
+    int opt = 1;
+    if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOGE("setsockopt(SO_REUSEADDR) failed: %s", strerror(errno));
         close(server_fd_);
         return;
     }
-    
-    // 抽象 Socket 不需要 chmod
+
+    // [核心修改] 设置 TCP 地址和端口
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // 只监听本地回环地址
+    addr.sin_port = htons(port_); // 将端口号从主机字节序转换到网络字节序
+
+    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        LOGE("Failed to bind TCP socket to 127.0.0.1:%d : %s", port_, strerror(errno));
+        close(server_fd_);
+        return;
+    }
 
     if (listen(server_fd_, 5) == -1) {
-        LOGE("Failed to listen on socket: %s", strerror(errno));
+        LOGE("Failed to listen on TCP socket: %s", strerror(errno));
         close(server_fd_);
         return;
     }
 
-    LOGI("Server listening on abstract UDS: @%s", socket_name_.c_str());
+    LOGI("Server listening on TCP 127.0.0.1:%d", port_);
     is_running_ = true;
 
-    // 主循环 select/accept/handle_client_data 保持不变
+    // 主循环 select/accept/handle_client_data 逻辑完全保持不变
     while (is_running_) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -210,7 +207,6 @@ void UdsServer::run() {
         }
         
         struct timeval tv { .tv_sec = 1, .tv_usec = 0 };
-
         int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
 
         if (activity < 0) {
@@ -218,12 +214,13 @@ void UdsServer::run() {
             LOGE("select() error: %s", strerror(errno));
             break;
         }
-
         if (!is_running_) break;
         if (activity == 0) continue;
 
         if (FD_ISSET(server_fd_, &read_fds)) {
-            int new_socket = accept(server_fd_, nullptr, nullptr);
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int new_socket = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (new_socket >= 0) {
                 add_client(new_socket);
             }

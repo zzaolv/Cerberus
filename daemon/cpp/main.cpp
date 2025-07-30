@@ -225,7 +225,9 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
     
-    g_server = std::make_unique<UdsServer>("cerberus_socket");
+    //g_server = std::make_unique<UdsServer>("cerberus_socket");
+    const int DAEMON_PORT = 28900; // 定义我们的通信端口
+    g_server = std::make_unique<UdsServer>(DAEMON_PORT); // [核心修改] 使用端口号实例化    
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
     g_server->run();

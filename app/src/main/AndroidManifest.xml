@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- ================================================== -->
     <!--        [核心修复] 声明查询所有应用的权限          -->
     <!--  这是让AppInfoRepository能正常工作的关键，否则无法获取应用列表 -->

@@ -9,9 +9,11 @@
 #include <functional>
 #include <map>
 
+// 为了减少文件重命名，我们继续使用这个类名，但它现在是一个TCP服务器
 class UdsServer {
 public:
-    explicit UdsServer(const std::string& socket_name);
+    // 构造函数现在接受一个端口号
+    explicit UdsServer(int port);
     ~UdsServer();
 
     UdsServer(const UdsServer&) = delete;
@@ -32,7 +34,7 @@ private:
     void remove_client(int client_fd);
     void handle_client_data(int client_fd);
 
-    std::string socket_name_;
+    int port_; // [核心修改] 使用端口号
     int server_fd_;
     std::atomic<bool> is_running_;
     
@@ -42,7 +44,6 @@ private:
     std::function<void(int, const std::string&)> on_message_received_;
     std::function<void(int)> on_disconnect_;
     std::map<int, std::string> client_buffers_;
-    // [核心修复] socket_path_ 不再需要，已移除
 };
 
 #endif //CERBERUSD_UDS_SERVER_H

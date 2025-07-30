@@ -1,48 +1,48 @@
 // app/src/main/java/com/crfzit/crfzit/data/uds/UdsClient.kt
 package com.crfzit.crfzit.data.uds
 
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
+// [核心修改] 移除LocalSocket，引入标准Java Socket
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.io.IOException
 import java.io.OutputStream
+import java.net.Socket // 引入 TCP Socket
 import java.nio.charset.StandardCharsets
 
 class UdsClient(private val scope: CoroutineScope) {
 
-    private var socket: LocalSocket? = null
+    // [核心修改] socket 类型变为 java.net.Socket
+    private var socket: Socket? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     private val _incomingMessages = MutableSharedFlow<String>(replay = 10, extraBufferCapacity = 64)
     val incomingMessages = _incomingMessages.asSharedFlow()
 
     companion object {
-        private const val TAG = "CerberusUdsClient"
-        // [核心修复] SOCKET_NAME 必须是简单的名字，而不是文件路径
-        private const val SOCKET_NAME = "cerberus_socket"
+        private const val TAG = "CerberusTcpClient" // 重命名日志标签
+        private const val HOST = "127.0.0.1"
+        private const val PORT = 28900
         private const val RECONNECT_DELAY_MS = 3000L
     }
 
     fun start() {
         if (connectionJob?.isActive == true) {
-            Log.d(TAG, "UDS client is already running.")
+            Log.d(TAG, "TCP client is already running.")
             return
         }
-        Log.i(TAG, "UDS client start() called.")
+        Log.i(TAG, "TCP client start() called.")
         connectionJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
-                    // [核心修复] 日志会显示为 @cerberus_socket
-                    Log.i(TAG, "Attempting to connect to UDS: @$SOCKET_NAME...")
-                    socket = LocalSocket(LocalSocket.SOCKET_STREAM).also {
-                        // [核心修复] 使用 ABSTRACT 命名空间进行连接
-                        it.connect(LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT))
+                    // [核心修改] 连接日志显示IP和端口
+                    Log.i(TAG, "Attempting to connect to TCP server: $HOST:$PORT...")
+                    // [核心修改] 创建并连接标准 TCP Socket
+                    socket = Socket(HOST, PORT).also {
                         outputStream = it.outputStream
                     }
-                    Log.i(TAG, "Successfully connected to daemon.")
+                    Log.i(TAG, "Successfully connected to daemon via TCP.")
                     listenForMessages()
                 } catch (e: IOException) {
                     Log.w(TAG, "Connection failed or lost: ${e.message}. Retrying in ${RECONNECT_DELAY_MS}ms...")
@@ -54,7 +54,8 @@ class UdsClient(private val scope: CoroutineScope) {
             }
         }
     }
-    
+
+    // sendMessage 和 listenForMessages 逻辑完全保持不变
     fun sendMessage(message: String) {
         scope.launch(Dispatchers.IO) {
             val stream = outputStream
@@ -63,7 +64,6 @@ class UdsClient(private val scope: CoroutineScope) {
                 return@launch
             }
             try {
-                // JSON Lines 协议，每条消息后加换行符
                 stream.write((message + "\n").toByteArray(StandardCharsets.UTF_8))
                 stream.flush()
                 Log.d(TAG, "Sent: $message")
@@ -81,7 +81,7 @@ class UdsClient(private val scope: CoroutineScope) {
                 while (currentSocket.isConnected && scope.isActive) {
                     val line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                         Log.d(TAG, "Rcvd: $line")
+                        Log.d(TAG, "Rcvd: $line")
                         _incomingMessages.emit(line)
                     }
                 }
@@ -98,7 +98,7 @@ class UdsClient(private val scope: CoroutineScope) {
         connectionJob?.cancel()
         connectionJob = null
         cleanupSocket()
-        Log.i(TAG, "UDS client stopped.")
+        Log.i(TAG, "TCP client stopped.")
     }
 
     private fun cleanupSocket() {
