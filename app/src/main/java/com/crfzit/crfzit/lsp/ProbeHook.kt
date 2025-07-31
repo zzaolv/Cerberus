@@ -16,54 +16,11 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import kotlinx.coroutines.*
-import java.io.File
 import java.io.IOException
 import java.io.OutputStreamWriter
 import java.net.Socket
 import java.nio.charset.StandardCharsets
-import java.text.SimpleDateFormat
-import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-
-/**
- * [新增] 一个简单的、线程安全的、用于system_server的文件日志记录器
- */
-private object FileLogger {
-    private const val LOG_FILE_PATH = "/data/local/tmp/cerberus_probe_hook.log"
-    private val logFile = File(LOG_FILE_PATH)
-    private val logScope = CoroutineScope(SupervisorJob() + Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-
-    init {
-        // 首次加载时，清空旧日志，避免文件无限增大
-        logScope.launch {
-            try {
-                if(logFile.exists()) {
-                    logFile.writeText("") // 清空
-                }
-                log("INFO", "FileLogger initialized. Log file at: $LOG_FILE_PATH")
-            } catch (e: Exception) {
-                // 如果出现权限问题，就在Xposed日志中记录错误
-                XposedBridge.log("[CerberusFileLogger] Error initializing log file: ${e.message}")
-            }
-        }
-    }
-
-    fun log(level: String, message: String) {
-        logScope.launch {
-            try {
-                val timestamp = dateFormat.format(Date())
-                val logLine = "$timestamp [$level] - $message\n"
-                logFile.appendText(logLine, StandardCharsets.UTF_8)
-            } catch (e: Exception) {
-                // 写入失败时，至少保证Xposed日志有输出
-                XposedBridge.log("[CerberusFileLogger] Failed to write to log file: ${e.message}")
-            }
-        }
-    }
-}
-
 
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -73,11 +30,11 @@ class ProbeHook : IXposedHookLoadPackage {
     private val THROTTLE_INTERVAL_MS = 5000
 
     companion object {
-        private const val TAG = "CerberusProbe_v25_Enhanced"
+        private const val TAG = "CerberusProbe_v26_Final"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val DAEMON_HOST = "127.0.0.1"
         private const val DAEMON_PORT = 28900
-
+        
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
     }
@@ -91,21 +48,20 @@ class ProbeHook : IXposedHookLoadPackage {
 
         try {
             val classLoader = lpparam.classLoader
-
+            
             hookActivitySwitchEvents(classLoader)
             hookBroadcastDelivery(classLoader)
             hookTaskTrimming(classLoader)
             hookSystemFreezer(classLoader)
-
+            
             hookAnrHelper(classLoader)
             hookWakelocksAndAlarms(classLoader)
             hookActivityStarter(classLoader)
             hookFcmWakeup(classLoader)
-
+            
             hookNotificationService(classLoader)
             hookServices(classLoader)
-            hookProcessSignal(classLoader)
-
+            
         } catch (t: Throwable) {
             logError("CRITICAL: Failed during hook placement: $t")
         }
@@ -117,7 +73,7 @@ class ProbeHook : IXposedHookLoadPackage {
             val jsonMessage = gson.toJson(message)
             try {
                 Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                    socket.soTimeout = 2000
+                    socket.soTimeout = 2000 
                     OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
                         writer.write(jsonMessage + "\n")
                         writer.flush()
@@ -134,7 +90,10 @@ class ProbeHook : IXposedHookLoadPackage {
                     }
                 }
             } catch (e: IOException) {
-                logError("Daemon short-conn send error for $type: ${e.message}")
+                // Connection refused is expected at boot, don't spam the log
+                if (e.message?.contains("ECONNREFUSED") != true) {
+                    logError("Daemon short-conn send error for $type: ${e.message}")
+                }
             } catch (e: Exception) {
                 logError("Unexpected error during short-conn send for $type: $e")
             }
@@ -152,28 +111,17 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
                 if (frozenUids.isNotEmpty()) {
                     XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs.")
-                    FileLogger.log("CONFIG", "Config updated. Tracking ${frozenUids.size} UIDs.")
                 }
-            } catch (e: Exception) {
+            } catch (e: Exception) { 
                 val errorMsg = "Failed to parse probe config: $e"
-                XposedBridge.log("[$TAG]: [ERROR] $errorMsg")
-                FileLogger.log("ERROR", errorMsg)
+                XposedBridge.log("[$TAG]: [ERROR] $errorMsg") 
             }
         }
         fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
     }
 
-    // [修改] 同时写入Xposed日志和文件日志
-    private fun log(message: String) {
-        XposedBridge.log("[$TAG] $message")
-        FileLogger.log("INFO", message)
-    }
-
-    // [修改] 同时写入Xposed日志和文件日志
-    private fun logError(message: String) {
-        XposedBridge.log("[$TAG] [ERROR] $message")
-        FileLogger.log("ERROR", message)
-    }
+    private fun log(message: String) = XposedBridge.log("[$TAG] $message")
+    private fun logError(message: String) = XposedBridge.log("[$TAG] [ERROR] $message")
 
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? {
         return XposedHelpers.findClassIfExists(className, classLoader)
@@ -184,13 +132,11 @@ class ProbeHook : IXposedHookLoadPackage {
             val hook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
-                        val event = param.args[2] as Int
-                        val componentName = param.args[0]?.let {
-                            XposedHelpers.getObjectField(it, "mActivityComponent") as? ComponentName
-                        } ?: return
-
-                        val packageName = componentName.packageName
+                        val componentName = param.args[0] as? ComponentName ?: return
                         val userId = param.args[1] as Int
+                        val event = param.args[2] as Int
+                        
+                        val packageName = componentName.packageName
                         val key = AppInstanceKey(packageName, userId)
 
                         when (event) {
@@ -214,33 +160,40 @@ class ProbeHook : IXposedHookLoadPackage {
         } ?: logError("FATAL: Could not find com.android.server.am.ActivityManagerService class!")
     }
 
+    /**
+     * [增强Hook 2 - 修正] 拦截向已冻结应用分发广播。
+     * 目标: com.android.server.am.BroadcastQueueModernImpl.dispatchReceivers
+     * 作用: 防止因冻结导致应用无法处理广播而引发的ANR。
+     */
     private fun hookBroadcastDelivery(classLoader: ClassLoader) {
-        findClass("com.android.server.am.BroadcastQueue", classLoader)?.let { clazz ->
+        findClass("com.android.server.am.BroadcastQueueModernImpl", classLoader)?.let { clazz ->
             val hook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
-                        val receiver = param.args[1]
-                        val receiverList = XposedHelpers.getObjectField(receiver, "receiverList")
-                        val app = XposedHelpers.getObjectField(receiverList, "app")
+                        // 第一个参数是 BroadcastProcessQueue
+                        val queue = param.args[0]
+                        val app = XposedHelpers.getObjectField(queue, "app") as? Any // ProcessRecord
                         if (app != null) {
                             val uid = XposedHelpers.getIntField(app, "uid")
                             if (ConfigManager.isUidFrozen(uid)) {
                                 val pkg = (XposedHelpers.getObjectField(app, "info") as ApplicationInfo).packageName
-                                param.result = -1
-                                log("DEFENSE: Skipped broadcast delivery to frozen app: $pkg (uid: $uid)")
+                                // 返回false，让调用者认为分发“瞬间”完成，从而安全跳过
+                                param.result = false
+                                log("DEFENSE: Skipped broadcast dispatch to frozen app: $pkg (uid: $uid)")
                             }
                         }
                     } catch (t: Throwable) {
+                        logError("Error in hookBroadcastDelivery: ${t.message}")
                     }
                 }
             }
 
-            clazz.declaredMethods.find { it.name == "deliverToRegisteredReceiverLocked" }
+            clazz.declaredMethods.find { it.name == "dispatchReceivers" && it.parameterCount == 3 }
                 ?.let {
                     XposedBridge.hookMethod(it, hook)
-                    log("SUCCESS: Hooked BroadcastQueue#deliverToRegisteredReceiverLocked to prevent broadcast ANRs.")
-                } ?: logError("WARN: Could not find BroadcastQueue#deliverToRegisteredReceiverLocked method.")
-        } ?: logError("WARN: Could not find com.android.server.am.BroadcastQueue class.")
+                    log("SUCCESS: Hooked BroadcastQueueModernImpl#dispatchReceivers to prevent broadcast ANRs.")
+                } ?: logError("WARN: Could not find BroadcastQueueModernImpl#dispatchReceivers method.")
+        } ?: logError("WARN: Could not find com.android.server.am.BroadcastQueueModernImpl class.")
     }
 
     private fun hookTaskTrimming(classLoader: ClassLoader) {
@@ -256,7 +209,7 @@ class ProbeHook : IXposedHookLoadPackage {
             log("SUCCESS: Hooked and disabled system's CachedAppOptimizer freezer.")
         } ?: logError("INFO: Did not find com.android.server.am.CachedAppOptimizer (this is normal on older Android versions).")
     }
-
+    
     private fun hookAnrHelper(classLoader: ClassLoader) {
         findClass("com.android.server.am.AnrHelper", classLoader)?.let { clazz ->
             val anrHook = object: XC_MethodHook() {
@@ -384,10 +337,10 @@ class ProbeHook : IXposedHookLoadPackage {
             log("SUCCESS: Hooked NotificationManagerService#enqueueNotificationInternal.")
         }
     }
-
+    
     private fun hookServices(classLoader: ClassLoader) {
         findClass("com.android.server.am.ActiveServices", classLoader)?.let { clazz ->
-            val hook = object: XC_MethodHook() {
+             val hook = object: XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val serviceRecord = param.args.find { it != null && it::class.java.name.endsWith("ServiceRecord") } ?: return
                     val appInfo = XposedHelpers.getObjectField(serviceRecord, "appInfo") as? ApplicationInfo ?: return
@@ -398,17 +351,12 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             }
             clazz.declaredMethods.filter { it.name.contains("bringUpService") }.forEach {
-                XposedBridge.hookMethod(it, hook)
+                 XposedBridge.hookMethod(it, hook)
             }
             log("SUCCESS: Hooked ActiveServices service startup methods.")
         }
     }
-
-    private fun hookProcessSignal(classLoader: ClassLoader) {
-        // This hook remains less effective, but kept for minimal protection.
-        // The main protection is now the ANR hook.
-    }
-
+    
     private fun isGcmOrFcmIntent(intent: Intent): Boolean {
         val action = intent.action ?: return false
         return action == "com.google.android.c2dm.intent.RECEIVE" || action == "com.google.firebase.MESSAGING_EVENT"
