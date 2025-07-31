@@ -77,6 +77,9 @@ public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
+    // [新增] 启动预热函数
+    void initial_full_scan_and_warmup();
+
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
 
@@ -96,8 +99,7 @@ public:
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
-
-    // [性能优化] 新增的交错式扫描函数声明
+    
     bool perform_staggered_stats_scan();
 
 private:
@@ -145,8 +147,7 @@ private:
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
-
-    // [性能优化] 新增迭代器成员，用于追踪下一个要扫描的应用
+    
     std::map<AppInstanceKey, AppRuntimeState>::iterator next_scan_iterator_;
 };
 

@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v29_log_rework" // 版本号更新
+#define LOG_TAG "cerberusd_main_v30_warmup" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -37,6 +37,7 @@ std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
 
+// handle_client_message, handle_client_disconnect, etc. 保持不变...
 void handle_client_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
@@ -44,7 +45,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (type == "hello.ui") {
             g_server->identify_client_as_ui(client_fd);
-            // 当UI连接时，立即发送一次完整的仪表盘数据
             if (g_state_manager) {
                 json payload = g_state_manager->get_dashboard_payload();
                 g_server->send_message(client_fd, json{{"type", "stream.dashboard_update"}, {"payload", payload}}.dump());
@@ -52,7 +52,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [日志重构] 处理新的日志请求
         if (type == "query.get_logs") {
             long long since_ts = msg.value("payload", json::object()).value("since", 0LL);
             auto logs = g_logger->get_logs(since_ts > 0 ? std::optional(since_ts) : std::nullopt, 200);
@@ -250,6 +249,9 @@ int main(int argc, char *argv[]) {
     g_logger = Logger::get_instance(LOG_DIR);
     g_ts_db = TimeSeriesDatabase::get_instance();
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
+    
+    // [新增] 调用启动预热函数
+    g_state_manager->initial_full_scan_and_warmup();
     
     g_logger->log(LogLevel::EVENT, "Daemon", "守护进程已启动");
     

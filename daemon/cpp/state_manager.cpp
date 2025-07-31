@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v29_staggered_fix" // 版本号更新
+#define LOG_TAG "cerberusd_state_v30_warmup" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,6 +21,7 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// status_to_string, DozeManager 的实现保持不变...
 static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
     if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
@@ -132,7 +133,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         master_config_.standard_timeout_sec, master_config_.is_timed_unfreeze_enabled, master_config_.timed_unfreeze_interval_sec);
        
     critical_system_apps_ = {
-        "com.google.android.inputmethod.latin", // Gboard
+        "com.google.android.inputmethod.latin",
         "com.baidu.input",
         "com.sohu.inputmethod.sogou",
         "com.iflytek.inputmethod",
@@ -472,17 +473,35 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.lineageos.settings.doze.auto_generated_rro_vendor__",
         "org.lineageos.setupwizard.auto_generated_rro_product__",
         "org.lineageos.updater.auto_generated_rro_product__",
-         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
+        "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-   
-   
-   
+    // [修改] 构造函数中不再执行扫描，而是由外部调用预热函数
     load_all_configs();
     next_scan_iterator_ = managed_apps_.begin();
-    reconcile_process_state_full();
     last_battery_level_info_ = std::nullopt;    
-    LOGI("StateManager Initialized.");
+    LOGI("StateManager Initialized. Ready for warmup.");
+}
+
+// [新增] 启动预热函数的实现
+void StateManager::initial_full_scan_and_warmup() {
+    LOGI("Starting initial full scan and data warmup...");
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // 1. 执行完整的进程状态协调，建立所有AppRuntimeState
+    reconcile_process_state_full();
+    
+    // 2. 对所有当前正在运行的应用，强制进行一次全量资源扫描
+    int warmed_up_count = 0;
+    for (auto& [key, app] : managed_apps_) {
+        if (!app.pids.empty()) {
+            sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
+            warmed_up_count++;
+        }
+    }
+    
+    LOGI("Warmup complete. Populated initial stats for %d running app instances.", warmed_up_count);
+    logger_->log(LogLevel::EVENT, "Daemon", "启动预热完成，已填充初始数据");
 }
 
 bool StateManager::perform_staggered_stats_scan() {

@@ -64,20 +64,17 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
-                // [日志重构] 由于数据源已经是降序，不再需要反转布局
             ) {
                 items(
-                    items = uiState.logs, 
-                    key = { log -> 
-                        // 使用一个足够唯一的key来帮助Compose进行高效重组
-                        "${log.originalLog.timestamp_ms}-${log.originalLog.message}" 
+                    items = uiState.logs,
+                    key = { log ->
+                        // [修正] 使用 .timestamp 替换 .timestamp_ms
+                        "${log.originalLog.timestamp}-${log.originalLog.message}"
                     }
                 ) { log ->
                     LogItem(log)
                 }
             }
-            
-            // [日志重构] 移除自动滚动，因为新日志现在在顶部
         }
     }
 }
@@ -85,21 +82,21 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 
 @Composable
 fun LogItem(log: UiLogEntry) {
-    // [日志重构] 更新时间格式为 HH:mm:ss
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val originalLog = log.originalLog
-    
+
     val (icon, color) = getLogAppearance(originalLog.level)
     val categoryString = originalLog.category
-    
+
     val displayAppName = log.appName ?: originalLog.packageName
-    
+
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-            append(formatter.format(Date(originalLog.timestamp_ms)))
+            // [修正] 使用 .timestamp 替换 .timestamp_ms
+            append(formatter.format(Date(originalLog.timestamp)))
         }
         append(" ")
-        
+
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
             append("$icon[$categoryString]")
         }
@@ -112,7 +109,7 @@ fun LogItem(log: UiLogEntry) {
             }
             append("’ ")
         }
-        
+
         append(originalLog.message)
     }
 

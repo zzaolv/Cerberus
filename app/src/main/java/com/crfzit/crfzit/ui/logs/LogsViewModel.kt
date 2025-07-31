@@ -20,15 +20,14 @@ data class UiLogEntry(
 
 data class LogsUiState(
     val isLoading: Boolean = true,
-    // [日志重构] 日志列表现在是不可变的，并且总是降序
-    val logs: List<UiLogEntry> = emptyList() 
+    val logs: List<UiLogEntry> = emptyList()
 )
 
 class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
-    
+
     private val _uiState = MutableStateFlow(LogsUiState())
     val uiState: StateFlow<LogsUiState> = _uiState.asStateFlow()
 
@@ -36,15 +35,12 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
-            // 预加载应用信息缓存，对解析日志中的包名有好处
             appInfoRepository.getAllApps(forceRefresh = true)
-            // [日志重构] 先加载初始日志
             loadInitialLogs()
-            // [日志重构] 然后启动轮询
             startPollingForNewLogs()
         }
     }
-    
+
     private fun loadInitialLogs() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
@@ -55,25 +51,24 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startPollingForNewLogs() {
-        // 防止重复启动
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch {
             while (true) {
-                delay(5000) // 每5秒轮询一次
+                delay(5000)
                 try {
-                    // 获取当前UI上最新的日志的时间戳
-                    val latestTimestamp = _uiState.value.logs.firstOrNull()?.originalLog?.timestamp_ms
-                    
+                    // [修正] 使用 .timestamp 替换 .timestamp_ms
+                    val latestTimestamp = _uiState.value.logs.firstOrNull()?.originalLog?.timestamp
+
                     val newLogs = daemonRepository.getLogs(since = latestTimestamp)
-                    
+
                     if (!newLogs.isNullOrEmpty()) {
                         val newUiLogs = newLogs.map { mapToUiLog(it) }
-                        
+
                         _uiState.update { currentState ->
-                            // 将新日志（已经是降序）与旧日志合并，然后去重
+                            // [修正] 使用 .timestamp 替换 .timestamp_ms
                             val combinedLogs = (newUiLogs + currentState.logs)
-                                .distinctBy { it.originalLog.timestamp_ms.toString() + it.originalLog.message }
-                                .sortedByDescending { it.originalLog.timestamp_ms }
+                                .distinctBy { it.originalLog.timestamp.toString() + it.originalLog.message }
+                                .sortedByDescending { it.originalLog.timestamp }
 
                             currentState.copy(logs = combinedLogs)
                         }
@@ -93,7 +88,6 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        // [日志重构] ViewModel销毁时停止轮询
         pollingJob?.cancel()
         super.onCleared()
     }
