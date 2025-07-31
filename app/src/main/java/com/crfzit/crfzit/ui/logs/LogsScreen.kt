@@ -20,7 +20,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogLevel
 import com.crfzit.crfzit.ui.stats.StatisticsScreen
-import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -55,10 +54,9 @@ fun LogsScreen(viewModel: LogsViewModel = viewModel()) {
 fun EventTimelineTab(viewModel: LogsViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val listState = rememberLazyListState()
-    val coroutineScope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (uiState.isLoading) {
+        if (uiState.isLoading && uiState.logs.isEmpty()) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
         } else {
             LazyColumn(
@@ -66,24 +64,20 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
+                // [日志重构] 由于数据源已经是降序，不再需要反转布局
             ) {
                 items(
                     items = uiState.logs, 
                     key = { log -> 
-                        "${log.originalLog.timestamp}-${log.originalLog.packageName}-${log.originalLog.userId}-${log.originalLog.message}" 
+                        // 使用一个足够唯一的key来帮助Compose进行高效重组
+                        "${log.originalLog.timestamp_ms}-${log.originalLog.message}" 
                     }
                 ) { log ->
                     LogItem(log)
                 }
             }
             
-            LaunchedEffect(uiState.logs.size) {
-                 coroutineScope.launch {
-                     if (uiState.logs.size > 1 && (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0) >= uiState.logs.size - 2) {
-                         listState.animateScrollToItem(uiState.logs.size - 1)
-                     }
-                 }
-            }
+            // [日志重构] 移除自动滚动，因为新日志现在在顶部
         }
     }
 }
@@ -91,38 +85,34 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 
 @Composable
 fun LogItem(log: UiLogEntry) {
-    val formatter = remember { SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()) }
+    // [日志重构] 更新时间格式为 HH:mm:ss
+    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val originalLog = log.originalLog
     
-    // [日志修复] 修复图标丢失的bug
     val (icon, color) = getLogAppearance(originalLog.level)
     val categoryString = originalLog.category
     
-    // [日志修复] 定义最终显示的应用名，优先使用ViewModel解析出的名字，否则回退到包名
     val displayAppName = log.appName ?: originalLog.packageName
     
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-            append(formatter.format(Date(originalLog.timestamp)))
+            append(formatter.format(Date(originalLog.timestamp_ms)))
         }
         append(" ")
         
-        // [日志修复] 正确拼接图标和分类
         withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
             append("$icon[$categoryString]")
         }
         append(" ")
 
-        // [日志修复] 如果日志有关联的应用，则构建 "应用 '名字'" 部分
         if (!displayAppName.isNullOrEmpty()) {
             append("应用 ‘")
-            withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold)) {
+            withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
                 append(displayAppName)
             }
             append("’ ")
         }
         
-        // 拼接后端传来的纯事件描述
         append(originalLog.message)
     }
 

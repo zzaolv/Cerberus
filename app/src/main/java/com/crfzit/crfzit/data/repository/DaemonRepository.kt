@@ -13,7 +13,6 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-// 架构重构：构造函数变为私有
 class DaemonRepository private constructor(
     private val scope: CoroutineScope
 ) {
@@ -27,7 +26,7 @@ class DaemonRepository private constructor(
             tcpClient.incomingMessages.collect { jsonLine ->
                 try {
                     val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
-                    if (baseMsg.type.startsWith("resp.") && baseMsg.requestId != null) {
+                    if ((baseMsg.type.startsWith("resp.") || baseMsg.type.startsWith("error.")) && baseMsg.requestId != null) {
                         pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
                     }
                 } catch (e: JsonSyntaxException) {
@@ -49,20 +48,39 @@ class DaemonRepository private constructor(
             }
         }
 
-    fun getLogStream(): Flow<LogEntry> = tcpClient.incomingMessages
-        .mapNotNull { jsonLine ->
-            try {
-                val type = object : TypeToken<CerberusMessage<LogEntryPayload>>() {}.type
-                val msg = gson.fromJson<CerberusMessage<LogEntryPayload>>(jsonLine, type)
-                if (msg?.type == "stream.new_log_entry") {
-                    val p = msg.payload ?: return@mapNotNull null
+    // [日志重构] 移除 getLogStream()
+    // fun getLogStream(): Flow<LogEntry> = ...
+
+    // [日志重构] 新增 getLogs() 函数
+    suspend fun getLogs(since: Long?): List<LogEntry>? {
+        val reqId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<String>()
+        pendingRequests[reqId] = deferred
+
+        val requestPayload = GetLogsPayload(since = since)
+        val requestMsg = CerberusMessage(type = "query.get_logs", requestId = reqId, payload = requestPayload)
+        tcpClient.sendMessage(gson.toJson(requestMsg))
+
+        return try {
+            val responseJson = withTimeout(5000) { deferred.await() }
+            val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
+            val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
+
+            if (message?.type == "resp.get_logs") {
+                message.payload.map { p ->
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
-                } else null
-            } catch (e: Exception) {
-                Log.w("DaemonRepository", "Failed to parse LogEntryPayload: ${e.message}")
+                }
+            } else {
+                Log.e("DaemonRepository", "Query 'get_logs' received unexpected response type '${message?.type}'")
                 null
             }
+        } catch (e: Exception) {
+            Log.e("DaemonRepository", "Failed to query 'get_logs': ${e.message}")
+            pendingRequests.remove(reqId)
+            null
         }
+    }
+
 
     fun getStatsStream(): Flow<MetricsRecord> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
@@ -93,12 +111,9 @@ class DaemonRepository private constructor(
             }
         }
 
-    suspend fun getAllLogs(): List<LogEntry>? = query("query.get_all_logs") { json ->
-        val type = object : TypeToken<List<LogEntryPayload>>() {}.type
-        val payloads = gson.fromJson<List<LogEntryPayload>>(json, type) ?: emptyList()
-        payloads.map { p ->
-            LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
-        }
+    suspend fun getAllLogs(): List<LogEntry>? {
+        // [日志重构] 此函数现在代理到新的 getLogs 函数
+        return getLogs(null)
     }
 
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->
@@ -198,7 +213,6 @@ class DaemonRepository private constructor(
         val payload: com.google.gson.JsonElement?
     )
 
-    // 架构重构：单例模式实现
     companion object {
         @Volatile
         private var INSTANCE: DaemonRepository? = null

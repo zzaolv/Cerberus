@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> // [新增] For TCP_NODELAY
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
@@ -13,7 +14,7 @@
 #include <sys/select.h>
 #include <thread>
 
-#define LOG_TAG "cerberusd_tcp_v2_heartbeat" // 版本号更新
+#define LOG_TAG "cerberusd_tcp_v3_nodelay" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -33,19 +34,16 @@ void UdsServer::set_disconnect_handler(std::function<void(int)> handler) {
     on_disconnect_ = std::move(handler);
 }
 
-// [新增] 实现UI客户端识别
 void UdsServer::identify_client_as_ui(int client_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     LOGI("Client fd %d identified as UI.", client_fd);
     ui_client_fds_.insert(client_fd);
 }
 
-// [新增] 实现向UI客户端广播
 void UdsServer::broadcast_message_to_ui(const std::string& message) {
     std::lock_guard<std::mutex> lock(client_mutex_);
     if (ui_client_fds_.empty()) return;
 
-    // 复制集合以避免在迭代时修改
     auto ui_clients_copy = ui_client_fds_;
     for (int fd : ui_clients_copy) {
         send_message(fd, message);
@@ -70,7 +68,7 @@ void UdsServer::remove_client(int client_fd) {
     if (it != client_fds_.end()) {
         client_fds_.erase(it, client_fds_.end());
         client_buffers_.erase(client_fd);
-        ui_client_fds_.erase(client_fd); // [修改] 同时从UI集合中移除
+        ui_client_fds_.erase(client_fd);
         close(client_fd);
         LOGI("Client disconnected, fd: %d. Total clients: %zu, UI clients: %zu", client_fd, client_fds_.size(), ui_client_fds_.size());
         if (on_disconnect_) {
@@ -97,8 +95,6 @@ bool UdsServer::send_message(int client_fd, const std::string& message) {
     if (bytes_sent < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
             LOGW("Send to fd %d failed (connection closed), removing client.", client_fd);
-            // 在多线程环境中，直接调用remove_client可能导致死锁
-            // 更好的方式是标记并由主循环移除，但为简化，当前实现可接受
             std::thread([this, client_fd] { this->remove_client(client_fd); }).detach();
         } else {
             LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
@@ -240,6 +236,11 @@ void UdsServer::run() {
             socklen_t client_len = sizeof(client_addr);
             int new_socket = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (new_socket >= 0) {
+                // [通信优化] 禁用Nagle算法
+                int nodelay_opt = 1;
+                if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay_opt, sizeof(nodelay_opt)) < 0) {
+                    LOGW("setsockopt(TCP_NODELAY) failed for client fd %d: %s", new_socket, strerror(errno));
+                }
                 add_client(new_socket);
             }
         }

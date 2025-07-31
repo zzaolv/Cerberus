@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h> // For waitpid
 #include <fcntl.h>
 #include <climits>
 #include <vector>
@@ -23,7 +24,7 @@
 #include <memory>
 #include <map>
 
-#define LOG_TAG "cerberusd_monitor_v24_clones"
+#define LOG_TAG "cerberusd_monitor_v25_io_rework" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -31,28 +32,123 @@
 
 namespace fs = std::filesystem;
 
-static std::string exec_shell_pipe(const char* cmd) {
-    std::array<char, 256> buffer;
-    std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
-    if (!pipe) {
-        LOGE("popen() failed for cmd: %s!", cmd);
+// [I/O优化] ProcFileReader 实现 - 遵循"场景一"最佳实践
+SystemMonitor::ProcFileReader::ProcFileReader(std::string path) : path_(std::move(path)) {}
+
+SystemMonitor::ProcFileReader::~ProcFileReader() {
+    if (fd_ != -1) {
+        close(fd_);
+    }
+}
+
+bool SystemMonitor::ProcFileReader::open_fd() {
+    if (fd_ != -1) return true;
+    fd_ = open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ == -1) {
+        LOGE("Failed to open persistent fd for %s: %s", path_.c_str(), strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool SystemMonitor::ProcFileReader::read_contents(std::string& out_contents) {
+    if (!open_fd()) return false;
+
+    char buffer[4096];
+    if (lseek(fd_, 0, SEEK_SET) != 0) {
+        LOGE("lseek failed for %s: %s. Reopening fd.", path_.c_str(), strerror(errno));
+        close(fd_);
+        fd_ = -1;
+        if (!open_fd()) return false;
+    }
+    
+    ssize_t bytes_read = read(fd_, buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        out_contents = buffer;
+        return true;
+    }
+    return false;
+}
+
+// [I/O优化] read_file_once 实现 - 遵循"场景一"最佳实践
+std::string SystemMonitor::read_file_once(const std::string& path, size_t max_size) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return "";
+
+    std::string content;
+    content.resize(max_size);
+    ssize_t bytes_read = read(fd, content.data(), max_size - 1);
+    close(fd);
+
+    if (bytes_read > 0) {
+        content.resize(bytes_read);
+        return content;
+    }
+    return "";
+}
+
+static std::optional<long> read_long_from_file_str(const std::string& content) {
+    if (content.empty()) return std::nullopt;
+    try {
+        return std::stol(content);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+// [I/O优化] exec_shell_pipe_efficient 实现 - 遵循"场景三"最佳实践
+std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::string>& args) {
+    if (args.empty()) return "";
+
+    int pipe_fd[2];
+    if (pipe2(pipe_fd, O_CLOEXEC) == -1) {
+        LOGE("pipe2 failed: %s", strerror(errno));
         return "";
     }
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        LOGE("fork failed: %s", strerror(errno));
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return "";
     }
+
+    if (pid == 0) { // Child process
+        close(pipe_fd[0]); // Close read end
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        close(pipe_fd[1]);
+        
+        std::vector<char*> c_args;
+        for (const auto& arg : args) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        c_args.push_back(nullptr);
+
+        execvp(c_args[0], c_args.data());
+        // If execvp returns, it must have failed
+        exit(127);
+    }
+
+    // Parent process
+    close(pipe_fd[1]); // Close write end
+    std::string result;
+    result.reserve(65536); // 预分配64KB缓冲区
+    char buffer[4096];
+    ssize_t count;
+
+    while ((count = read(pipe_fd[0], buffer, sizeof(buffer))) > 0) {
+        result.append(buffer, count);
+    }
+    close(pipe_fd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
     return result;
 }
 
-static std::optional<long> read_long_from_file(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return std::nullopt;
-    long value;
-    file >> value;
-    if (file.fail()) return std::nullopt;
-    return value;
-}
 
 int get_uid_from_pid(int pid) {
     char path_buffer[64];
@@ -63,7 +159,7 @@ int get_uid_from_pid(int pid) {
 }
 
 
-SystemMonitor::SystemMonitor() {
+SystemMonitor::SystemMonitor() : proc_stat_reader_("/proc/stat") {
     if (fs::exists("/dev/cpuset/top-app/tasks")) {
         top_app_tasks_path_ = "/dev/cpuset/top-app/tasks";
     } else if (fs::exists("/dev/cpuset/top-app/cgroup.procs")) {
@@ -80,10 +176,10 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-// [核心修复] "权威识别" - 解析 dumpsys activity 并提取 UserID
 std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
     std::set<AppInstanceKey> visible_keys;
-    std::string result = exec_shell_pipe("dumpsys activity activities");
+    // [I/O优化] 使用高效管道执行器
+    std::string result = exec_shell_pipe_efficient({"dumpsys", "activity", "activities"});
     std::stringstream ss(result);
     std::string line;
 
@@ -94,17 +190,15 @@ std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
         std::string package_name;
 
         while (line_ss >> token) {
-            // 匹配 u<number> 格式, 例如 u0, u999
             if (token.length() > 1 && token[0] == 'u' && std::all_of(token.begin() + 1, token.end(), ::isdigit)) {
                 try {
                     user_id = std::stoi(token.substr(1));
-                    // 下一个token就是包名/Activity
                     if (line_ss >> token) {
                         size_t slash_pos = token.find('/');
                         if (slash_pos != std::string::npos) {
                             package_name = token.substr(0, slash_pos);
                         }
-                        break; // 找到后就退出当前行的解析
+                        break;
                     }
                 } catch (...) {
                     user_id = -1;
@@ -124,7 +218,6 @@ std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
             process_line = process_line.substr(0, process_line.find(']'));
             std::stringstream pss(process_line);
             std::string proc_record;
-            // 处理可能有多个可见进程的情况
             while(std::getline(pss, proc_record, ',')) {
                  parse_and_insert(proc_record);
             }
@@ -133,8 +226,6 @@ std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
     return visible_keys;
 }
 
-
-// "深度审计数据" - 获取完整的进程树信息
 std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
     std::map<int, ProcessInfo> process_map;
     constexpr int PER_USER_RANGE = 100000;
@@ -157,29 +248,26 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
         info.uid = st.st_uid;
         info.user_id = info.uid / PER_USER_RANGE;
         
-        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/stat", pid);
-        std::ifstream stat_file(path_buffer);
-        if (stat_file.is_open()) {
+        // [I/O优化] 使用底层一次性读取
+        std::string stat_content = read_file_once(std::string("/proc/") + std::to_string(pid) + "/stat");
+        if (!stat_content.empty()) {
+            std::stringstream stat_ss(stat_content);
             std::string s;
-            stat_file >> s >> s >> s >> info.ppid;
+            stat_ss >> s >> s >> s >> info.ppid;
         }
 
-        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/oom_score_adj", pid);
-        info.oom_score_adj = read_long_from_file(path_buffer).value_or(1001);
+        info.oom_score_adj = read_long_from_file_str(read_file_once(std::string("/proc/") + std::to_string(pid) + "/oom_score_adj")).value_or(1001);
+        
+        info.pkg_name = read_file_once(std::string("/proc/") + std::to_string(pid) + "/cmdline");
+        size_t null_pos = info.pkg_name.find('\0');
+        if(null_pos != std::string::npos) info.pkg_name.resize(null_pos);
 
-        snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
-        std::ifstream cmdline_file(path_buffer);
-        if (cmdline_file.is_open()) {
-            std::string cmdline;
-            std::getline(cmdline_file, cmdline, '\0');
-             if (!cmdline.empty() && cmdline.find('.') != std::string::npos) {
-                size_t colon_pos = cmdline.find(':');
-                info.pkg_name = (colon_pos != std::string::npos) ? cmdline.substr(0, colon_pos) : cmdline;
-            }
-        }
-
-        if (!info.pkg_name.empty()) {
-            process_map[pid] = info;
+        if (!info.pkg_name.empty() && info.pkg_name.find('.') != std::string::npos) {
+           size_t colon_pos = info.pkg_name.find(':');
+           if (colon_pos != std::string::npos) {
+               info.pkg_name = info.pkg_name.substr(0, colon_pos);
+           }
+           process_map[pid] = info;
         }
     }
     return process_map;
@@ -189,12 +277,10 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
 long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& pids) {
     long long total_jiffies = 0;
     for (int pid : pids) {
-        std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
-        std::ifstream stat_file(stat_path);
-        if (stat_file.is_open()) {
-            std::string line;
-            std::getline(stat_file, line);
-            std::stringstream ss(line);
+        // [I/O优化] 使用底层一次性读取
+        std::string stat_content = read_file_once(std::string("/proc/") + std::to_string(pid) + "/stat");
+        if (!stat_content.empty()) {
+            std::stringstream ss(stat_content);
             std::string value;
             for(int i = 0; i < 13; ++i) ss >> value;
             long long utime = 0, stime = 0;
@@ -229,8 +315,14 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
 }
 
 bool SystemMonitor::get_screen_state() {
-    std::string result = exec_shell_pipe("dumpsys power | grep -E 'mWakefulness|mScreenState' | head -n 1");
-    return result.find("Awake") != std::string::npos || result.find("ON") != std::string::npos;
+    // [I/O优化] 使用高效管道执行器
+    std::string result = exec_shell_pipe_efficient({"dumpsys", "power"});
+    size_t pos = result.find("mWakefulness=");
+    if(pos == std::string::npos) pos = result.find("mWakefulnessRaw=");
+    if(pos != std::string::npos) {
+        return result.find("Awake", pos) != std::string::npos;
+    }
+    return false;
 }
 
 void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, bool& charging) {
@@ -242,18 +334,19 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
         level = -1; temp = 0.0f; power = 0.0f; charging = false;
         return;
     }
-
-    level = read_long_from_file(final_path + "capacity").value_or(-1);
     
-    auto temp_raw = read_long_from_file(final_path + "temp");
+    // [I/O优化] 使用底层一次性读取
+    level = read_long_from_file_str(read_file_once(final_path + "capacity")).value_or(-1);
+    
+    auto temp_raw = read_long_from_file_str(read_file_once(final_path + "temp"));
     if (temp_raw.has_value()) {
         temp = static_cast<float>(*temp_raw) / 10.0f;
     } else {
         temp = 0.0f;
     }
 
-    auto current_now_ua = read_long_from_file(final_path + "current_now");
-    auto voltage_now_uv = read_long_from_file(final_path + "voltage_now");
+    auto current_now_ua = read_long_from_file_str(read_file_once(final_path + "current_now"));
+    auto voltage_now_uv = read_long_from_file_str(read_file_once(final_path + "voltage_now"));
     
     if (current_now_ua.has_value() && voltage_now_uv.has_value()) {
         double current_a = static_cast<double>(*current_now_ua) / 1000.0;
@@ -263,9 +356,9 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
         power = 0.0f;
     }
 
-    std::ifstream status_file(final_path + "status");
-    std::string status;
-    if(status_file >> status) {
+    std::string status = read_file_once(final_path + "status");
+    if(!status.empty()) {
+        status.erase(status.find_last_not_of(" \n\r\t")+1); // Trim whitespace
         charging = (status == "Charging" || status == "Full");
     } else {
         charging = false;
@@ -289,9 +382,13 @@ void SystemMonitor::stop_top_app_monitor() {
 std::set<int> SystemMonitor::read_top_app_pids() {
     std::set<int> pids;
     if (top_app_tasks_path_.empty()) return pids;
-    std::ifstream file(top_app_tasks_path_);
+    // [I/O优化] 使用底层一次性读取
+    std::string content = read_file_once(top_app_tasks_path_);
+    if(content.empty()) return pids;
+
+    std::stringstream ss(content);
     int pid;
-    while (file >> pid) {
+    while (ss >> pid) {
         pids.insert(pid);
     }
     return pids;
@@ -327,18 +424,13 @@ void SystemMonitor::update_audio_state() {
     };
     std::map<int, PlayerStates> uid_player_states;
     
-    std::array<char, 2048> buffer;
-
-    FILE* pipe = popen("dumpsys audio", "r");
-    if (!pipe) {
-        LOGW("popen for 'dumpsys audio' failed: %s", strerror(errno));
-        return;
-    }
+    // [I/O优化] 使用高效管道执行器
+    std::string result = exec_shell_pipe_efficient({"dumpsys", "audio"});
+    std::stringstream ss(result);
+    std::string line;
 
     bool in_players_section = false;
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        std::string line(buffer.data());
-
+    while (std::getline(ss, line)) {
         if (line.rfind("  players:", 0) == 0) {
             in_players_section = true;
             continue;
@@ -356,15 +448,15 @@ void SystemMonitor::update_audio_state() {
 
                     size_t upid_pos = line.find("u/pid:");
                     if (upid_pos != std::string::npos) {
-                        std::stringstream ss(line.substr(upid_pos + 6));
-                        ss >> uid;
+                        std::stringstream line_ss(line.substr(upid_pos + 6));
+                        line_ss >> uid;
                     }
                     if (uid < 10000) continue;
 
                     size_t state_pos = line.find(" state:");
                     if (state_pos != std::string::npos) {
-                        std::stringstream ss(line.substr(state_pos + 7));
-                        ss >> state_str;
+                        std::stringstream line_ss(line.substr(state_pos + 7));
+                        line_ss >> state_str;
                     }
 
                     uid_player_states[uid].total_count++;
@@ -375,7 +467,6 @@ void SystemMonitor::update_audio_state() {
             }
         }
     }
-    pclose(pipe);
 
     std::set<int> active_uids;
     for (const auto& [uid, states] : uid_player_states) {
@@ -387,10 +478,10 @@ void SystemMonitor::update_audio_state() {
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_uids) {
-            std::stringstream ss;
-            for(int uid : active_uids) { ss << uid << " "; }
+            std::stringstream log_ss;
+            for(int uid : active_uids) { log_ss << uid << " "; }
             LOGI("Active audio UIDs changed (strict policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
-                 uids_playing_audio_.size(), active_uids.size(), ss.str().c_str());
+                 uids_playing_audio_.size(), active_uids.size(), log_ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
     }
@@ -486,17 +577,19 @@ NetworkSpeed SystemMonitor::get_cached_network_speed(int uid) {
 std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
     std::map<int, TrafficStats> snapshot;
     const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
-
-    std::ifstream qtaguid_file(qtaguid_path);
-    if (qtaguid_file.is_open()) {
+    
+    // 优先尝试qtaguid
+    std::string qtaguid_content = read_file_once(qtaguid_path, 256 * 1024); // 256KB buffer
+    if (!qtaguid_content.empty()) {
+        std::stringstream ss(qtaguid_content);
         std::string line;
-        std::getline(qtaguid_file, line);
-        while (std::getline(qtaguid_file, line)) {
-            std::stringstream ss(line);
+        std::getline(ss, line); // Skip header
+        while (std::getline(ss, line)) {
+            std::stringstream line_ss(line);
             std::string idx, iface, acct_tag, set;
             int uid, cnt_set, protocol;
             long long rx_bytes, rx_packets, tx_bytes, tx_packets;
-            ss >> idx >> iface >> acct_tag >> uid >> cnt_set >> set >> protocol >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
+            line_ss >> idx >> iface >> acct_tag >> uid >> cnt_set >> set >> protocol >> rx_bytes >> rx_packets >> tx_bytes >> tx_packets;
             if (uid >= 10000) {
                 snapshot[uid].rx_bytes += rx_bytes;
                 snapshot[uid].tx_bytes += tx_bytes;
@@ -507,7 +600,8 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
         }
     }
     
-    std::string result = exec_shell_pipe("dumpsys netstats");
+    // 如果qtaguid失败或为空，回退到dumpsys
+    std::string result = exec_shell_pipe_efficient({"dumpsys", "netstats"});
     std::stringstream ss(result);
     std::string line;
     enum class ParseState { searching, in_mTun, in_mStatsFactory };
@@ -566,15 +660,8 @@ std::string SystemMonitor::get_current_ime_package() {
     time_t now = time(nullptr);
     
     if (now - last_ime_check_time_ > 60 || current_ime_package_.empty()) {
-        std::array<char, 256> buffer;
-        std::string result = "";
-        FILE* pipe = popen("settings get secure default_input_method", "r");
-        if (pipe) {
-            if (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-                result = buffer.data();
-            }
-            pclose(pipe);
-        }
+        // [I/O优化] 使用高效管道执行器
+        std::string result = exec_shell_pipe_efficient({"settings", "get", "secure", "default_input_method"});
 
         size_t slash_pos = result.find('/');
         if (slash_pos != std::string::npos) {
@@ -593,17 +680,13 @@ std::string SystemMonitor::get_current_ime_package() {
 
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
-    std::array<char, 2048> buffer;
-
-    FILE* pipe = popen("dumpsys location", "r");
-    if (!pipe) {
-        LOGW("popen for 'dumpsys location' failed: %s", strerror(errno));
-        return;
-    }
+    // [I/O优化] 使用高效管道执行器
+    std::string result = exec_shell_pipe_efficient({"dumpsys", "location"});
+    std::stringstream ss(result);
+    std::string line;
 
     std::string current_provider_line;
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        std::string line(buffer.data());
+    while (std::getline(ss, line)) {
         
         if (line.rfind("LocationProvider[", 0) == 0) {
             current_provider_line = line;
@@ -623,7 +706,7 @@ void SystemMonitor::update_location_state() {
                 size_t pkg_start = line.find("package=");
                 if (pkg_start == std::string::npos) continue;
                 pkg_start += 8;
-                size_t pkg_end = line.find(" ", pkg_start);
+                size_t pkg_end = line.find(' ', pkg_start);
                 if (pkg_end == std::string::npos) continue;
                 std::string pkg_name = line.substr(pkg_start, pkg_end - pkg_start);
                 
@@ -640,14 +723,12 @@ void SystemMonitor::update_location_state() {
         }
     }
 
-    pclose(pipe);
-
     {
         std::lock_guard<std::mutex> lock(location_uids_mutex_);
         if (uids_using_location_ != active_uids) {
-            std::stringstream ss;
-            for(int uid : active_uids) { ss << uid << " "; }
-            LOGI("Active location UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_using_location_.size(), active_uids.size(), ss.str().c_str());
+            std::stringstream log_ss;
+            for(int uid : active_uids) { log_ss << uid << " "; }
+            LOGI("Active location UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_using_location_.size(), active_uids.size(), log_ss.str().c_str());
             uids_using_location_ = active_uids;
         }
     }
@@ -658,24 +739,14 @@ int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
         if (!entry.is_directory()) continue;
         try {
             int pid = std::stoi(entry.path().filename().string());
-            char path_buffer[256];
-            snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
-            std::ifstream cmdline_file(path_buffer);
-            if (cmdline_file.is_open()) {
-                std::string cmdline;
-                std::getline(cmdline_file, cmdline, '\0');
-                if (cmdline.rfind(pkg_name, 0) == 0) {
-                    return pid;
-                }
+            // [I/O优化] 使用底层一次性读取
+            std::string cmdline = read_file_once(std::string("/proc/") + std::to_string(pid) + "/cmdline");
+            if (cmdline.rfind(pkg_name, 0) == 0) {
+                return pid;
             }
         } catch (...) { continue; }
     }
     return -1;
-}
-
-bool SystemMonitor::is_uid_using_location(int uid) {
-    std::lock_guard<std::mutex> lock(location_uids_mutex_);
-    return uids_using_location_.count(uid) > 0;
 }
 
 void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_mem_kb, long& total_swap_kb, float& total_cpu_percent) {
@@ -683,26 +754,30 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
     total_swap_kb = 0;
     total_cpu_percent = 0.0f;
     if (pids.empty()) return;
+
     for (int pid : pids) {
         std::string proc_path = "/proc/" + std::to_string(pid);
         if (!fs::exists(proc_path)) continue;
-        std::ifstream rollup_file(proc_path + "/smaps_rollup");
-        if (rollup_file.is_open()) {
+        
+        // [I/O优化] 使用底层一次性读取
+        std::string rollup_content = read_file_once(proc_path + "/smaps_rollup");
+        if (!rollup_content.empty()) {
+            std::stringstream ss(rollup_content);
             std::string line;
-            while (std::getline(rollup_file, line)) {
-                std::stringstream ss(line);
+            while (std::getline(ss, line)) {
+                std::stringstream line_ss(line);
                 std::string key;
                 long value;
-                ss >> key >> value;
+                line_ss >> key >> value;
                 if (key == "Pss:") total_mem_kb += value;
                 else if (key == "Swap:") total_swap_kb += value;
             }
         }
-        std::ifstream stat_file(proc_path + "/stat");
-        if (stat_file.is_open()) {
-            std::string line;
-            std::getline(stat_file, line);
-            std::stringstream ss(line);
+        
+        // [I/O优化] 使用底层一次性读取
+        std::string stat_content = read_file_once(proc_path + "/stat");
+        if (!stat_content.empty()) {
+            std::stringstream ss(stat_content);
             std::string value;
             for(int i = 0; i < 13; ++i) ss >> value;
             long long utime, stime;
@@ -728,11 +803,12 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
 }
 
 std::string SystemMonitor::get_app_name_from_pid(int pid) {
-    std::string status_path = "/proc/" + std::to_string(pid) + "/status";
-    std::ifstream status_file(status_path);
-    if (status_file.is_open()) {
+    // [I/O优化] 使用底层一次性读取
+    std::string status_content = read_file_once("/proc/" + std::to_string(pid) + "/status");
+    if (!status_content.empty()) {
+        std::stringstream ss(status_content);
         std::string line;
-        while (std::getline(status_file, line)) {
+        while (std::getline(ss, line)) {
             if (line.rfind("Name:", 0) == 0) {
                 std::string name = line.substr(line.find(":") + 1);
                 name.erase(0, name.find_first_not_of(" \t"));
@@ -741,21 +817,19 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
             }
         }
     }
-    std::string cmdline_path = "/proc/" + std::to_string(pid) + "/cmdline";
-    std::ifstream cmdline_file(cmdline_path);
-     if (cmdline_file.is_open()) {
-        std::string cmdline;
-        std::getline(cmdline_file, cmdline, '\0');
+    std::string cmdline = read_file_once("/proc/" + std::to_string(pid) + "/cmdline");
+    if (!cmdline.empty()) {
         return cmdline;
     }
     return "Unknown";
 }
 
 void SystemMonitor::update_cpu_usage(float& usage) {
-    std::ifstream stat_file("/proc/stat");
-    if (!stat_file.is_open()) return;
-    std::string line;
-    std::getline(stat_file, line);
+    // [I/O优化] 使用FD复用器
+    std::string stat_content;
+    if(!proc_stat_reader_.read_contents(stat_content) || stat_content.empty()) return;
+
+    std::string line = stat_content.substr(0, stat_content.find('\n'));
     std::string cpu_label;
     TotalCpuTimes current_times;
     std::stringstream ss(line);
@@ -777,14 +851,17 @@ void SystemMonitor::update_cpu_usage(float& usage) {
 }
 
 void SystemMonitor::update_mem_info(long& total, long& available, long& swap_total, long& swap_free) {
-    std::ifstream meminfo_file("/proc/meminfo");
-    if (!meminfo_file.is_open()) return;
+    // [I/O优化] 使用底层一次性读取
+    std::string meminfo_content = read_file_once("/proc/meminfo");
+    if (meminfo_content.empty()) return;
+
+    std::stringstream ss(meminfo_content);
     std::string line;
-    while (std::getline(meminfo_file, line)) {
+    while (std::getline(ss, line)) {
         std::string key;
         long value;
-        std::stringstream ss(line);
-        ss >> key >> value;
+        std::stringstream line_ss(line);
+        line_ss >> key >> value;
         if (key == "MemTotal:") total = value;
         else if (key == "MemAvailable:") available = value;
         else if (key == "SwapTotal:") swap_total = value;

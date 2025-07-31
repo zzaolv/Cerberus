@@ -1,23 +1,18 @@
 // daemon/cpp/logger.cpp
 #include "logger.h"
-#include "main.h" // For broadcast_message
-#include "uds_server.h" // For server instance access
 #include <fstream>
 #include <filesystem>
 #include <chrono>
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
+#include <android/log.h> // [新增] 用于错误日志
+
+#define LOG_TAG "cerberusd_logger_v2_incremental"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-// [新增] 全局UdsServer引用，用于日志广播
-extern std::unique_ptr<UdsServer> g_server;
-
-std::shared_ptr<Logger> Logger::instance_ = nullptr;
-std::mutex Logger::instance_mutex_;
-
-// [新增] LogEntry 序列化为 JSON
 json LogEntry::to_json() const {
     return json{
         {"timestamp", timestamp_ms},
@@ -33,7 +28,6 @@ json LogEntry::to_json() const {
 std::shared_ptr<Logger> Logger::get_instance(const std::string& log_dir_path) {
     std::lock_guard<std::mutex> lock(instance_mutex_);
     if (!instance_) {
-        // 使用 make_shared 和私有构造函数
         struct make_shared_enabler : public Logger {
             make_shared_enabler(const std::string& path) : Logger(path) {}
         };
@@ -80,55 +74,91 @@ void Logger::log(LogLevel level, const std::string& category, const std::string&
     cv_.notify_one();
 }
 
-std::vector<LogEntry> Logger::get_history(int limit) const {
-    std::vector<LogEntry> history;
-    std::lock_guard<std::mutex> lock(queue_mutex_);
+// [日志重构] 核心实现：获取增量或历史日志
+std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_ms, int limit) const {
+    std::vector<LogEntry> results;
     
-    // 优先从内存队列中获取最新的日志
-    int count = 0;
-    for (auto it = log_queue_.rbegin(); it != log_queue_.rend() && count < limit; ++it, ++count) {
-        history.push_back(*it);
-    }
-    
-    // 如果内存中的日志不够，从文件中读取
-    if (count < limit && fs::exists(current_log_file_path_)) {
-        std::ifstream log_file(current_log_file_path_);
-        std::string line;
-        std::vector<std::string> lines;
-        while (std::getline(log_file, line)) {
-            lines.push_back(line);
-        }
+    // 1. 从文件中读取日志
+    read_logs_from_file(results, since_timestamp_ms, since_timestamp_ms.has_value() ? -1 : limit);
 
-        for (auto it = lines.rbegin(); it != lines.rend() && count < limit; ++it, ++count) {
-            try {
-                json j = json::parse(*it);
-                LogEntry entry{
-                    .timestamp_ms = j.value("ts", 0LL),
-                    .level = static_cast<LogLevel>(j.value("lvl", 0)),
-                    .category = j.value("cat", ""),
-                    .message = j.value("msg", ""),
-                    .package_name = j.value("pkg", ""),
-                    .user_id = j.value("uid", -1)
-                };
-                history.push_back(entry);
-            } catch (...) {
-                // Ignore parse errors
+    // 2. 从内存队列中获取日志
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (const auto& entry : log_queue_) {
+            if (!since_timestamp_ms.has_value() || entry.timestamp_ms > since_timestamp_ms.value()) {
+                results.push_back(entry);
             }
         }
     }
-    std::reverse(history.begin(), history.end());
-    return history;
+
+    // 3. 去重、排序和截断
+    std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        return a.timestamp_ms > b.timestamp_ms; // 按时间戳降序
+    });
+    
+    results.erase(std::unique(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        return a.timestamp_ms == b.timestamp_ms && a.message == b.message;
+    }), results.end());
+
+    if (results.size() > limit && !since_timestamp_ms.has_value()) {
+        results.resize(limit);
+    }
+
+    return results;
 }
+
+// [日志重构] 新增的日志文件读取辅助函数
+void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<long long> since_timestamp_ms, int limit) const {
+    std::string path_to_read = current_log_file_path_;
+    if (!fs::exists(path_to_read)) return;
+    
+    std::ifstream log_file(path_to_read);
+    if (!log_file.is_open()) return;
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(log_file, line)) {
+        lines.push_back(line);
+    }
+    
+    // 从后向前遍历，效率更高
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        if (limit > 0 && out_logs.size() >= limit) break;
+        
+        try {
+            json j = json::parse(*it);
+            long long timestamp = j.value("ts", 0LL);
+
+            if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
+                // 如果是增量更新，且已读到比客户端最新的还旧的日志，则停止
+                break;
+            }
+
+            LogEntry entry{
+                .timestamp_ms = timestamp,
+                .level = static_cast<LogLevel>(j.value("lvl", 0)),
+                .category = j.value("cat", ""),
+                .message = j.value("msg", ""),
+                .package_name = j.value("pkg", ""),
+                .user_id = j.value("uid", -1)
+            };
+            out_logs.push_back(entry);
+        } catch (const json::exception& e) {
+            // 忽略解析错误
+        }
+    }
+}
+
 
 void Logger::ensure_log_file() {
     time_t now = time(nullptr);
-    tm ltm;
-    localtime_r(&now, &ltm);  // 修正：<m -> &ltm
+    tm ltm = {};
+    localtime_r(&now, <m);
 
     if (ltm.tm_yday != current_day_) {
         current_day_ = ltm.tm_yday;
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d", &ltm);  // 修正：<m -> &ltm
+        strftime(buf, sizeof(buf), "%Y-%m-%d", <m);
         current_log_file_path_ = fs::path(log_dir_path_) / (std::string("events-") + buf + ".log");
     }
 }
@@ -148,7 +178,10 @@ void Logger::writer_thread_func() {
 
         ensure_log_file();
         std::ofstream log_file(current_log_file_path_, std::ios_base::app);
-        if (!log_file.is_open()) continue;
+        if (!log_file.is_open()) {
+            LOGE("Failed to open log file for writing: %s", current_log_file_path_.c_str());
+            continue;
+        }
 
         for (const auto& entry : temp_queue) {
             // 写入文件的JSON格式可以精简，以节省空间
@@ -163,14 +196,7 @@ void Logger::writer_thread_func() {
             
             log_file << file_json.dump() << std::endl;
 
-            // 广播给UI客户端的JSON需要完整信息
-            if (g_server) {
-                json broadcast_payload = entry.to_json();
-                g_server->broadcast_message(json{
-                    {"type", "stream.new_log_entry"},
-                    {"payload", broadcast_payload}
-                }.dump());
-            }
+            // [日志重构] 不再通过TCP广播日志
         }
     }
 }

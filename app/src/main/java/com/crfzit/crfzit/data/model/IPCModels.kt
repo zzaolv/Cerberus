@@ -75,7 +75,6 @@ data class FullConfigPayload(
     val frozenUids: List<Int>? = null 
 )
 
-// [核心修复] 在 MasterConfig 中添加新字段，使其与 daemon 一致
 data class MasterConfig(
     @SerializedName("is_enabled")
     val isEnabled: Boolean = true,
@@ -109,7 +108,6 @@ data class AppInstanceKey(
     val userId: Int
 )
 
-// [新增] 用于反序列化日志条目的模型
 data class LogEntryPayload(
     val timestamp: Long,
     val level: Int,
@@ -119,7 +117,6 @@ data class LogEntryPayload(
     @SerializedName("user_id") val userId: Int?
 )
 
-// [新增] 用于反序列化统计记录的模型
 data class MetricsRecordPayload(
     val timestamp: Long,
     @SerializedName("cpu_usage_percent") val cpuUsagePercent: Float,
@@ -134,4 +131,9 @@ data class MetricsRecordPayload(
     @SerializedName("is_screen_on") val isScreenOn: Boolean,
     @SerializedName("is_audio_playing") val isAudioPlaying: Boolean,
     @SerializedName("is_location_active") val isLocationActive: Boolean
+)
+
+// [日志重构] 新增用于日志请求的Payload
+data class GetLogsPayload(
+    val since: Long? = null
 )

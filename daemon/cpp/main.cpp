@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v28_heartbeat" // 版本号更新
+#define LOG_TAG "cerberusd_main_v29_log_rework" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,20 +42,33 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         json msg = json::parse(message_str);
         std::string type = msg.value("type", "");
 
-        // [新增] 处理来自UI的hello消息
         if (type == "hello.ui") {
             g_server->identify_client_as_ui(client_fd);
-            return; // 处理完毕，直接返回
+            // 当UI连接时，立即发送一次完整的仪表盘数据
+            if (g_state_manager) {
+                json payload = g_state_manager->get_dashboard_payload();
+                g_server->send_message(client_fd, json{{"type", "stream.dashboard_update"}, {"payload", payload}}.dump());
+            }
+            return;
         }
 
-        if (type == "query.get_all_logs") {
-            auto logs = g_logger->get_history(msg.value("limit", 200));
+        // [日志重构] 处理新的日志请求
+        if (type == "query.get_logs") {
+            long long since_ts = msg.value("payload", json::object()).value("since", 0LL);
+            auto logs = g_logger->get_logs(since_ts > 0 ? std::optional(since_ts) : std::nullopt, 200);
+            
             json log_array = json::array();
             for(const auto& log : logs) { log_array.push_back(log.to_json()); }
-            // [修改] 直接使用send_message发送响应，因为这是请求-响应模式
-            g_server->send_message(client_fd, json{ {"type", "resp.all_logs"}, {"req_id", msg.value("req_id", "")}, {"payload", log_array} }.dump());
+            
+            g_server->send_message(client_fd, json{ 
+                {"type", "resp.get_logs"}, 
+                {"req_id", msg.value("req_id", "")}, 
+                {"payload", log_array} 
+            }.dump());
             return;
-        } else if (type == "query.get_history_stats") {
+        } 
+        
+        if (type == "query.get_history_stats") {
             auto records = g_ts_db->get_all_records();
             json record_array = json::array();
             for(const auto& record : records) { record_array.push_back(record.to_json()); }
@@ -144,7 +157,7 @@ void worker_thread_func() {
     int audio_scan_countdown = 3;
     int location_scan_countdown = 15;
     int audit_countdown = 30;
-    int heartbeat_countdown = 7; // [新增] 心跳计时器, 7 * 2s = 14s
+    int heartbeat_countdown = 7;
 
     const int SAMPLING_INTERVAL_SEC = 2;
 
@@ -192,7 +205,6 @@ void worker_thread_func() {
             location_scan_countdown = 15;
         }
 
-        // [新增] 心跳逻辑
         if (--heartbeat_countdown <= 0) {
             if (g_server) {
                 g_server->broadcast_message_to_ui("{\"type\":\"ping\"}");

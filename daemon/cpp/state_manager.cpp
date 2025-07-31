@@ -472,7 +472,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.lineageos.settings.doze.auto_generated_rro_vendor__",
         "org.lineageos.setupwizard.auto_generated_rro_product__",
         "org.lineageos.updater.auto_generated_rro_product__",
-        "org.protonaosp.deviceconfig.auto_generated_rro_product__"
+         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
    
@@ -1158,19 +1158,14 @@ bool StateManager::check_timers() {
     return changed;
 }
 
-// [LINKER-FIX] 在此添加缺失的函数实现
 void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
-    // 检查是否有有效的计划索引
     if (app.scheduled_unfreeze_idx != -1) {
-        // 检查索引是否在时间线向量的边界内
         if (app.scheduled_unfreeze_idx < unfrozen_timeline_.size()) {
-            // 安全性检查：确保计划槽中的UID与应用的UID匹配
             if (unfrozen_timeline_[app.scheduled_unfreeze_idx] == app.uid) {
-                unfrozen_timeline_[app.scheduled_unfreeze_idx] = 0; // 清除该槽
+                unfrozen_timeline_[app.scheduled_unfreeze_idx] = 0;
                 LOGD("TIMELINE: Cancelled scheduled unfreeze for %s at index %d.", app.package_name.c_str(), app.scheduled_unfreeze_idx);
             }
         }
-        // 始终重置应用内的计划索引
         app.scheduled_unfreeze_idx = -1;
     }
 }
