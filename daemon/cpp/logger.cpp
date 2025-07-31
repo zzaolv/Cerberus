@@ -6,12 +6,17 @@
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
-#include <android/log.h> // [新增] 用于错误日志
+#include <android/log.h>
 
 #define LOG_TAG "cerberusd_logger_v2_incremental"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// [链接器修复] 定义在头文件中声明的静态成员变量
+std::shared_ptr<Logger> Logger::instance_ = nullptr;
+std::mutex Logger::instance_mutex_;
+
 
 json LogEntry::to_json() const {
     return json{
@@ -74,14 +79,11 @@ void Logger::log(LogLevel level, const std::string& category, const std::string&
     cv_.notify_one();
 }
 
-// [日志重构] 核心实现：获取增量或历史日志
 std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_ms, int limit) const {
     std::vector<LogEntry> results;
     
-    // 1. 从文件中读取日志
     read_logs_from_file(results, since_timestamp_ms, since_timestamp_ms.has_value() ? -1 : limit);
 
-    // 2. 从内存队列中获取日志
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         for (const auto& entry : log_queue_) {
@@ -91,9 +93,8 @@ std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_
         }
     }
 
-    // 3. 去重、排序和截断
     std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
-        return a.timestamp_ms > b.timestamp_ms; // 按时间戳降序
+        return a.timestamp_ms > b.timestamp_ms;
     });
     
     results.erase(std::unique(results.begin(), results.end(), [](const auto& a, const auto& b) {
@@ -107,7 +108,6 @@ std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_
     return results;
 }
 
-// [日志重构] 新增的日志文件读取辅助函数
 void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<long long> since_timestamp_ms, int limit) const {
     std::string path_to_read = current_log_file_path_;
     if (!fs::exists(path_to_read)) return;
@@ -121,7 +121,6 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<
         lines.push_back(line);
     }
     
-    // 从后向前遍历，效率更高
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
         if (limit > 0 && out_logs.size() >= limit) break;
         
@@ -130,7 +129,6 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<
             long long timestamp = j.value("ts", 0LL);
 
             if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
-                // 如果是增量更新，且已读到比客户端最新的还旧的日志，则停止
                 break;
             }
 
@@ -144,7 +142,6 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<
             };
             out_logs.push_back(entry);
         } catch (const json::exception& e) {
-            // 忽略解析错误
         }
     }
 }
@@ -184,7 +181,6 @@ void Logger::writer_thread_func() {
         }
 
         for (const auto& entry : temp_queue) {
-            // 写入文件的JSON格式可以精简，以节省空间
             json file_json = {
                 {"ts", entry.timestamp_ms},
                 {"lvl", static_cast<int>(entry.level)},
@@ -195,8 +191,6 @@ void Logger::writer_thread_func() {
             if (entry.user_id != -1) file_json["uid"] = entry.user_id;
             
             log_file << file_json.dump() << std::endl;
-
-            // [日志重构] 不再通过TCP广播日志
         }
     }
 }

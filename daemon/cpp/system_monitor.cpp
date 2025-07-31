@@ -9,7 +9,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/wait.h> // For waitpid
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <climits>
 #include <vector>
@@ -24,7 +24,7 @@
 #include <memory>
 #include <map>
 
-#define LOG_TAG "cerberusd_monitor_v25_io_rework" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v25_io_rework"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,7 +32,6 @@
 
 namespace fs = std::filesystem;
 
-// [I/O优化] ProcFileReader 实现 - 遵循"场景一"最佳实践
 SystemMonitor::ProcFileReader::ProcFileReader(std::string path) : path_(std::move(path)) {}
 
 SystemMonitor::ProcFileReader::~ProcFileReader() {
@@ -71,7 +70,6 @@ bool SystemMonitor::ProcFileReader::read_contents(std::string& out_contents) {
     return false;
 }
 
-// [I/O优化] read_file_once 实现 - 遵循"场景一"最佳实践
 std::string SystemMonitor::read_file_once(const std::string& path, size_t max_size) {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1) return "";
@@ -97,7 +95,6 @@ static std::optional<long> read_long_from_file_str(const std::string& content) {
     }
 }
 
-// [I/O优化] exec_shell_pipe_efficient 实现 - 遵循"场景三"最佳实践
 std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
@@ -115,8 +112,8 @@ std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::stri
         return "";
     }
 
-    if (pid == 0) { // Child process
-        close(pipe_fd[0]); // Close read end
+    if (pid == 0) { 
+        close(pipe_fd[0]); 
         dup2(pipe_fd[1], STDOUT_FILENO);
         close(pipe_fd[1]);
         
@@ -127,14 +124,12 @@ std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::stri
         c_args.push_back(nullptr);
 
         execvp(c_args[0], c_args.data());
-        // If execvp returns, it must have failed
         exit(127);
     }
 
-    // Parent process
-    close(pipe_fd[1]); // Close write end
+    close(pipe_fd[1]);
     std::string result;
-    result.reserve(65536); // 预分配64KB缓冲区
+    result.reserve(65536);
     char buffer[4096];
     ssize_t count;
 
@@ -178,7 +173,6 @@ SystemMonitor::~SystemMonitor() {
 
 std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
     std::set<AppInstanceKey> visible_keys;
-    // [I/O优化] 使用高效管道执行器
     std::string result = exec_shell_pipe_efficient({"dumpsys", "activity", "activities"});
     std::stringstream ss(result);
     std::string line;
@@ -248,7 +242,6 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
         info.uid = st.st_uid;
         info.user_id = info.uid / PER_USER_RANGE;
         
-        // [I/O优化] 使用底层一次性读取
         std::string stat_content = read_file_once(std::string("/proc/") + std::to_string(pid) + "/stat");
         if (!stat_content.empty()) {
             std::stringstream stat_ss(stat_content);
@@ -277,7 +270,6 @@ std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
 long long SystemMonitor::get_total_cpu_jiffies_for_pids(const std::vector<int>& pids) {
     long long total_jiffies = 0;
     for (int pid : pids) {
-        // [I/O优化] 使用底层一次性读取
         std::string stat_content = read_file_once(std::string("/proc/") + std::to_string(pid) + "/stat");
         if (!stat_content.empty()) {
             std::stringstream ss(stat_content);
@@ -315,7 +307,6 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
 }
 
 bool SystemMonitor::get_screen_state() {
-    // [I/O优化] 使用高效管道执行器
     std::string result = exec_shell_pipe_efficient({"dumpsys", "power"});
     size_t pos = result.find("mWakefulness=");
     if(pos == std::string::npos) pos = result.find("mWakefulnessRaw=");
@@ -335,7 +326,6 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
         return;
     }
     
-    // [I/O优化] 使用底层一次性读取
     level = read_long_from_file_str(read_file_once(final_path + "capacity")).value_or(-1);
     
     auto temp_raw = read_long_from_file_str(read_file_once(final_path + "temp"));
@@ -358,7 +348,7 @@ void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, boo
 
     std::string status = read_file_once(final_path + "status");
     if(!status.empty()) {
-        status.erase(status.find_last_not_of(" \n\r\t")+1); // Trim whitespace
+        status.erase(status.find_last_not_of(" \n\r\t")+1);
         charging = (status == "Charging" || status == "Full");
     } else {
         charging = false;
@@ -382,7 +372,6 @@ void SystemMonitor::stop_top_app_monitor() {
 std::set<int> SystemMonitor::read_top_app_pids() {
     std::set<int> pids;
     if (top_app_tasks_path_.empty()) return pids;
-    // [I/O优化] 使用底层一次性读取
     std::string content = read_file_once(top_app_tasks_path_);
     if(content.empty()) return pids;
 
@@ -424,7 +413,6 @@ void SystemMonitor::update_audio_state() {
     };
     std::map<int, PlayerStates> uid_player_states;
     
-    // [I/O优化] 使用高效管道执行器
     std::string result = exec_shell_pipe_efficient({"dumpsys", "audio"});
     std::stringstream ss(result);
     std::string line;
@@ -578,12 +566,11 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
     std::map<int, TrafficStats> snapshot;
     const std::string qtaguid_path = "/proc/net/xt_qtaguid/stats";
     
-    // 优先尝试qtaguid
-    std::string qtaguid_content = read_file_once(qtaguid_path, 256 * 1024); // 256KB buffer
+    std::string qtaguid_content = read_file_once(qtaguid_path, 256 * 1024);
     if (!qtaguid_content.empty()) {
         std::stringstream ss(qtaguid_content);
         std::string line;
-        std::getline(ss, line); // Skip header
+        std::getline(ss, line);
         while (std::getline(ss, line)) {
             std::stringstream line_ss(line);
             std::string idx, iface, acct_tag, set;
@@ -600,7 +587,6 @@ std::map<int, TrafficStats> SystemMonitor::read_current_traffic() {
         }
     }
     
-    // 如果qtaguid失败或为空，回退到dumpsys
     std::string result = exec_shell_pipe_efficient({"dumpsys", "netstats"});
     std::stringstream ss(result);
     std::string line;
@@ -660,7 +646,6 @@ std::string SystemMonitor::get_current_ime_package() {
     time_t now = time(nullptr);
     
     if (now - last_ime_check_time_ > 60 || current_ime_package_.empty()) {
-        // [I/O优化] 使用高效管道执行器
         std::string result = exec_shell_pipe_efficient({"settings", "get", "secure", "default_input_method"});
 
         size_t slash_pos = result.find('/');
@@ -680,7 +665,6 @@ std::string SystemMonitor::get_current_ime_package() {
 
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
-    // [I/O优化] 使用高效管道执行器
     std::string result = exec_shell_pipe_efficient({"dumpsys", "location"});
     std::stringstream ss(result);
     std::string line;
@@ -734,12 +718,17 @@ void SystemMonitor::update_location_state() {
     }
 }
 
+// [链接器修复] 添加缺失的函数实现
+bool SystemMonitor::is_uid_using_location(int uid) {
+    std::lock_guard<std::mutex> lock(location_uids_mutex_);
+    return uids_using_location_.count(uid) > 0;
+}
+
 int SystemMonitor::get_pid_from_pkg(const std::string& pkg_name) {
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
         try {
             int pid = std::stoi(entry.path().filename().string());
-            // [I/O优化] 使用底层一次性读取
             std::string cmdline = read_file_once(std::string("/proc/") + std::to_string(pid) + "/cmdline");
             if (cmdline.rfind(pkg_name, 0) == 0) {
                 return pid;
@@ -759,7 +748,6 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
         std::string proc_path = "/proc/" + std::to_string(pid);
         if (!fs::exists(proc_path)) continue;
         
-        // [I/O优化] 使用底层一次性读取
         std::string rollup_content = read_file_once(proc_path + "/smaps_rollup");
         if (!rollup_content.empty()) {
             std::stringstream ss(rollup_content);
@@ -774,7 +762,6 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
             }
         }
         
-        // [I/O优化] 使用底层一次性读取
         std::string stat_content = read_file_once(proc_path + "/stat");
         if (!stat_content.empty()) {
             std::stringstream ss(stat_content);
@@ -803,7 +790,6 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
 }
 
 std::string SystemMonitor::get_app_name_from_pid(int pid) {
-    // [I/O优化] 使用底层一次性读取
     std::string status_content = read_file_once("/proc/" + std::to_string(pid) + "/status");
     if (!status_content.empty()) {
         std::stringstream ss(status_content);
@@ -825,7 +811,6 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
 }
 
 void SystemMonitor::update_cpu_usage(float& usage) {
-    // [I/O优化] 使用FD复用器
     std::string stat_content;
     if(!proc_stat_reader_.read_contents(stat_content) || stat_content.empty()) return;
 
@@ -851,7 +836,6 @@ void SystemMonitor::update_cpu_usage(float& usage) {
 }
 
 void SystemMonitor::update_mem_info(long& total, long& available, long& swap_total, long& swap_free) {
-    // [I/O优化] 使用底层一次性读取
     std::string meminfo_content = read_file_once("/proc/meminfo");
     if (meminfo_content.empty()) return;
 
