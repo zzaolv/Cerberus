@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v30_warmup" // 版本号更新
+#define LOG_TAG "cerberusd_state_v31_report_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -476,22 +476,18 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
     };
    
-    // [修改] 构造函数中不再执行扫描，而是由外部调用预热函数
     load_all_configs();
     next_scan_iterator_ = managed_apps_.begin();
     last_battery_level_info_ = std::nullopt;    
     LOGI("StateManager Initialized. Ready for warmup.");
 }
 
-// [新增] 启动预热函数的实现
 void StateManager::initial_full_scan_and_warmup() {
     LOGI("Starting initial full scan and data warmup...");
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    // 1. 执行完整的进程状态协调，建立所有AppRuntimeState
     reconcile_process_state_full();
     
-    // 2. 对所有当前正在运行的应用，强制进行一次全量资源扫描
     int warmed_up_count = 0;
     for (auto& [key, app] : managed_apps_) {
         if (!app.pids.empty()) {
@@ -530,7 +526,6 @@ bool StateManager::perform_staggered_stats_scan() {
 
     return true;
 }
-
 
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
@@ -576,12 +571,20 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
+// [修正] 重构Doze报告生成逻辑
 void StateManager::generate_doze_exit_report() {
-    using AppCpuActivity = std::pair<std::string, double>;
+    // 1. 定义一个临时结构体来存储报告所需的所有信息
+    struct AppCpuActivity {
+        std::string app_name;
+        std::string package_name;
+        double cpu_seconds;
+    };
+
     std::vector<AppCpuActivity> activity_list;
     const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
 
+    // 2. 收集数据，并存储更完整的信息（包括包名）
     for (const auto& [key, app] : managed_apps_) {
         if (app.pids.empty()) continue;
         
@@ -593,25 +596,35 @@ void StateManager::generate_doze_exit_report() {
         
         if (end_jiffies > start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) activity_list.push_back({app.app_name, cpu_seconds});
+            if (cpu_seconds > 0.01) {
+                activity_list.push_back({app.app_name, app.package_name, cpu_seconds});
+            }
         }
     }
     
-    if (activity_list.empty()) {
-        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动。");
-        return;
-    }
-    
+    // 3. 排序，确保数据按CPU时间降序排列
     std::sort(activity_list.begin(), activity_list.end(), 
-              [](const AppCpuActivity& a, const AppCpuActivity& b) { return a.second > b.second; });
+              [](const AppCpuActivity& a, const AppCpuActivity& b) { return a.cpu_seconds > b.cpu_seconds; });
 
-    logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间:");
+    // 4. 构建完整的报告字符串
+    std::stringstream report_ss;
+    report_ss << "Doze期间应用的CPU活跃时间:";
 
-    for (const auto& activity : activity_list) {
-        std::stringstream line_ss;
-        line_ss << "| | [活跃: " << std::fixed << std::setprecision(3) << activity.second << "秒] | [" << activity.first << "]";
-        logger_->log(LogLevel::REPORT, "报告", line_ss.str());
+    if (activity_list.empty()) {
+        report_ss << "\n| | 无明显应用活动。";
+    } else {
+        for (const auto& activity : activity_list) {
+            // 如果app_name和package_name相同，只显示一个
+            std::string display_name = (activity.app_name == activity.package_name) 
+                                       ? activity.package_name 
+                                       : activity.app_name + " (" + activity.package_name + ")";
+            
+            report_ss << "\n| | [活跃: " << std::fixed << std::setprecision(3) << activity.cpu_seconds << "秒] | [" << display_name << "]";
+        }
     }
+
+    // 5. 使用一次log调用来记录整个报告，确保原子性
+    logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
 }
 
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
@@ -1516,7 +1529,7 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
-        if (!friendly_name.empty() && friendly_name != app->package_name) {
+        if (!friendly_name.empty()) {
             app->app_name = friendly_name;
         }
     }
