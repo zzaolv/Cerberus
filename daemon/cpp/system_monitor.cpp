@@ -1,5 +1,5 @@
 // daemon/cpp/system_monitor.cpp
-#include "system_monitor.hh"
+#include "system_monitor.h"
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
