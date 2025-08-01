@@ -2,6 +2,7 @@
 package com.crfzit.crfzit.data.model
 
 import android.graphics.drawable.Drawable
+import com.google.gson.JsonElement
 
 enum class Policy(val value: Int) {
     EXEMPTED(0),
@@ -55,6 +56,7 @@ data class LogEntry(
     val message: String,
     val packageName: String?,
     val userId: Int = -1
+    val details: JsonElement? = null
 )
 
 data class MetricsRecord(

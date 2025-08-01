@@ -11,26 +11,26 @@
 #include <condition_variable>
 #include <nlohmann/json.hpp>
 #include <memory>
-#include <optional> // [新增] For optional since_timestamp
+#include <optional>
 
 using json = nlohmann::json;
 
 enum class LogLevel {
-    INFO,    // ℹ️
-    SUCCESS, // ✅
-    WARN,    // ⚠️
-    ERROR,   // ❌
-    EVENT,   // ⚡️
-    DOZE,    // 🌙
-    BATTERY, // 🔋
-    REPORT,  // 📊
-    ACTION_OPEN,     // ▶️
-    ACTION_CLOSE,    // ⏹️
-    ACTION_FREEZE,   // ❄️
-    ACTION_UNFREEZE, // ☀️
-    ACTION_DELAY,    // 🤣
-    TIMER,           // ⏰
-    BATCH_PARENT     // 📦 (用于批量处理的父条目)
+    INFO,
+    SUCCESS,
+    WARN,
+    ERROR,
+    EVENT,
+    DOZE,
+    BATTERY,
+    REPORT,
+    ACTION_OPEN,
+    ACTION_CLOSE,
+    ACTION_FREEZE,
+    ACTION_UNFREEZE,
+    ACTION_DELAY,
+    TIMER,
+    BATCH_PARENT
 };
 
 struct LogEntry {
@@ -40,6 +40,8 @@ struct LogEntry {
     std::string message;
     std::string package_name;
     int user_id;
+    // [新增] 用于存放结构化数据的字段
+    json details;
 
     json to_json() const;
 };
@@ -52,29 +54,24 @@ public:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    void log(LogLevel level, const std::string& category, const std::string& message, 
-             const std::string& package_name = "", int user_id = -1);
+    // [修改] 增加details参数
+    void log(LogLevel level, const std::string& category, const std::string& message,
+             const std::string& package_name = "", int user_id = -1, const json& details = nullptr);
 
-    // [日志重构] 修改函数以支持增量更新
     std::vector<LogEntry> get_logs(std::optional<long long> since_timestamp_ms, int limit) const;
-
     void stop();
 
 private:
     explicit Logger(const std::string& log_dir_path);
-    
     void writer_thread_func();
     void ensure_log_file();
-    // [日志重构] 新增的日志文件读取辅助函数
     void read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<long long> since_timestamp_ms, int limit) const;
-
 
     static std::shared_ptr<Logger> instance_;
     static std::mutex instance_mutex_;
 
     std::string log_dir_path_;
     std::string current_log_file_path_;
-    
     std::deque<LogEntry> log_queue_;
     mutable std::mutex queue_mutex_;
     std::condition_variable cv_;

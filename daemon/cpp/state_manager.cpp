@@ -586,12 +586,28 @@ void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
         std::string process_name;
         double cpu_seconds;
+        json to_json() const {
+            return {{"process_name", process_name}, {"cpu_seconds", cpu_seconds}};
+        }
     };
 
     struct AppActivitySummary {
         std::string app_name;
+        std::string package_name;
         double total_cpu_seconds = 0.0;
         std::vector<ProcessActivity> processes;
+        json to_json() const {
+            json proc_array = json::array();
+            for (const auto& p : processes) {
+                proc_array.push_back(p.to_json());
+            }
+            return {
+                {"app_name", app_name},
+                {"package_name", package_name},
+                {"total_cpu_seconds", total_cpu_seconds},
+                {"processes", proc_array}
+            };
+        }
     };
 
     std::map<AppInstanceKey, AppActivitySummary> grouped_activities;
@@ -610,13 +626,14 @@ void StateManager::generate_doze_exit_report() {
     }
 
     if (grouped_activities.empty()) {
-        logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间:\n| | 无明显应用活动。");
+        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动");
         return;
     }
 
     std::vector<std::pair<AppInstanceKey, double>> sorted_apps;
     for (auto& [key, summary] : grouped_activities) {
         auto it = managed_apps_.find(key);
+        summary.package_name = key.first;
         if (it != managed_apps_.end()) {
             summary.app_name = it->second.app_name;
         } else {
@@ -631,24 +648,12 @@ void StateManager::generate_doze_exit_report() {
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    std::stringstream report_ss;
-    report_ss << "Doze期间应用的CPU活跃时间:";
-
+    json details_array = json::array();
     for (const auto& pair : sorted_apps) {
-        const AppInstanceKey& key = pair.first;
-        const auto& summary = grouped_activities[key];
-
-        report_ss << "\n| | [总活跃: " << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s] | ["
-                  << summary.app_name << " (" << key.first << ")]";
-
-        if (summary.processes.size() > 1 || (summary.processes.size() == 1 && summary.processes[0].process_name != key.first)) {
-            for (const auto& proc : summary.processes) {
-                 report_ss << "\n| |   - [活跃: " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s] | [" << proc.process_name << "]";
-            }
-        }
+        details_array.push_back(grouped_activities[pair.first].to_json());
     }
 
-    logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
+    logger_->log(LogLevel::REPORT, "报告", "Doze期间应用的CPU活跃时间", "", -1, details_array);
 }
 
 

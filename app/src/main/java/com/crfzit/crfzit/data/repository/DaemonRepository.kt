@@ -63,12 +63,14 @@ class DaemonRepository private constructor(
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
+            // [修改] LogEntryPayload 现在也可能包含 details 字段
             val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
             val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
 
             if (message?.type == "resp.get_logs") {
                 message.payload.map { p ->
-                    LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
+                    // [修改] 将 details 字段也映射过来
+                    LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1, p.details)
                 }
             } else {
                 Log.e("DaemonRepository", "Query 'get_logs' received unexpected response type '${message?.type}'")

@@ -20,8 +20,11 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogLevel
 import com.crfzit.crfzit.ui.stats.StatisticsScreen
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,11 +71,99 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 items(
                     items = uiState.logs,
                     key = { log ->
-                        // [修正] 使用 .timestamp 替换 .timestamp_ms
                         "${log.originalLog.timestamp}-${log.originalLog.message}"
                     }
                 ) { log ->
-                    LogItem(log)
+                    // [核心修改] 条件渲染
+                    if (log.originalLog.category == "报告" && log.originalLog.details != null) {
+                        ReportLogItem(log)
+                    } else {
+                        LogItem(log)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// [新增] Doze报告的数据模型
+data class DozeProcessActivity(val process_name: String, val cpu_seconds: Double)
+data class DozeAppActivity(val app_name: String, val package_name: String, val total_cpu_seconds: Double, val processes: List<DozeProcessActivity>)
+
+// [新增] 用于显示Doze报告的Composable
+@Composable
+fun ReportLogItem(log: UiLogEntry) {
+    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val originalLog = log.originalLog
+    val (icon, color) = getLogAppearance(originalLog.level)
+    
+    val dozeReportData: List<DozeAppActivity> = remember(originalLog.details) {
+        try {
+            val type = object : TypeToken<List<DozeAppActivity>>() {}.type
+            Gson().fromJson(originalLog.details, type) ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = formatter.format(Date(originalLog.timestamp)),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "$icon [${originalLog.category}]",
+                    color = color,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = originalLog.message,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            
+            Spacer(Modifier.height(8.dp))
+            
+            if (dozeReportData.isEmpty()) {
+                Text("Doze期间无明显应用活动。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 16.dp))
+            } else {
+                dozeReportData.forEach { appActivity ->
+                    Column(Modifier.padding(start = 8.dp, top = 4.dp)) {
+                        Text(
+                            buildAnnotatedString {
+                                withStyle(style = SpanStyle(fontWeight = FontWeight.Bold)) {
+                                    append("▶ ${appActivity.app_name}")
+                                }
+                                withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                                    append(" (${appActivity.package_name})")
+                                }
+                                append(" - 总计: ${"%.3f".format(appActivity.total_cpu_seconds)}s")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            lineHeight = 16.sp
+                        )
+
+                        if (appActivity.processes.size > 1 || (appActivity.processes.isNotEmpty() && appActivity.processes[0].process_name != appActivity.package_name)) {
+                            appActivity.processes.forEach { process ->
+                                Text(
+                                    text = "  - ${process.process_name}: ${"%.3f".format(process.cpu_seconds)}s",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    modifier = Modifier.padding(start = 16.dp),
+                                    lineHeight = 16.sp
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
