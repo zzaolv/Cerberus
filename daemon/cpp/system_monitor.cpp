@@ -25,17 +25,13 @@
 #include <map>
 #include <unordered_set>
 
-#define LOG_TAG "cerberusd_monitor_v27_location_policy" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v28_audio_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
-
-// ... ProcFileReader, read_file_once, exec_shell_pipe_efficient, get_uid_from_pid ...
-// ... 和其他 SystemMonitor 的成员函数保持不变，直到 update_location_state ...
-// (为了简洁，我将省略这部分未改变的代码，请以前一个响应中的版本为准)
 
 SystemMonitor::ProcFileReader::ProcFileReader(std::string path) : path_(std::move(path)) {}
 
@@ -411,12 +407,9 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+// [核心修复] 回归到更稳定可靠的、基于 'started' 状态的音频识别逻辑
 void SystemMonitor::update_audio_state() {
-    struct PlayerStats {
-        int total_count = 0;
-        int paused_count = 0;
-    };
-    std::map<int, PlayerStats> uid_player_stats;
+    std::set<int> active_uids;
     std::unordered_set<std::string> ignored_usages = {"USAGE_ASSISTANCE_SONIFICATION", "USAGE_TOUCH_INTERACTION_RESPONSE"};
 
     std::string result = exec_shell_pipe_efficient({"dumpsys", "audio"});
@@ -438,6 +431,7 @@ void SystemMonitor::update_audio_state() {
         
         if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
             try {
+                // 1. 首先检查并过滤掉系统提示音等无关播放器
                 bool is_ignored = false;
                 for (const auto& usage : ignored_usages) {
                     if (line.find(usage) != std::string::npos) {
@@ -447,34 +441,29 @@ void SystemMonitor::update_audio_state() {
                 }
                 if (is_ignored) continue;
 
-                int uid = -1;
-                std::string state_str;
+                // 2. 检查状态是否为 'started'
+                size_t state_pos = line.find(" state:");
+                if (state_pos != std::string::npos) {
+                    // 提高解析效率，只检查 'started' 关键字
+                    if (line.substr(state_pos + 7, 7) != "started") {
+                        continue;
+                    }
+                } else {
+                    continue; // 没有 state 字段，忽略
+                }
 
+                // 3. 只有当状态确定为 'started' 且非忽略类型时，才解析 UID
+                int uid = -1;
                 size_t upid_pos = line.find("u/pid:");
                 if (upid_pos != std::string::npos) {
                     std::stringstream line_ss(line.substr(upid_pos + 6));
                     line_ss >> uid;
                 }
-                if (uid < 10000) continue;
-
-                size_t state_pos = line.find(" state:");
-                if (state_pos != std::string::npos) {
-                    std::stringstream line_ss(line.substr(state_pos + 7));
-                    line_ss >> state_str;
-                }
                 
-                uid_player_stats[uid].total_count++;
-                if (state_str == "paused") {
-                    uid_player_stats[uid].paused_count++;
+                if (uid >= 10000) {
+                    active_uids.insert(uid);
                 }
             } catch (const std::exception& e) {}
-        }
-    }
-
-    std::set<int> active_uids;
-    for (const auto& [uid, stats] : uid_player_stats) {
-        if (stats.total_count > 0 && stats.paused_count == 0) {
-            active_uids.insert(uid);
         }
     }
     
@@ -483,7 +472,7 @@ void SystemMonitor::update_audio_state() {
         if (uids_playing_audio_ != active_uids) {
             std::stringstream log_ss;
             for(int uid : active_uids) { log_ss << uid << " "; }
-            LOGI("Active audio UIDs changed (paused policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+            LOGI("Active audio UIDs changed (started policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
                  uids_playing_audio_.size(), active_uids.size(), log_ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
@@ -679,7 +668,6 @@ std::string SystemMonitor::get_current_ime_package() {
     return current_ime_package_;
 }
 
-// [核心重构] 实现您提出的新的定位豁免逻辑
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
     std::string result = exec_shell_pipe_efficient({"dumpsys", "location"});
@@ -691,26 +679,21 @@ void SystemMonitor::update_location_state() {
         if (!in_gps_provider_section) {
             if (line.find("gps provider:") != std::string::npos) {
                 in_gps_provider_section = true;
-                // 检查GPS是否关闭
                 if (line.find("[OFF]") != std::string::npos) {
-                    // 如果GPS关闭，直接跳过此区域
                     in_gps_provider_section = false; 
                 }
             }
             continue;
         }
 
-        // 遇到结束标记，停止处理
         if (line.find("user 0:") != std::string::npos) {
             in_gps_provider_section = false;
-            continue; // 继续扫描，以防有其他provider
+            continue;
         }
         
-        // 在gps provider区域内，寻找WorkSource
         size_t ws_pos = line.find("WorkSource{");
         if (ws_pos != std::string::npos) {
             try {
-                // WorkSource{10388 com.baidu.BaiduMap}
                 std::string ws_content = line.substr(ws_pos + 11);
                 std::stringstream ws_ss(ws_content);
                 int uid = -1;
