@@ -10,36 +10,36 @@
 #include <mutex>
 #include <unordered_set>
 #include <set>
-#include <chrono> 
+#include <chrono>
 #include "database_manager.h"
 #include "system_monitor.h"
 #include "action_executor.h"
-#include "logger.h"                 
-#include "time_series_database.h"   
+#include "logger.h"
+#include "time_series_database.h"
 
 using json = nlohmann::json;
 
 struct AppRuntimeState {
-    enum class Status { 
+    enum class Status {
         STOPPED,
         RUNNING,
         FROZEN
     } current_status = Status::STOPPED;
 
-    // [新增] 记录冻结方式
+    // [修复] 将 SIGSTOP 重命名为 SIG_STOP 以避免宏冲突
     enum class FreezeMethod {
         NONE,
         CGROUP,
-        SIGSTOP
+        SIG_STOP
     } freeze_method = FreezeMethod::NONE;
 
     std::string package_name;
     std::string app_name;
     int uid = -1;
     int user_id = 0;
-    std::vector<int> pids; 
+    std::vector<int> pids;
     AppConfig config;
-    
+
     bool is_foreground = false;
     time_t background_since = 0;
     time_t observation_since = 0;
@@ -49,7 +49,7 @@ struct AppRuntimeState {
     bool has_rogue_structure = false;
     int rogue_puppet_pid = -1;
     int rogue_master_pid = -1;
-    
+
     bool has_logged_rogue_warning = false;
 
     int scheduled_unfreeze_idx = -1;
@@ -58,20 +58,20 @@ struct AppRuntimeState {
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
     long long last_foreground_timestamp_ms = 0;
-    long long total_runtime_ms = 0;    
+    long long total_runtime_ms = 0;
 };
 
 class DozeManager {
 public:
     enum class State { AWAKE, IDLE, INACTIVE, DEEP_DOZE };
     enum class DozeEvent { NONE, ENTERED_DEEP_DOZE, EXITED_DEEP_DOZE };
-    
+
     DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor);
     DozeEvent process_metrics(const MetricsRecord& record);
 
 private:
     void enter_state(State new_state, const MetricsRecord& record);
-    
+
     State current_state_ = State::AWAKE;
     std::chrono::steady_clock::time_point state_change_timestamp_;
     std::chrono::steady_clock::time_point deep_doze_start_time_;
@@ -83,7 +83,7 @@ class StateManager {
 public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
-    
+
     void initial_full_scan_and_warmup();
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
@@ -109,7 +109,7 @@ private:
     void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
-    bool reconcile_process_state_full(); 
+    bool reconcile_process_state_full();
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
     void add_pid_to_app(int pid, const std::string&, int user_id, int uid);
@@ -130,13 +130,13 @@ private:
     std::shared_ptr<ActionExecutor> action_executor_;
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<TimeSeriesDatabase> ts_db_;
-    
+
     MasterConfig master_config_;
     std::unique_ptr<DozeManager> doze_manager_;
     std::mutex state_mutex_;
     std::set<AppInstanceKey> last_known_visible_app_keys_;
     std::optional<MetricsRecord> last_metrics_record_;
-    std::optional<std::pair<int, long long>> last_battery_level_info_; 
+    std::optional<std::pair<int, long long>> last_battery_level_info_;
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
     std::map<AppInstanceKey, long long> doze_start_cpu_jiffies_;
