@@ -23,8 +23,9 @@
 #include <string>
 #include <memory>
 #include <map>
+#include <unordered_set> // 新增
 
-#define LOG_TAG "cerberusd_monitor_v25_io_rework"
+#define LOG_TAG "cerberusd_monitor_v26_audio_policy" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -406,59 +407,76 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
+// [核心重构] 实现您提出的新的音频豁免逻辑
 void SystemMonitor::update_audio_state() {
-    struct PlayerStates {
-        int started_count = 0;
+    // 存储每个UID有多少播放器，以及有多少是暂停状态
+    struct PlayerStats {
         int total_count = 0;
+        int paused_count = 0;
     };
-    std::map<int, PlayerStates> uid_player_states;
-    
+    std::map<int, PlayerStats> uid_player_stats;
+    std::unordered_set<std::string> ignored_usages = {"USAGE_ASSISTANCE_SONIFICATION", "USAGE_TOUCH_INTERACTION_RESPONSE"};
+
     std::string result = exec_shell_pipe_efficient({"dumpsys", "audio"});
     std::stringstream ss(result);
     std::string line;
 
     bool in_players_section = false;
     while (std::getline(ss, line)) {
-        if (line.rfind("  players:", 0) == 0) {
-            in_players_section = true;
+        if (!in_players_section) {
+            if (line.find("players:") != std::string::npos) {
+                in_players_section = true;
+            }
             continue;
         }
         
-        if (in_players_section) {
-            if (line.find("  ducked players piids:") == 0 || line.find("  faded out players piids:") == 0) {
-                in_players_section = false;
-            }
-            
-            if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
-                try {
-                    int uid = -1;
-                    std::string state_str;
-
-                    size_t upid_pos = line.find("u/pid:");
-                    if (upid_pos != std::string::npos) {
-                        std::stringstream line_ss(line.substr(upid_pos + 6));
-                        line_ss >> uid;
+        // 遇到结束标记，停止处理
+        if (line.find("ducked players piids:") != std::string::npos) {
+            break;
+        }
+        
+        if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
+            try {
+                // 1. 过滤系统提示音等无关播放器
+                bool is_ignored = false;
+                for (const auto& usage : ignored_usages) {
+                    if (line.find(usage) != std::string::npos) {
+                        is_ignored = true;
+                        break;
                     }
-                    if (uid < 10000) continue;
+                }
+                if (is_ignored) continue;
 
-                    size_t state_pos = line.find(" state:");
-                    if (state_pos != std::string::npos) {
-                        std::stringstream line_ss(line.substr(state_pos + 7));
-                        line_ss >> state_str;
-                    }
+                // 2. 解析 UID 和 state
+                int uid = -1;
+                std::string state_str;
 
-                    uid_player_states[uid].total_count++;
-                    if (state_str == "started") {
-                        uid_player_states[uid].started_count++;
-                    }
-                } catch (const std::exception& e) {}
-            }
+                size_t upid_pos = line.find("u/pid:");
+                if (upid_pos != std::string::npos) {
+                    std::stringstream line_ss(line.substr(upid_pos + 6));
+                    line_ss >> uid;
+                }
+                if (uid < 10000) continue;
+
+                size_t state_pos = line.find(" state:");
+                if (state_pos != std::string::npos) {
+                    std::stringstream line_ss(line.substr(state_pos + 7));
+                    line_ss >> state_str;
+                }
+                
+                // 3. 统计总数和暂停数
+                uid_player_stats[uid].total_count++;
+                if (state_str == "paused") {
+                    uid_player_stats[uid].paused_count++;
+                }
+            } catch (const std::exception& e) {}
         }
     }
 
     std::set<int> active_uids;
-    for (const auto& [uid, states] : uid_player_states) {
-        if (states.total_count > 0 && states.started_count == states.total_count) {
+    // 4. 决策：如果一个UID有播放器，且暂停的播放器数量为0，则豁免
+    for (const auto& [uid, stats] : uid_player_stats) {
+        if (stats.total_count > 0 && stats.paused_count == 0) {
             active_uids.insert(uid);
         }
     }
@@ -468,12 +486,13 @@ void SystemMonitor::update_audio_state() {
         if (uids_playing_audio_ != active_uids) {
             std::stringstream log_ss;
             for(int uid : active_uids) { log_ss << uid << " "; }
-            LOGI("Active audio UIDs changed (strict policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+            LOGI("Active audio UIDs changed (paused policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
                  uids_playing_audio_.size(), active_uids.size(), log_ss.str().c_str());
             uids_playing_audio_ = active_uids;
         }
     }
 }
+
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
     std::lock_guard<std::mutex> lock(audio_uids_mutex_);
@@ -718,7 +737,6 @@ void SystemMonitor::update_location_state() {
     }
 }
 
-// [链接器修复] 添加缺失的函数实现
 bool SystemMonitor::is_uid_using_location(int uid) {
     std::lock_guard<std::mutex> lock(location_uids_mutex_);
     return uids_using_location_.count(uid) > 0;
@@ -805,6 +823,8 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
     }
     std::string cmdline = read_file_once("/proc/" + std::to_string(pid) + "/cmdline");
     if (!cmdline.empty()) {
+        size_t null_pos = cmdline.find('\0');
+        if(null_pos != std::string::npos) cmdline.resize(null_pos);
         return cmdline;
     }
     return "Unknown";
