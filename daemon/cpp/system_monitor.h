@@ -12,10 +12,15 @@
 #include <atomic>
 #include <functional>
 #include <optional>
-#include <utility> // For std::pair
+#include <utility>
 
-// 核心修复: AppInstanceKey 在此定义，以便多处共享
 using AppInstanceKey = std::pair<std::string, int>;
+
+// [前台识别] 新增结构体，用于返回真前台和假前台两个集合
+struct VisibleAppsResult {
+    std::set<AppInstanceKey> true_foreground; // 来自 VisibleActivityProcess
+    std::set<AppInstanceKey> fake_foreground; // 在 ResumedActivity 但不在 VisibleActivityProcess
+};
 
 struct CpuTimeSlice {
     long long app_jiffies = 0;
@@ -48,9 +53,9 @@ class SystemMonitor {
 public:
     SystemMonitor();
     ~SystemMonitor();
-    
+
     std::optional<MetricsRecord> collect_current_metrics();
-    
+
     void update_app_stats(const std::vector<int>& pids, long& mem_kb, long& swap_kb, float& cpu_percent);
     std::string get_app_name_from_pid(int pid);
 
@@ -59,24 +64,24 @@ public:
     void start_top_app_monitor();
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
-    
-    std::set<AppInstanceKey> get_visible_app_keys();
+
+    // [前台识别] 修改函数返回类型
+    VisibleAppsResult get_visible_app_keys();
     std::map<int, ProcessInfo> get_full_process_tree();
 
     void update_audio_state();
     bool is_uid_playing_audio(int uid);
-    
+
     void update_location_state();
     bool is_uid_using_location(int uid);
-    
+
     std::string get_current_ime_package();
-    
+
     void start_network_snapshot_thread();
     void stop_network_snapshot_thread();
     NetworkSpeed get_cached_network_speed(int uid);
 
 private:
-    // [I/O优化] 新增：为高频读取的/proc文件设计的FD复用工具
     class ProcFileReader {
     public:
         ProcFileReader(std::string path);
@@ -89,9 +94,7 @@ private:
         bool open_fd();
     };
 
-    // [I/O优化] 新增：高效执行shell命令并以流方式读取其输出的函数
     std::string exec_shell_pipe_efficient(const std::vector<std::string>& args);
-    // [I/O优化] 新增：使用底层open/read一次性读取文件
     static std::string read_file_once(const std::string& path, size_t max_size = 4096);
 
     void update_cpu_usage(float& usage);
@@ -109,12 +112,11 @@ private:
         long long total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
         long long idle_total() const { return idle + iowait; }
     };
-    
+
     mutable std::mutex data_mutex_;
     TotalCpuTimes prev_total_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
-    // [I/O优化] 为/proc/stat创建一个FD复用器实例
     ProcFileReader proc_stat_reader_;
 
     std::set<int> last_known_top_pids_;
@@ -124,10 +126,10 @@ private:
 
     std::mutex audio_uids_mutex_;
     std::set<int> uids_playing_audio_;
-    
+
     mutable std::mutex location_uids_mutex_;
     std::set<int> uids_using_location_;
-    
+
     mutable std::mutex ime_mutex_;
     std::string current_ime_package_;
     time_t last_ime_check_time_ = 0;

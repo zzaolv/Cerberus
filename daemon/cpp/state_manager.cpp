@@ -536,8 +536,23 @@ bool StateManager::perform_staggered_stats_scan() {
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
 
-    auto visible_app_keys = sys_monitor_->get_visible_app_keys();
-    state_has_changed |= update_foreground_state(visible_app_keys);
+    // [前台识别] 使用新的函数和返回类型
+    auto visible_result = sys_monitor_->get_visible_app_keys();
+
+    // [前台识别] 日志记录假前台应用
+    for (const auto& key : visible_result.fake_foreground) {
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end()) {
+            // 只在状态首次出现时记录，避免日志刷屏
+            if (!it->second.has_logged_rogue_warning) {
+                logger_->log(LogLevel::WARN, "审计", "检测到假前台活动", key.first, key.second);
+                it->second.has_logged_rogue_warning = true;
+            }
+        }
+    }
+    
+    // [前台识别] 仅使用 "真前台" 集合来更新状态
+    state_has_changed |= update_foreground_state(visible_result.true_foreground);
 
     if(state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
@@ -583,6 +598,7 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
 }
 
 void StateManager::generate_doze_exit_report() {
+    // [核心修复] 重构此函数
     struct ProcessActivity {
         std::string process_name;
         double cpu_seconds;
@@ -610,6 +626,7 @@ void StateManager::generate_doze_exit_report() {
         }
     };
 
+    // 使用 AppInstanceKey 作为 map 的键，确保每个应用只有一个条目
     std::map<AppInstanceKey, AppActivitySummary> grouped_activities;
     const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
@@ -618,9 +635,26 @@ void StateManager::generate_doze_exit_report() {
         long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid});
         if (end_jiffies > start_record.start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) {
+            if (cpu_seconds > 0.01) { // 阈值过滤
                 AppInstanceKey key = {start_record.package_name, start_record.user_id};
+
+                // 如果应用条目不存在，则创建它
+                if (grouped_activities.find(key) == grouped_activities.end()) {
+                    AppActivitySummary summary;
+                    summary.package_name = key.first;
+                    auto it = managed_apps_.find(key);
+                    if (it != managed_apps_.end()) {
+                        summary.app_name = it->second.app_name;
+                    } else {
+                        // 如果在managed_apps_中找不到，就用包名作为后备
+                        summary.app_name = key.first;
+                    }
+                    grouped_activities[key] = summary;
+                }
+
+                // 将进程活动累加到已有的应用条目中
                 grouped_activities[key].processes.push_back({start_record.process_name, cpu_seconds});
+                grouped_activities[key].total_cpu_seconds += cpu_seconds;
             }
         }
     }
@@ -630,32 +664,23 @@ void StateManager::generate_doze_exit_report() {
         return;
     }
 
-    std::vector<std::pair<AppInstanceKey, double>> sorted_apps;
-    for (auto& [key, summary] : grouped_activities) {
-        auto it = managed_apps_.find(key);
-        summary.package_name = key.first;
-        if (it != managed_apps_.end()) {
-            summary.app_name = it->second.app_name;
-        } else {
-            summary.app_name = key.first;
-        }
-        for (const auto& proc : summary.processes) {
-            summary.total_cpu_seconds += proc.cpu_seconds;
-        }
-        sorted_apps.push_back({key, summary.total_cpu_seconds});
+    // 将 map 转换为 vector 以便排序
+    std::vector<AppActivitySummary> sorted_apps;
+    for (auto const& [key, val] : grouped_activities) {
+        sorted_apps.push_back(val);
     }
 
+    // 按总CPU时间降序排序
     std::sort(sorted_apps.begin(), sorted_apps.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+              [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
     json details_array = json::array();
-    for (const auto& pair : sorted_apps) {
-        details_array.push_back(grouped_activities[pair.first].to_json());
+    for (const auto& summary : sorted_apps) {
+        details_array.push_back(summary.to_json());
     }
 
     logger_->log(LogLevel::REPORT, "报告", "Doze期间应用的CPU活跃时间", "", -1, details_array);
 }
-
 
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (old_record.is_charging != new_record.is_charging) {

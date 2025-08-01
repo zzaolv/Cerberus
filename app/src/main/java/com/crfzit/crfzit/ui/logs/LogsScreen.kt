@@ -2,6 +2,7 @@
 package com.crfzit.crfzit.ui.logs
 
 import android.util.Log
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -22,6 +23,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogLevel
 import com.crfzit.crfzit.ui.stats.StatisticsScreen
 import com.google.gson.Gson
+import com.google.gson.JsonElement
 import com.google.gson.reflect.TypeToken
 import java.text.SimpleDateFormat
 import java.util.*
@@ -62,6 +64,7 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
         if (uiState.isLoading && uiState.logs.isEmpty()) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
         } else {
+            // [核心修复] LazyColumn 中不再有 if/else 分支，统一使用 LogItem
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
@@ -70,18 +73,13 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
             ) {
                 itemsIndexed(
                     items = uiState.logs,
-                    key = { _, log -> // 使用 index 和内容作为 key
+                    key = { _, log ->
                         "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}"
                     }
-                ) { index, log ->
-                    if (log.originalLog.category == "报告" && log.originalLog.details != null) {
-                        ReportLogItem(log)
-                    } else {
-                        LogItem(log)
-                    }
+                ) { _, log ->
+                    LogItem(log = log) // 统一调用
                 }
 
-                // [分页加载] 在列表末尾显示加载指示器
                 if (uiState.isLoadingMore) {
                     item {
                         Row(
@@ -96,12 +94,11 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 }
             }
 
-            // [分页加载] 触发加载更多的逻辑
             val layoutInfo = listState.layoutInfo
             val shouldLoadMore = remember(layoutInfo) {
                 derivedStateOf {
                     val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
-                    lastVisibleItem != null && lastVisibleItem.index >= layoutInfo.totalItemsCount - 5 // 提前5个item开始加载
+                    lastVisibleItem != null && lastVisibleItem.index >= layoutInfo.totalItemsCount - 5
                 }
             }
 
@@ -114,132 +111,137 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
     }
 }
 
+// 数据模型保持不变
 data class DozeProcessActivity(val process_name: String, val cpu_seconds: Double)
 data class DozeAppActivity(val app_name: String, val package_name: String, val total_cpu_seconds: Double, val processes: List<DozeProcessActivity>)
 
-@Composable
-fun ReportLogItem(log: UiLogEntry) {
-    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-    val originalLog = log.originalLog
-    val (icon, color) = getLogAppearance(originalLog.level)
 
-    // [修复Doze日志解析] 将JsonElement转换为字符串再进行解析
-    val dozeReportData: List<DozeAppActivity> = remember(originalLog.details) {
-        try {
-            val type = object : TypeToken<List<DozeAppActivity>>() {}.type
-            // 核心修复点：使用 .toString()
-            Gson().fromJson(originalLog.details.toString(), type) ?: emptyList()
-        } catch (e: Exception) {
-            Log.e("ReportLogItem", "Failed to parse Doze report details: ${e.message}")
-            emptyList()
-        }
+/**
+ * [核心修复] 这是唯一的日志项 Composable，它能同时处理普通日志和报告日志。
+ */
+@Composable
+fun LogItem(log: UiLogEntry) {
+    val originalLog = log.originalLog
+    val isReport = originalLog.category == "报告" && originalLog.details != null && !originalLog.details.isJsonNull
+
+    // 根据是否是报告，选择不同的卡片背景色
+    val cardColors = if (isReport) {
+        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+    } else {
+        CardDefaults.cardColors(containerColor = Color.Transparent)
     }
 
+    // 如果不是报告，则不使用卡片，以减少视觉噪音
+    val cardElevation = if (isReport) CardDefaults.cardElevation() else CardDefaults.cardElevation(defaultElevation = 0.dp)
+
+
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+        modifier = Modifier.fillMaxWidth(),
+        colors = cardColors,
+        elevation = cardElevation
     ) {
-        Column(Modifier.padding(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = formatter.format(Date(originalLog.timestamp)),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = "$icon [${originalLog.category}]",
-                    color = color,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = originalLog.message,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            if (dozeReportData.isEmpty()) {
-                Text("Doze期间无明显应用活动。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 16.dp))
-            } else {
-                dozeReportData.forEach { appActivity ->
-                    Column(Modifier.padding(start = 8.dp, top = 4.dp)) {
-                        Text(
-                            buildAnnotatedString {
-                                withStyle(style = SpanStyle(fontWeight = FontWeight.Bold)) {
-                                    append("▶ ${appActivity.app_name}")
-                                }
-                                withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-                                    append(" (${appActivity.package_name})")
-                                }
-                                append(" - 总计: ${"%.3f".format(appActivity.total_cpu_seconds)}s")
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            lineHeight = 16.sp
-                        )
-
-                        if (appActivity.processes.size > 1 || (appActivity.processes.isNotEmpty() && appActivity.processes[0].process_name != appActivity.package_name)) {
-                            appActivity.processes.forEach { process ->
-                                Text(
-                                    text = "  - ${process.process_name}: ${"%.3f".format(process.cpu_seconds)}s",
-                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                                    modifier = Modifier.padding(start = 16.dp),
-                                    lineHeight = 16.sp
-                                )
-                            }
-                        }
-                    }
+        Column(
+            modifier = Modifier.padding(
+                horizontal = if(isReport) 12.dp else 0.dp,
+                vertical = if(isReport) 12.dp else 2.dp
+            )
+        ) {
+            // 第一部分：所有日志都有的通用标题行
+            val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+            val (icon, color) = getLogAppearance(originalLog.level)
+            val displayAppName = log.appName ?: originalLog.packageName
+            val annotatedString = buildAnnotatedString {
+                withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                    append(formatter.format(Date(originalLog.timestamp)))
                 }
+                append(" ")
+                withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
+                    append("$icon[${originalLog.category}]")
+                }
+                append(" ")
+                if (!displayAppName.isNullOrEmpty()) {
+                    append("应用 ‘")
+                    withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
+                        append(displayAppName)
+                    }
+                    append("’ ")
+                }
+                append(originalLog.message)
+            }
+            Text(
+                text = annotatedString,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 16.sp
+                )
+            )
+
+            // 第二部分：如果是报告，则显示详细内容
+            AnimatedVisibility(visible = isReport) {
+                ReportDetails(details = originalLog.details)
             }
         }
     }
 }
 
-
+/**
+ * [核心修复] 专门用于渲染报告详情的 Composable，从 LogItem 中分离出来以保持清晰。
+ */
 @Composable
-fun LogItem(log: UiLogEntry) {
-    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-    val originalLog = log.originalLog
-
-    val (icon, color) = getLogAppearance(originalLog.level)
-    val categoryString = originalLog.category
-
-    val displayAppName = log.appName ?: originalLog.packageName
-
-    val annotatedString = buildAnnotatedString {
-        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-            append(formatter.format(Date(originalLog.timestamp)))
-        }
-        append(" ")
-
-        withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-            append("$icon[$categoryString]")
-        }
-        append(" ")
-
-        if (!displayAppName.isNullOrEmpty()) {
-            append("应用 ‘")
-            withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
-                append(displayAppName)
+private fun ReportDetails(details: JsonElement?) {
+    val dozeReportData: List<DozeAppActivity> = remember(details) {
+        try {
+            if (details != null && !details.isJsonNull) {
+                val type = object : TypeToken<List<DozeAppActivity>>() {}.type
+                Gson().fromJson(details, type) ?: emptyList()
+            } else {
+                emptyList()
             }
-            append("’ ")
+        } catch (e: Exception) {
+            Log.e("ReportDetails", "Failed to parse Doze report details.", e)
+            emptyList()
         }
-
-        append(originalLog.message)
     }
 
-    Text(
-        text = annotatedString,
-        style = MaterialTheme.typography.bodySmall.copy(
-            fontFamily = FontFamily.Monospace,
-            lineHeight = 16.sp
-        ),
-        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
-    )
+    Spacer(Modifier.height(8.dp))
+
+    if (dozeReportData.isEmpty()) {
+        Text("Doze期间无明显应用活动。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 16.dp))
+    } else {
+        dozeReportData.take(5).forEach { appActivity ->
+            Column(Modifier.padding(start = 8.dp, top = 4.dp)) {
+                Text(
+                    buildAnnotatedString {
+                        withStyle(style = SpanStyle(fontWeight = FontWeight.Bold)) {
+                            append("▶ ${appActivity.app_name}")
+                        }
+                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                            append(" (${appActivity.package_name})")
+                        }
+                        append(" - 总计: ${"%.3f".format(appActivity.total_cpu_seconds)}s")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    lineHeight = 16.sp
+                )
+
+                appActivity.processes.sortedByDescending { it.cpu_seconds }.take(3).forEach { process ->
+                    Text(
+                        text = "  - ${process.process_name}: ${"%.3f".format(process.cpu_seconds)}s",
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        modifier = Modifier.padding(start = 16.dp),
+                        lineHeight = 16.sp
+                    )
+                }
+            }
+        }
+        if (dozeReportData.size > 5) {
+            Text(
+                text = "...等 ${dozeReportData.size - 5} 个其他应用。",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(start = 8.dp, top = 4.dp)
+            )
+        }
+    }
 }
 
 @Composable

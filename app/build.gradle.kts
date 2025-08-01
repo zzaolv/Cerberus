@@ -34,6 +34,7 @@ android {
                 "proguard-rules.pro"
             )
             proguardFile("proguard-rules-disabler.pro")
+            signingConfig = signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false

@@ -24,6 +24,7 @@
 #include <memory>
 #include <map>
 #include <unordered_set>
+#include <numeric>
 
 #define LOG_TAG "cerberusd_monitor_v28_audio_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -172,53 +173,67 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
-    std::set<AppInstanceKey> visible_keys;
-    std::string result = exec_shell_pipe_efficient({"dumpsys", "activity", "activities"});
-    std::stringstream ss(result);
-    std::string line;
+// [前台识别] 重构 get_visible_app_keys 函数
+VisibleAppsResult SystemMonitor::get_visible_app_keys() {
+    VisibleAppsResult result;
+    std::string dumpsys_output = exec_shell_pipe_efficient({"dumpsys", "activity", "activities"});
+    if (dumpsys_output.empty()) {
+        return result;
+    }
 
-    auto parse_and_insert = [&](const std::string& line_to_parse) {
+    std::vector<std::string> lines;
+    std::stringstream ss(dumpsys_output);
+    std::string line;
+    while(std::getline(ss, line)) {
+        lines.push_back(line);
+    }
+
+    // 只处理最后15行，足够覆盖摘要区域
+    size_t start_index = (lines.size() > 15) ? (lines.size() - 15) : 0;
+    
+    // 辅助解析函数
+    auto parse_line_for_apps = [&](const std::string& line_to_parse) {
+        std::set<AppInstanceKey> found_apps;
         std::stringstream line_ss(line_to_parse);
         std::string token;
-        int user_id = -1;
-        std::string package_name;
-
         while (line_ss >> token) {
-            if (token.length() > 1 && token[0] == 'u' && std::all_of(token.begin() + 1, token.end(), ::isdigit)) {
+            // 查找类似 u0a123 或 u999a123 的模式
+            size_t u_pos = token.find("/u");
+            if (u_pos != std::string::npos) {
                 try {
-                    user_id = std::stoi(token.substr(1));
-                    if (line_ss >> token) {
-                        size_t slash_pos = token.find('/');
-                        if (slash_pos != std::string::npos) {
-                            package_name = token.substr(0, slash_pos);
-                        }
-                        break;
+                    std::string package_name = token.substr(0, u_pos);
+                    // 跳过 /u，直接解析 user_id
+                    std::string user_part = token.substr(u_pos + 2);
+                    // 移除 'a' 后缀 (例如 u0a342)
+                    size_t a_pos = user_part.find('a');
+                    if (a_pos != std::string::npos) {
+                        user_part = user_part.substr(0, a_pos);
                     }
-                } catch (...) {
-                    user_id = -1;
-                }
+                    int user_id = std::stoi(user_part);
+                    found_apps.insert({package_name, user_id});
+                } catch (...) { /* ignore parse errors */ }
             }
         }
-        if (user_id != -1 && !package_name.empty()) {
-            visible_keys.insert({package_name, user_id});
-        }
+        return found_apps;
     };
-    
-    while (std::getline(ss, line)) {
-        if (line.find("ResumedActivity:") != std::string::npos) {
-            parse_and_insert(line);
-        } else if (line.find("VisibleActivityProcess:") != std::string::npos) {
-            std::string process_line = line.substr(line.find('[') + 1);
-            process_line = process_line.substr(0, process_line.find(']'));
-            std::stringstream pss(process_line);
-            std::string proc_record;
-            while(std::getline(pss, proc_record, ',')) {
-                 parse_and_insert(proc_record);
-            }
+
+    std::set<AppInstanceKey> resumed_keys;
+
+    for (size_t i = start_index; i < lines.size(); ++i) {
+        const auto& current_line = lines[i];
+        if (current_line.find("ResumedActivity:") != std::string::npos) {
+             resumed_keys = parse_line_for_apps(current_line);
+        } else if (current_line.find("VisibleActivityProcess:") != std::string::npos) {
+             result.true_foreground = parse_line_for_apps(current_line);
         }
     }
-    return visible_keys;
+
+    // 计算假前台：在 Resumed 但不在 Visible 的应用
+    std::set_difference(resumed_keys.begin(), resumed_keys.end(),
+                        result.true_foreground.begin(), result.true_foreground.end(),
+                        std::inserter(result.fake_foreground, result.fake_foreground.begin()));
+
+    return result;
 }
 
 std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
@@ -407,13 +422,14 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// [核心修复] 回归到更稳定可靠的、基于 'started' 状态的音频识别逻辑
+// [音频识别] 重构 update_audio_state 函数
 void SystemMonitor::update_audio_state() {
-    std::set<int> active_uids;
+    // 临时存储每个UID的所有音频会话状态 (1 for started, 0 for paused)
+    std::map<int, std::vector<int>> uid_session_states;
     std::unordered_set<std::string> ignored_usages = {"USAGE_ASSISTANCE_SONIFICATION", "USAGE_TOUCH_INTERACTION_RESPONSE"};
 
-    std::string result = exec_shell_pipe_efficient({"dumpsys", "audio"});
-    std::stringstream ss(result);
+    std::string dumpsys_output = exec_shell_pipe_efficient({"dumpsys", "audio"});
+    std::stringstream ss(dumpsys_output);
     std::string line;
 
     bool in_players_section = false;
@@ -426,12 +442,11 @@ void SystemMonitor::update_audio_state() {
         }
         
         if (line.find("ducked players piids:") != std::string::npos) {
-            break;
+            break; // 到达播放器列表末尾
         }
         
         if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
             try {
-                // 1. 首先检查并过滤掉系统提示音等无关播放器
                 bool is_ignored = false;
                 for (const auto& usage : ignored_usages) {
                     if (line.find(usage) != std::string::npos) {
@@ -441,43 +456,48 @@ void SystemMonitor::update_audio_state() {
                 }
                 if (is_ignored) continue;
 
-                // 2. 检查状态是否为 'started'
-                size_t state_pos = line.find(" state:");
-                if (state_pos != std::string::npos) {
-                    // 提高解析效率，只检查 'started' 关键字
-                    if (line.substr(state_pos + 7, 7) != "started") {
-                        continue;
-                    }
-                } else {
-                    continue; // 没有 state 字段，忽略
-                }
-
-                // 3. 只有当状态确定为 'started' 且非忽略类型时，才解析 UID
                 int uid = -1;
                 size_t upid_pos = line.find("u/pid:");
                 if (upid_pos != std::string::npos) {
                     std::stringstream line_ss(line.substr(upid_pos + 6));
                     line_ss >> uid;
                 }
-                
-                if (uid >= 10000) {
-                    active_uids.insert(uid);
+                if (uid < 10000) continue;
+
+                size_t state_pos = line.find(" state:");
+                if (state_pos != std::string::npos) {
+                    std::string state_str = line.substr(state_pos + 7);
+                    if (state_str.rfind("started", 0) == 0) {
+                        uid_session_states[uid].push_back(1);
+                    } else if (state_str.rfind("paused", 0) == 0) {
+                        uid_session_states[uid].push_back(0);
+                    }
                 }
-            } catch (const std::exception& e) {}
+            } catch (...) {}
+        }
+    }
+    
+    std::set<int> active_uids;
+    for (const auto& [uid, states] : uid_session_states) {
+        if (states.empty()) continue;
+        // 计算所有状态的乘积
+        int product = std::accumulate(states.begin(), states.end(), 1, std::multiplies<int>());
+        // 如果乘积为1，说明所有会话都是started
+        if (product == 1) {
+            active_uids.insert(uid);
         }
     }
     
     {
         std::lock_guard<std::mutex> lock(audio_uids_mutex_);
         if (uids_playing_audio_ != active_uids) {
-            std::stringstream log_ss;
-            for(int uid : active_uids) { log_ss << uid << " "; }
-            LOGI("Active audio UIDs changed (started policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
-                 uids_playing_audio_.size(), active_uids.size(), log_ss.str().c_str());
+            LOGI("Active audio UIDs changed. Old count: %zu, New count: %zu.", 
+                 uids_playing_audio_.size(), active_uids.size());
             uids_playing_audio_ = active_uids;
         }
     }
 }
+
 
 
 bool SystemMonitor::is_uid_playing_audio(int uid) {
