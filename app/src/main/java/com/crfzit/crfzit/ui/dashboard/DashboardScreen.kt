@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/ui/dashboard/DashboardScreen.kt
 package com.crfzit.crfzit.ui.dashboard
 
+import android.graphics.Bitmap
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
@@ -29,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
+import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppRuntimeState
 import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
@@ -91,7 +93,7 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
     }
 }
 
-// ... DashboardContent and other composables remain unchanged ...
+
 @Composable
 fun DashboardContent(
     globalStats: GlobalStats,
@@ -120,6 +122,85 @@ fun DashboardContent(
 }
 
 @Composable
+fun AppRuntimeCard(app: UiAppRuntime) {
+    val state = app.runtimeState
+    Card {
+        Row(
+            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Image(
+                // [内存优化] 这里是核心改动。我们不再直接使用Drawable，
+                // 而是让Coil通过我们自定义的AppIcon数据类和Fetcher来加载图标。
+                // 这实现了按需加载、缓存、分辨率和色深控制等所有优化。
+                painter = rememberAsyncImagePainter(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(AppIcon(state.packageName)) // 使用自定义数据类作为请求模型
+                        .size(128) // 限制图片加载的最大尺寸为128x128像素
+                        .bitmapConfig(Bitmap.Config.RGB_565)
+                        .placeholder(R.drawable.ic_launcher_foreground) // 使用一个轻量级占位符
+                        .error(R.drawable.ic_launcher_foreground)
+                        .build()
+                ),
+                contentDescription = app.appName,
+                modifier = Modifier.size(48.dp)
+            )
+            
+            Column(
+                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = app.appName,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (app.userId != 0) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_clone),
+                            contentDescription = "分身应用 (User ${app.userId})",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    AppStatusIcons(state = state)
+                }
+                
+                val resourceText = buildAnnotatedString {
+                    append("MEM: ${formatMemory(state.memUsageKb)}")
+                    if (state.swapUsageKb > 1024) {
+                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
+                            append(" (+${formatMemory(state.swapUsageKb)} S)")
+                        }
+                    }
+                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
+                }
+
+                Text(
+                    text = resourceText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Text(
+                    text = "状态：${formatStatus(state)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+// GlobalStatusArea, StatusGridItem, AppStatusIcons, 等其他Composable保持不变...
+
+@Composable
 fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
         (stats.totalMemKb - stats.availMemKb).toFloat() / stats.totalMemKb
@@ -135,8 +216,6 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val upSpeed = formatSpeed(speed.uploadSpeedBps)
 
     Column(modifier = Modifier.padding(bottom = 8.dp)) {
-        // [FIX] Removed activeProfileName as it's no longer in the model
-        // You can add a static or dynamic title here if needed
         Text(
             text = "系统状态",
             style = MaterialTheme.typography.titleMedium,
@@ -225,93 +304,17 @@ fun StatusGridItem(
     }
 }
 
-
-@Composable
-fun AppRuntimeCard(app: UiAppRuntime) {
-    val state = app.runtimeState
-    Card {
-        Row(
-            modifier = Modifier.padding(12.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Image(
-                painter = rememberAsyncImagePainter(
-                    ImageRequest.Builder(LocalContext.current)
-                        .data(app.icon)
-                        .placeholder(android.R.drawable.sym_def_app_icon)
-                        .error(android.R.drawable.sym_def_app_icon)
-                        .crossfade(true).build()
-                ),
-                contentDescription = app.appName,
-                modifier = Modifier.size(48.dp)
-            )
-            
-            Column(
-                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = app.appName,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    if (app.userId != 0) {
-                        Spacer(Modifier.width(4.dp))
-                        Icon(
-                            painter = painterResource(id = R.drawable.ic_clone),
-                            contentDescription = "分身应用 (User ${app.userId})",
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.secondary
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    AppStatusIcons(state = state)
-                }
-                
-                val resourceText = buildAnnotatedString {
-                    append("MEM: ${formatMemory(state.memUsageKb)}")
-                    if (state.swapUsageKb > 1024) {
-                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))) {
-                            append(" (+${formatMemory(state.swapUsageKb)} S)")
-                        }
-                    }
-                    append(" | CPU: ${"%.1f".format(state.cpuUsagePercent)}%")
-                }
-
-                Text(
-                    text = resourceText,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Text(
-                    text = "状态：${formatStatus(state)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-    }
-}
-
 @Composable
 fun AppStatusIcons(state: AppRuntimeState) {
     Row {
         val iconModifier = Modifier.padding(horizontal = 2.dp)
         if (state.isForeground) Text("▶️", iconModifier)
         if (state.isWhitelisted) Text("🛡️", iconModifier)
-
-        // [FIX] Removed hasPlayback etc. as they are no longer in the model
         if (state.displayStatus.uppercase() == "FROZEN") {
             Text("❄️", iconModifier)
         }
     }
 }
-
 
 @Composable
 fun ConnectionLoadingIndicator() {
@@ -348,8 +351,6 @@ private fun formatSpeed(bitsPerSecond: Long): Pair<String, String> {
 
 private fun formatStatus(state: AppRuntimeState): String {
     val status = state.displayStatus.uppercase()
-    
-    // [修复] 新的状态处理
     return when {
         status.startsWith("PENDING_FREEZE") -> {
             val time = status.substringAfter("(").substringBefore("s")

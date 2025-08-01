@@ -48,28 +48,28 @@ class DaemonRepository private constructor(
             }
         }
 
-    // [日志重构] 移除 getLogStream()
-    // fun getLogStream(): Flow<LogEntry> = ...
 
-    // [日志重构] 新增 getLogs() 函数
-    suspend fun getLogs(since: Long?): List<LogEntry>? {
+    // [分页加载] 修改getLogs函数，使其支持所有分页参数
+    suspend fun getLogs(
+        since: Long? = null,
+        before: Long? = null,
+        limit: Int? = null
+    ): List<LogEntry>? {
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
 
-        val requestPayload = GetLogsPayload(since = since)
+        val requestPayload = GetLogsPayload(since = since, before = before, limit = limit)
         val requestMsg = CerberusMessage(type = "query.get_logs", requestId = reqId, payload = requestPayload)
         tcpClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
-            // [修改] LogEntryPayload 现在也可能包含 details 字段
             val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
             val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
 
             if (message?.type == "resp.get_logs") {
                 message.payload.map { p ->
-                    // [修改] 将 details 字段也映射过来
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1, p.details)
                 }
             } else {
@@ -114,8 +114,8 @@ class DaemonRepository private constructor(
         }
 
     suspend fun getAllLogs(): List<LogEntry>? {
-        // [日志重构] 此函数现在代理到新的 getLogs 函数
-        return getLogs(null)
+        // [分页加载] 此函数现在代理到新的 getLogs 函数，用于初始加载
+        return getLogs(limit = 50)
     }
 
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->

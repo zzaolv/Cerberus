@@ -12,9 +12,8 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * [核心修复] 此仓库的职责被重新定义。
- * 它不再是所有应用列表的来源，而是一个按需提供应用元数据（如名称、图标）的工具。
- * 尤其重要的是，它只查询当前用户（通常是User 0）的应用信息。
+ * [内存优化] 此仓库现在是一个轻量级的元数据提供者。
+ * 它缓存的AppInfo对象不包含Drawable，因此缓存占用的内存非常小。
  */
 class AppInfoRepository private constructor(private val context: Context) {
 
@@ -33,7 +32,6 @@ class AppInfoRepository private constructor(private val context: Context) {
         }
     }
 
-    // [核心修复] getAppInfo不再需要userId。它只为给定的包名查找主用户的应用信息。
     suspend fun getAppInfo(packageName: String): AppInfo? {
         appInfoCache[packageName]?.let { return it }
 
@@ -50,7 +48,6 @@ class AppInfoRepository private constructor(private val context: Context) {
     private suspend fun loadAllInstalledApps() {
         withContext(Dispatchers.IO) {
             appInfoCache.clear()
-            // [核心修复] 只获取当前用户(user 0)的应用列表作为基础元数据
             val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                 .filterNotNull()
                 .mapNotNull { appInfo ->
@@ -70,7 +67,6 @@ class AppInfoRepository private constructor(private val context: Context) {
             val appInfo = packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
             createAppInfoFrom(appInfo)
         } catch (e: PackageManager.NameNotFoundException) {
-            // 如果分身应用在主空间不存在，这里会返回null，这是预期行为
             null
         }
     }
@@ -79,7 +75,8 @@ class AppInfoRepository private constructor(private val context: Context) {
         return AppInfo(
             packageName = appInfo.packageName,
             appName = appInfo.loadLabel(packageManager).toString(),
-            icon = appInfo.loadIcon(packageManager),
+            // [内存优化] 不再加载和存储Drawable对象
+            // icon = appInfo.loadIcon(packageManager),
             isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
             userId = 0 // 这个仓库获取的都是主用户空间的应用，因此userId固定为0
         )

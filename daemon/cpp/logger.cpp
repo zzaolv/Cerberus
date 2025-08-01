@@ -8,15 +8,11 @@
 #include <algorithm>
 #include <android/log.h>
 
-#define LOG_TAG "cerberusd_logger_v3_structured"
+#define LOG_TAG "cerberusd_logger_v4_pagination" // 版本号更新
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-std::shared_ptr<Logger> Logger::instance_ = nullptr;
-std::mutex Logger::instance_mutex_;
-
-// [修改] to_json() 现在会包含 details 字段
 json LogEntry::to_json() const {
     json j = {
         {"timestamp", timestamp_ms},
@@ -67,14 +63,13 @@ void Logger::stop() {
     }
 }
 
-// [修改] 增加 details 参数
 void Logger::log(LogLevel level, const std::string& category, const std::string& message, const std::string& package_name, int user_id, const json& details) {
     long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
-    
+
     LogEntry entry{timestamp, level, category, message, package_name, user_id, details};
-    
+
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         log_queue_.push_back(entry);
@@ -82,28 +77,42 @@ void Logger::log(LogLevel level, const std::string& category, const std::string&
     cv_.notify_one();
 }
 
-std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_ms, int limit) const {
+// [分页加载] 修改函数实现以支持分页
+std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_ms,
+                                     std::optional<long long> before_timestamp_ms,
+                                     int limit) const {
     std::vector<LogEntry> results;
-    
-    read_logs_from_file(results, since_timestamp_ms, since_timestamp_ms.has_value() ? -1 : limit);
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (const auto& entry : log_queue_) {
-            if (!since_timestamp_ms.has_value() || entry.timestamp_ms > since_timestamp_ms.value()) {
-                results.push_back(entry);
+    // 分页加载（before_timestamp_ms）和轮询新日志（since_timestamp_ms）是互斥的
+    if (before_timestamp_ms.has_value()) {
+        // 场景：加载历史记录的“上一页”
+        read_logs_from_file(results, std::nullopt, before_timestamp_ms, limit);
+    } else {
+        // 场景：加载初始页面或轮询新日志
+        read_logs_from_file(results, since_timestamp_ms, std::nullopt,
+                            since_timestamp_ms.has_value() ? -1 : limit);
+
+        // 如果是轮询新日志，也需要检查内存中的队列
+        if (since_timestamp_ms.has_value()) {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (const auto& entry : log_queue_) {
+                if (entry.timestamp_ms > since_timestamp_ms.value()) {
+                    results.push_back(entry);
+                }
             }
         }
     }
 
+    // 排序和去重逻辑保持不变，但现在处理的数据量大大减少了
     std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
         return a.timestamp_ms > b.timestamp_ms;
     });
-    
+
     results.erase(std::unique(results.begin(), results.end(), [](const auto& a, const auto& b) {
         return a.timestamp_ms == b.timestamp_ms && a.message == b.message;
     }), results.end());
 
+    // 对初始加载和分页加载应用limit，但不限制轮询
     if (results.size() > limit && !since_timestamp_ms.has_value()) {
         results.resize(limit);
     }
@@ -111,10 +120,14 @@ std::vector<LogEntry> Logger::get_logs(std::optional<long long> since_timestamp_
     return results;
 }
 
-void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<long long> since_timestamp_ms, int limit) const {
+// [分页加载] 扩展函数以处理before_timestamp_ms
+void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs,
+                                 std::optional<long long> since_timestamp_ms,
+                                 std::optional<long long> before_timestamp_ms,
+                                 int limit) const {
     std::string path_to_read = current_log_file_path_;
     if (!fs::exists(path_to_read)) return;
-    
+
     std::ifstream log_file(path_to_read);
     if (!log_file.is_open()) return;
 
@@ -123,16 +136,23 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<
     while (std::getline(log_file, line)) {
         lines.push_back(line);
     }
-    
+
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        // 如果已达到限制，则停止（limit为-1表示不限制）
         if (limit > 0 && out_logs.size() >= limit) break;
-        
+
         try {
             json j = json::parse(*it);
             long long timestamp = j.value("ts", 0LL);
 
+            // 轮询新日志的逻辑
             if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
-                break;
+                break; // 已找到比“最新”日志更旧的日志，停止
+            }
+
+            // 分页加载的逻辑
+            if (before_timestamp_ms.has_value() && timestamp >= before_timestamp_ms.value()) {
+                continue; // 跳过比“上一页最后一条”更新或相等的日志
             }
 
             LogEntry entry{
@@ -142,15 +162,14 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<
                 .message = j.value("msg", ""),
                 .package_name = j.value("pkg", ""),
                 .user_id = j.value("uid", -1),
-                // [修改] 读取 details 字段
                 .details = j.value("details", nullptr)
             };
             out_logs.push_back(entry);
         } catch (const json::exception& e) {
+            // ignore malformed lines
         }
     }
 }
-
 
 void Logger::ensure_log_file() {
     time_t now = time(nullptr);
@@ -171,7 +190,7 @@ void Logger::writer_thread_func() {
         cv_.wait(lock, [this]{ return !log_queue_.empty() || !is_running_; });
 
         if (!is_running_ && log_queue_.empty()) break;
-        
+
         std::deque<LogEntry> temp_queue;
         temp_queue.swap(log_queue_);
         lock.unlock();
@@ -186,7 +205,6 @@ void Logger::writer_thread_func() {
         }
 
         for (const auto& entry : temp_queue) {
-            // [修改] 写入文件时也包含 details
             json file_json = {
                 {"ts", entry.timestamp_ms},
                 {"lvl", static_cast<int>(entry.level)},
@@ -196,7 +214,7 @@ void Logger::writer_thread_func() {
             if (!entry.package_name.empty()) file_json["pkg"] = entry.package_name;
             if (entry.user_id != -1) file_json["uid"] = entry.user_id;
             if (!entry.details.is_null()) file_json["details"] = entry.details;
-            
+
             log_file << file_json.dump() << std::endl;
         }
     }

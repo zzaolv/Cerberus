@@ -17,6 +17,7 @@ import kotlinx.coroutines.withContext
 
 data class ConfigurationUiState(
     val isLoading: Boolean = true,
+    // [内存优化] allInstalledApps 列表现在非常轻量，因为它不包含图标
     val allInstalledApps: List<AppInfo> = emptyList(),
     val policies: Map<AppInstanceKey, AppPolicyPayload> = emptyMap(),
     val fullConfig: FullConfigPayload? = null,
@@ -57,6 +58,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
+            // [内存优化] 这两个调用现在都非常快且内存占用低
             val launchableApps = getAllLaunchableApps()
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
@@ -69,14 +71,12 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
             daemonPolicyMap.values.forEach { policy ->
                 val key = AppInstanceKey(policy.packageName, policy.userId)
-
-                // [核心修复] 只有当应用是分身应用(userId != 0)且不在现有列表中时，才进行补充
                 if (!finalAppMap.containsKey(key) && policy.userId != 0) {
                     val baseAppInfo = appInfoRepository.getAppInfo(policy.packageName)
                     finalAppMap[key] = AppInfo(
                         packageName = policy.packageName,
                         appName = baseAppInfo?.appName ?: policy.packageName,
-                        icon = baseAppInfo?.icon,
+                        // [内存优化] 不再加载和存储Drawable对象
                         isSystemApp = baseAppInfo?.isSystemApp ?: false,
                         userId = policy.userId
                     )
@@ -105,7 +105,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                     AppInfo(
                         packageName = appInfo.packageName,
                         appName = appInfo.loadLabel(packageManager).toString(),
-                        icon = appInfo.loadIcon(packageManager),
                         isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
                         userId = 0
                     )

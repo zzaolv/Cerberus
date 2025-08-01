@@ -40,7 +40,6 @@ struct LogEntry {
     std::string message;
     std::string package_name;
     int user_id;
-    // [新增] 用于存放结构化数据的字段
     json details;
 
     json to_json() const;
@@ -54,18 +53,24 @@ public:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    // [修改] 增加details参数
     void log(LogLevel level, const std::string& category, const std::string& message,
              const std::string& package_name = "", int user_id = -1, const json& details = nullptr);
 
-    std::vector<LogEntry> get_logs(std::optional<long long> since_timestamp_ms, int limit) const;
+    // [分页加载] 修改get_logs接口，增加 before_timestamp_ms 参数用于分页
+    std::vector<LogEntry> get_logs(std::optional<long long> since_timestamp_ms,
+                                   std::optional<long long> before_timestamp_ms,
+                                   int limit) const;
     void stop();
 
 private:
     explicit Logger(const std::string& log_dir_path);
     void writer_thread_func();
     void ensure_log_file();
-    void read_logs_from_file(std::vector<LogEntry>& out_logs, std::optional<long long> since_timestamp_ms, int limit) const;
+    // [分页加载] 修改 read_logs_from_file 接口
+    void read_logs_from_file(std::vector<LogEntry>& out_logs,
+                             std::optional<long long> since_timestamp_ms,
+                             std::optional<long long> before_timestamp_ms,
+                             int limit) const;
 
     static std::shared_ptr<Logger> instance_;
     static std::mutex instance_mutex_;

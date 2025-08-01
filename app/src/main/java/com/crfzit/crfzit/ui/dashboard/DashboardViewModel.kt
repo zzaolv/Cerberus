@@ -2,7 +2,8 @@
 package com.crfzit.crfzit.ui.dashboard
 
 import android.app.Application
-import android.graphics.drawable.Drawable
+// [内存优化] 不再需要Drawable
+// import android.graphics.drawable.Drawable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppRuntimeState
@@ -17,7 +18,8 @@ import kotlinx.coroutines.launch
 data class UiAppRuntime(
     val runtimeState: AppRuntimeState,
     val appName: String,
-    val icon: Drawable?,
+    // [内存优化] 移除 icon 字段
+    // val icon: Drawable?,
     val isSystem: Boolean,
     val userId: Int
 )
@@ -33,7 +35,6 @@ data class DashboardUiState(
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
 
-    // 架构重构：获取唯一的单例实例
     private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val networkMonitor = NetworkMonitor()
@@ -43,6 +44,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
+            // 预热应用信息缓存，但不加载图标
             appInfoRepository.getAllApps(forceRefresh = true)
 
             combine(
@@ -53,12 +55,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 
                 val uiAppRuntimes = dashboardPayload.appsRuntimeState
                     .mapNotNull { runtimeState ->
+                        // appInfoRepository 现在返回不含图标的轻量级对象
                         val appInfo = appInfoRepository.getAppInfo(runtimeState.packageName)
                         appInfo?.let {
                             UiAppRuntime(
                                 runtimeState = runtimeState,
                                 appName = it.appName,
-                                icon = it.icon,
+                                // [内存优化] 不再传递 icon
+                                // icon = it.icon,
                                 isSystem = it.isSystemApp,
                                 userId = runtimeState.userId
                             )
@@ -100,6 +104,5 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         super.onCleared()
-        // 架构重构：ViewModel不再负责停止Repository
     }
 }

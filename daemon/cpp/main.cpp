@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v30_warmup" // 版本号更新
+#define LOG_TAG "cerberusd_main_v31_pagination" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -37,7 +37,7 @@ std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
 
-// handle_client_message, handle_client_disconnect, etc. 保持不变...
+
 void handle_client_message(int client_fd, const std::string& message_str) {
     try {
         json msg = json::parse(message_str);
@@ -52,21 +52,30 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
+        // [分页加载] 修改消息处理以支持新的分页参数
         if (type == "query.get_logs") {
-            long long since_ts = msg.value("payload", json::object()).value("since", 0LL);
-            auto logs = g_logger->get_logs(since_ts > 0 ? std::optional(since_ts) : std::nullopt, 200);
-            
+            const auto& payload_json = msg.value("payload", json::object());
+            long long since_ts = payload_json.value("since", 0LL);
+            long long before_ts = payload_json.value("before", 0LL);
+            int limit = payload_json.value("limit", 200);
+
+            auto logs = g_logger->get_logs(
+                since_ts > 0 ? std::optional(since_ts) : std::nullopt,
+                before_ts > 0 ? std::optional(before_ts) : std::nullopt,
+                limit
+            );
+
             json log_array = json::array();
             for(const auto& log : logs) { log_array.push_back(log.to_json()); }
-            
-            g_server->send_message(client_fd, json{ 
-                {"type", "resp.get_logs"}, 
-                {"req_id", msg.value("req_id", "")}, 
-                {"payload", log_array} 
+
+            g_server->send_message(client_fd, json{
+                {"type", "resp.get_logs"},
+                {"req_id", msg.value("req_id", "")},
+                {"payload", log_array}
             }.dump());
             return;
-        } 
-        
+        }
+
         if (type == "query.get_history_stats") {
             auto records = g_ts_db->get_all_records();
             json record_array = json::array();
@@ -97,8 +106,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
                 notify_probe_of_config_change();
             }
-            g_top_app_refresh_tickets = 1; 
-        } 
+            g_top_app_refresh_tickets = 1;
+        }
         else if (type == "cmd.set_master_config") {
             MasterConfig cfg;
             const auto& payload = msg.at("payload");
@@ -106,7 +115,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             cfg.is_timed_unfreeze_enabled = payload.value("is_timed_unfreeze_enabled", true);
             cfg.timed_unfreeze_interval_sec = payload.value("timed_unfreeze_interval_sec", 1800);
             g_state_manager->update_master_config(cfg);
-        } 
+        }
         else if (type == "query.refresh_dashboard") {
             broadcast_dashboard_update();
         } else if (type == "query.get_all_policies") {
@@ -118,6 +127,9 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
+
+// 其他函数 (handle_client_disconnect, broadcast_dashboard_update, worker_thread_func, main, etc.) 保持不变...
+
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);
     if (client_fd == g_probe_fd.load()) {
@@ -150,8 +162,8 @@ void signal_handler(int signum) {
 
 void worker_thread_func() {
     LOGI("Worker thread started.");
-    g_top_app_refresh_tickets = 2; 
-    
+    g_top_app_refresh_tickets = 2;
+
     int reconcile_countdown = 15;
     int audio_scan_countdown = 3;
     int location_scan_countdown = 15;
@@ -173,14 +185,14 @@ void worker_thread_func() {
         if (g_top_app_refresh_tickets > 0) {
             g_top_app_refresh_tickets--;
             if (g_state_manager->handle_top_app_change_fast()) state_changed = true;
-            audit_countdown = 30; 
+            audit_countdown = 30;
         }
-        
+
         if (--audit_countdown <= 0) {
             if (g_state_manager->evaluate_and_execute_strategy()) state_changed = true;
             audit_countdown = 30;
         }
-        
+
         if (g_state_manager->tick_state_machine()) {
             state_changed = true;
         }
@@ -234,7 +246,7 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
-    
+
     try {
         if (!fs::exists(DATA_DIR)) fs::create_directories(DATA_DIR);
         if (!fs::exists(LOG_DIR)) fs::create_directories(LOG_DIR);
@@ -249,25 +261,24 @@ int main(int argc, char *argv[]) {
     g_logger = Logger::get_instance(LOG_DIR);
     g_ts_db = TimeSeriesDatabase::get_instance();
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
-    
-    // [新增] 调用启动预热函数
+
     g_state_manager->initial_full_scan_and_warmup();
-    
+
     g_logger->log(LogLevel::EVENT, "Daemon", "守护进程已启动");
-    
+
     g_sys_monitor->start_top_app_monitor();
     g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
-    
+
     const int DAEMON_PORT = 28900;
     g_server = std::make_unique<UdsServer>(DAEMON_PORT);
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
     g_server->run();
-    
+
     g_is_running = false;
     if(g_worker_thread.joinable()) g_worker_thread.join();
-    
+
     g_sys_monitor->stop_top_app_monitor();
     g_sys_monitor->stop_network_snapshot_thread();
 

@@ -72,8 +72,8 @@ data class FullConfigPayload(
     val exemptConfig: ExemptConfig,
     @SerializedName("policies")
     val policies: List<AppPolicyPayload>,
-    @SerializedName("frozen_uids") 
-    val frozenUids: List<Int>? = null 
+    @SerializedName("frozen_uids")
+    val frozenUids: List<Int>? = null
 )
 
 data class MasterConfig(
@@ -116,7 +116,6 @@ data class LogEntryPayload(
     val message: String,
     @SerializedName("package_name") val packageName: String?,
     @SerializedName("user_id") val userId: Int?,
-    // [新增] 对应后端的 details 字段
     val details: JsonElement? = null
 )
 
@@ -136,7 +135,9 @@ data class MetricsRecordPayload(
     @SerializedName("is_location_active") val isLocationActive: Boolean
 )
 
-// [日志重构] 新增用于日志请求的Payload
+// [分页加载] 扩展日志请求Payload
 data class GetLogsPayload(
-    val since: Long? = null
+    val since: Long? = null,
+    val before: Long? = null,
+    val limit: Int? = null
 )

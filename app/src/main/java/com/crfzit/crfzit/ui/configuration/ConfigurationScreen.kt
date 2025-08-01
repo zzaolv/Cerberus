@@ -1,6 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/ui/configuration/ConfigurationScreen.kt
 package com.crfzit.crfzit.ui.configuration
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -21,11 +22,11 @@ import androidx.navigation.NavController
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.crfzit.crfzit.R
+import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.AppPolicyPayload
 
-// [修复] 将此枚举移至此文件，以解决之前因文件内容错误导致的引用失败
 enum class Policy(val value: Int, val displayName: String) {
     EXEMPTED(0, "豁免"),
     STANDARD(2, "智能"),
@@ -44,7 +45,6 @@ fun ConfigurationScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
 
-    // 筛选和排序逻辑现在从ViewModel中获取，保持UI的整洁
     val filteredApps = remember(uiState.searchQuery, uiState.showSystemApps, uiState.policies) {
         viewModel.getFilteredAndSortedApps()
     }
@@ -87,7 +87,6 @@ fun ConfigurationScreen(
                 ) {
                     items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
                         val key = AppInstanceKey(appInfo.packageName, appInfo.userId)
-                        // 从state中获取最新的策略，如果不存在则使用默认值
                         val policyPayload = uiState.policies[key]
                             ?: AppPolicyPayload(appInfo.packageName, appInfo.userId, Policy.EXEMPTED.value)
 
@@ -112,7 +111,6 @@ fun AppPolicyItem(
     onPolicyChange: (Policy) -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
-    // 豁免的应用半透明显示，以示区别
     val itemAlpha = if (policy == Policy.EXEMPTED) 0.7f else 1.0f
 
     Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
@@ -123,12 +121,15 @@ fun AppPolicyItem(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
+                // [内存优化] 与DashboardScreen同样的核心改动，使用Coil按需加载
                 painter = rememberAsyncImagePainter(
-                    ImageRequest.Builder(LocalContext.current)
-                        .data(appInfo.icon)
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(AppIcon(appInfo.packageName))
+                        .size(128)
+                        .bitmapConfig(Bitmap.Config.RGB_565)
                         .placeholder(R.drawable.ic_launcher_foreground)
                         .error(R.drawable.ic_launcher_foreground)
-                        .crossfade(true).build()
+                        .build()
                 ),
                 contentDescription = appInfo.appName,
                 modifier = Modifier.size(40.dp)
@@ -161,7 +162,6 @@ fun AppPolicyItem(
                     expanded = showMenu,
                     onDismissRequest = { showMenu = false }
                 ) {
-                    // 只提供用户可选的策略
                     listOf(Policy.EXEMPTED, Policy.STANDARD, Policy.STRICT).forEach { p ->
                         DropdownMenuItem(
                             text = {

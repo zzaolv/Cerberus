@@ -3,7 +3,7 @@ package com.crfzit.crfzit.ui.logs
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,7 +24,6 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,40 +67,69 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                items(
+                itemsIndexed(
                     items = uiState.logs,
-                    key = { log ->
-                        "${log.originalLog.timestamp}-${log.originalLog.message}"
+                    key = { _, log -> // 使用 index 和内容作为 key
+                        "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}"
                     }
-                ) { log ->
-                    // [核心修改] 条件渲染
+                ) { index, log ->
                     if (log.originalLog.category == "报告" && log.originalLog.details != null) {
                         ReportLogItem(log)
                     } else {
                         LogItem(log)
                     }
                 }
+
+                // [分页加载] 在列表末尾显示加载指示器
+                if (uiState.isLoadingMore) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(8.dp),
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                }
+            }
+
+            // [分页加载] 触发加载更多的逻辑
+            val layoutInfo = listState.layoutInfo
+            val shouldLoadMore = remember(layoutInfo) {
+                derivedStateOf {
+                    val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
+                    lastVisibleItem != null && lastVisibleItem.index >= layoutInfo.totalItemsCount - 5 // 提前5个item开始加载
+                }
+            }
+
+            LaunchedEffect(shouldLoadMore.value) {
+                if (shouldLoadMore.value) {
+                    viewModel.loadMoreLogs()
+                }
             }
         }
     }
 }
 
-// [新增] Doze报告的数据模型
 data class DozeProcessActivity(val process_name: String, val cpu_seconds: Double)
 data class DozeAppActivity(val app_name: String, val package_name: String, val total_cpu_seconds: Double, val processes: List<DozeProcessActivity>)
 
-// [新增] 用于显示Doze报告的Composable
 @Composable
 fun ReportLogItem(log: UiLogEntry) {
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val originalLog = log.originalLog
     val (icon, color) = getLogAppearance(originalLog.level)
-    
+
+    // [修复Doze日志解析] 将JsonElement转换为字符串再进行解析
     val dozeReportData: List<DozeAppActivity> = remember(originalLog.details) {
         try {
             val type = object : TypeToken<List<DozeAppActivity>>() {}.type
-            Gson().fromJson(originalLog.details, type) ?: emptyList()
+            // 核心修复点：使用 .toString()
+            Gson().fromJson(originalLog.details.toString(), type) ?: emptyList()
         } catch (e: Exception) {
+            Log.e("ReportLogItem", "Failed to parse Doze report details: ${e.message}")
             emptyList()
         }
     }
@@ -131,9 +159,9 @@ fun ReportLogItem(log: UiLogEntry) {
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            
+
             Spacer(Modifier.height(8.dp))
-            
+
             if (dozeReportData.isEmpty()) {
                 Text("Doze期间无明显应用活动。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 16.dp))
             } else {
@@ -183,7 +211,6 @@ fun LogItem(log: UiLogEntry) {
 
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-            // [修正] 使用 .timestamp 替换 .timestamp_ms
             append(formatter.format(Date(originalLog.timestamp)))
         }
         append(" ")
