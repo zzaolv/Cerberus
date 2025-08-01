@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v31_report_fix" // 版本号更新
+#define LOG_TAG "cerberusd_state_v32_log_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -21,12 +21,18 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// status_to_string, DozeManager 的实现保持不变...
+// [修复] 增加对冻结方式的描述
 static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
-    if (app.current_status == AppRuntimeState::Status::STOPPED) return "STOPPED";
-    if (app.current_status == AppRuntimeState::Status::FROZEN) return "FROZEN";
-    if (app.is_foreground) return "FOREGROUND";
-    if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "EXEMPTED_BACKGROUND";
+    if (app.current_status == AppRuntimeState::Status::STOPPED) return "未运行";
+    if (app.current_status == AppRuntimeState::Status::FROZEN) {
+        switch (app.freeze_method) {
+            case AppRuntimeState::FreezeMethod::CGROUP: return "已冻结 (V2)";
+            case AppRuntimeState::FreezeMethod::SIGSTOP: return "已冻结 (SIG)";
+            default: return "已冻结";
+        }
+    }
+    if (app.is_foreground) return "前台运行";
+    if (app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) return "后台运行 (已豁免)";
     if (app.background_since > 0) {
         time_t now = time(nullptr);
         int timeout_sec = 0;
@@ -40,16 +46,17 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
         }
         int remaining = timeout_sec - (now - app.background_since);
         if (remaining < 0) remaining = 0;
-        return "PENDING_FREEZE (" + std::to_string(remaining) + "s)";
+        return "等待冻结 (" + std::to_string(remaining) + "s)";
     }
     if (app.observation_since > 0) {
         time_t now = time(nullptr);
         int remaining = 10 - (now - app.observation_since);
         if (remaining < 0) remaining = 0;
-        return "OBSERVING (" + std::to_string(remaining) + "s)";
+        return "后台观察中 (" + std::to_string(remaining) + "s)";
     }
-    return "BACKGROUND";
+    return "后台运行";
 }
+
 
 DozeManager::DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor)
     : logger_(logger), action_executor_(executor) {
@@ -571,9 +578,7 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [修正] 重构Doze报告生成逻辑
 void StateManager::generate_doze_exit_report() {
-    // 1. 定义一个临时结构体来存储报告所需的所有信息
     struct AppCpuActivity {
         std::string app_name;
         std::string package_name;
@@ -584,7 +589,6 @@ void StateManager::generate_doze_exit_report() {
     const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
 
-    // 2. 收集数据，并存储更完整的信息（包括包名）
     for (const auto& [key, app] : managed_apps_) {
         if (app.pids.empty()) continue;
         
@@ -602,11 +606,9 @@ void StateManager::generate_doze_exit_report() {
         }
     }
     
-    // 3. 排序，确保数据按CPU时间降序排列
     std::sort(activity_list.begin(), activity_list.end(), 
               [](const AppCpuActivity& a, const AppCpuActivity& b) { return a.cpu_seconds > b.cpu_seconds; });
 
-    // 4. 构建完整的报告字符串
     std::stringstream report_ss;
     report_ss << "Doze期间应用的CPU活跃时间:";
 
@@ -614,7 +616,6 @@ void StateManager::generate_doze_exit_report() {
         report_ss << "\n| | 无明显应用活动。";
     } else {
         for (const auto& activity : activity_list) {
-            // 如果app_name和package_name相同，只显示一个
             std::string display_name = (activity.app_name == activity.package_name) 
                                        ? activity.package_name 
                                        : activity.app_name + " (" + activity.package_name + ")";
@@ -623,7 +624,6 @@ void StateManager::generate_doze_exit_report() {
         }
     }
 
-    // 5. 使用一次log调用来记录整个报告，确保原子性
     logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
 }
 
@@ -682,6 +682,7 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         
         action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
         app.current_status = AppRuntimeState::Status::RUNNING;
+        app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
         app.observation_since = time(nullptr);
         app.background_since = 0;
         app.freeze_retry_count = 0;
@@ -764,8 +765,9 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
 
                 if (is_now_foreground) {
                     app.has_logged_rogue_warning = false;
+                    // [日志修复] 仅当应用从后台变为前台时记录日志
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
-                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
+                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开 (权威)", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     }
                     if (unfreeze_and_observe_nolock(app, "切换至前台(权威)")) {
@@ -775,6 +777,7 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
                     app.background_since = 0;
                     app.freeze_retry_count = 0;
                 } else {
+                    // [日志修复] 仅当应用从前台变为后台时记录日志
                      if (prev_foreground_keys.count(key) > 0) {
                         long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                         long long current_runtime_ms = (app.last_foreground_timestamp_ms > 0) ? (now_ms - app.last_foreground_timestamp_ms) : 0;
@@ -840,8 +843,9 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
 
                 if (is_now_foreground) {
                     app.has_logged_rogue_warning = false;
+                    // [日志修复] 仅当应用从后台变为前台时记录日志
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
-                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开", app.package_name, app.user_id);
+                         logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开 (快速)", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     }
                     if (unfreeze_and_observe_nolock(app, "切换至前台(快速)")) {
@@ -851,6 +855,7 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
                     app.background_since = 0;
                     app.freeze_retry_count = 0;
                 } else {
+                    // [日志修复] 仅当应用从前台变为后台时记录日志
                      if (prev_foreground_keys.count(key) > 0) {
                         long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                         long long current_runtime_ms = (app.last_foreground_timestamp_ms > 0) ? (now_ms - app.last_foreground_timestamp_ms) : 0;
@@ -875,6 +880,7 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
     return state_has_changed;
 }
 
+// [日志修复] 移除此函数中的日志记录，仅作为信号触发
 void StateManager::on_app_foreground_event(const json& payload) {
     try {
         std::string package_name = payload.value("package_name", "");
@@ -882,7 +888,6 @@ void StateManager::on_app_foreground_event(const json& payload) {
         if (package_name.empty()) return;
 
         LOGD("EVENT: Received foreground event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
-        
         g_top_app_refresh_tickets = 1;
 
     } catch (const json::exception& e) {
@@ -890,6 +895,7 @@ void StateManager::on_app_foreground_event(const json& payload) {
     }
 }
 
+// [日志修复] 移除此函数中的日志记录，仅作为信号触发
 void StateManager::on_app_background_event(const json& payload) {
     try {
         std::string package_name = payload.value("package_name", "");
@@ -898,22 +904,13 @@ void StateManager::on_app_background_event(const json& payload) {
         
         LOGD("EVENT: Received background event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
 
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            AppInstanceKey key = {package_name, user_id};
-            auto it = managed_apps_.find(key);
-            if (it != managed_apps_.end() && it->second.is_foreground) {
-                it->second.is_foreground = false;
-                it->second.observation_since = time(nullptr);
-            }
-        }
-        
         g_top_app_refresh_tickets = 1;
 
     } catch (const json::exception& e) {
         LOGE("Error processing background event: %s", e.what());
     }
 }
+
 
 void StateManager::on_proactive_unfreeze_request(const json& payload) {
     try {
@@ -928,14 +925,10 @@ void StateManager::on_proactive_unfreeze_request(const json& payload) {
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
             if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
-                 logger_->log(LogLevel::ACTION_UNFREEZE, "预解冻", "为响应启动请求而解冻", package_name, user_id);
-                 action_executor_->unfreeze(key, it->second.pids);
-                 it->second.current_status = AppRuntimeState::Status::RUNNING;
-                 it->second.background_since = 0;
-                 it->second.observation_since = 0;
-                 it->second.freeze_retry_count = 0;
-                 
-                 broadcast_dashboard_update();
+                 if(unfreeze_and_observe_nolock(it->second, "PROACTIVE_START")) {
+                    broadcast_dashboard_update();
+                    notify_probe_of_config_change();
+                 }
             }
         }
     } catch (const json::exception& e) {
@@ -1152,15 +1145,25 @@ bool StateManager::check_timers() {
                     int freeze_result = action_executor_->freeze(key, pids_to_freeze);
 
                     switch (freeze_result) {
-                        case 0:
+                        case 0: // Cgroup
                             app.current_status = AppRuntimeState::Status::FROZEN;
-                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结", app.package_name, app.user_id);
+                            app.freeze_method = AppRuntimeState::FreezeMethod::CGROUP;
+                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结 (Cgroup)", app.package_name, app.user_id);
                             schedule_timed_unfreeze(app);
                             probe_config_needs_update = true;
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
-                        case 1:
+                        case 1: // SIGSTOP
+                            app.current_status = AppRuntimeState::Status::FROZEN;
+                            app.freeze_method = AppRuntimeState::FreezeMethod::SIGSTOP;
+                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结 (SIGSTOP)", app.package_name, app.user_id);
+                            schedule_timed_unfreeze(app);
+                            probe_config_needs_update = true;
+                            app.background_since = 0;
+                            app.freeze_retry_count = 0;
+                            break;
+                        case 2: // Soft Failure
                             app.freeze_retry_count++;
                             if (app.freeze_retry_count > MAX_FREEZE_RETRIES) {
                                 logger_->log(LogLevel::WARN, "冻结", "多次尝试冻结失败，已放弃", app.package_name, app.user_id);
@@ -1171,8 +1174,7 @@ bool StateManager::check_timers() {
                                 app.background_since = now; 
                             }
                             break;
-                        case -1:
-                        default:
+                        default: // Hard Failure
                              logger_->log(LogLevel::ERROR, "冻结", "冻结遇到致命错误，已中止", app.package_name, app.user_id);
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
@@ -1214,7 +1216,7 @@ void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
             unfrozen_timeline_[current_index] = app.uid;
             app.scheduled_unfreeze_idx = current_index;
             LOGD("TIMELINE: Scheduled timed unfreeze for %s (uid %d) at index %u.", app.package_name.c_str(), app.uid, current_index);
-            logger_->log(LogLevel::TIMER, "定时器", "已计划定时解冻", app.package_name, app.user_id);
+            // [日志修复] 此处不记录日志，统一在执行时记录
             return;
         }
     }
@@ -1237,8 +1239,9 @@ bool StateManager::check_timed_unfreeze() {
             if (app.uid == uid_to_unfreeze) {
                 if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
                     LOGI("TIMELINE: Executing timed unfreeze for %s.", app.package_name.c_str());
+                    // [日志修复] 在unfreeze_and_observe_nolock中已经记录了标准解冻日志，此处增加一条定时器日志
+                    logger_->log(LogLevel::TIMER, "定时器", "执行定时解冻", app.package_name, app.user_id);
                     if(unfreeze_and_observe_nolock(app, "定时器唤醒")) {
-                       logger_->log(LogLevel::TIMER, "定时器", "执行定时解冻", app.package_name, app.user_id);
                        state_changed = true;
                     }
                 }
@@ -1273,6 +1276,7 @@ bool StateManager::perform_deep_scan() {
                          cancel_timed_unfreeze(app);
                     }
                     app.current_status = AppRuntimeState::Status::STOPPED;
+                    app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
                     app.is_foreground = false;
                     app.background_since = 0;
                     app.observation_since = 0;
@@ -1349,7 +1353,8 @@ json StateManager::get_dashboard_payload() {
     
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
-        if (app.pids.empty() && app.config.policy == AppPolicy::EXEMPTED && !app.is_foreground) {
+        // [修复] 只有正在运行的应用才应出现在仪表盘
+        if (app.pids.empty()) {
             continue;
         }
         json app_json;
@@ -1561,6 +1566,7 @@ void StateManager::remove_pid_from_app(int pid) {
             app->observation_since = 0;
             app->freeze_retry_count = 0;
             app->undetected_since = 0;
+            app->freeze_method = AppRuntimeState::FreezeMethod::NONE;
             cancel_timed_unfreeze(*app);
         }
     }

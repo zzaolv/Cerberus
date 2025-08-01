@@ -15,8 +15,8 @@ public:
     ~ActionExecutor();
 
     /**
-     * @brief 尝试冻结一个应用实例，采用最终的“物理验证乐观”策略。
-     * @return 0: 成功 | 1: 软失败，需要重试 | -1: 彻底失败
+     * @brief 尝试冻结一个应用实例，采用带物理验证的策略。
+     * @return 0: Cgroup冻结成功 | 1: SIGSTOP后备方案成功 | 2: 软失败(可重试) | -1: 彻底失败
      */
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
     
@@ -26,13 +26,17 @@ private:
     bool initialize_binder();
     void cleanup_binder();
     
+    /**
+     * @brief 冻结/解冻Binder
+     * @return 0: 成功 | 2: 软失败(EAGAIN) | -1: 致命失败
+     */
     int handle_binder_freeze(const std::vector<int>& pids, bool freeze);
     
     /**
-     * @brief [核心] 通过检查基于UID的cgroup.freeze文件来验证进程是否被物理冻结。
+     * @brief [核心] 通过检查我们自己创建的cgroup.freeze文件来验证进程是否被物理冻结。
      * @return true 如果进程被cgroup冻结，否则 false。
      */
-    bool is_pid_frozen_by_uid_cgroup(int pid);
+    bool is_pid_frozen_by_cgroup(int pid, const AppInstanceKey& key);
 
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();

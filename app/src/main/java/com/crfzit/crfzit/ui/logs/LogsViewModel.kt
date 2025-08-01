@@ -54,9 +54,9 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch {
             while (true) {
-                delay(5000)
+                // [修复] 轮询间隔调整为更合理的3秒
+                delay(3000)
                 try {
-                    // [修正] 使用 .timestamp 替换 .timestamp_ms
                     val latestTimestamp = _uiState.value.logs.firstOrNull()?.originalLog?.timestamp
 
                     val newLogs = daemonRepository.getLogs(since = latestTimestamp)
@@ -65,9 +65,15 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
                         val newUiLogs = newLogs.map { mapToUiLog(it) }
 
                         _uiState.update { currentState ->
-                            // [修正] 使用 .timestamp 替换 .timestamp_ms
-                            val combinedLogs = (newUiLogs + currentState.logs)
-                                .distinctBy { it.originalLog.timestamp.toString() + it.originalLog.message }
+                            // [修复] 采用更健壮的合并与去重逻辑
+                            val currentLogsMap = currentState.logs.associateBy {
+                                it.originalLog.timestamp.toString() + it.originalLog.message + it.originalLog.packageName
+                            }
+                            val newLogsMap = newUiLogs.associateBy {
+                                it.originalLog.timestamp.toString() + it.originalLog.message + it.originalLog.packageName
+                            }
+                            
+                            val combinedLogs = (currentLogsMap + newLogsMap).values.toList()
                                 .sortedByDescending { it.originalLog.timestamp }
 
                             currentState.copy(logs = combinedLogs)

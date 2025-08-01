@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v14_aggressive"
+#define LOG_TAG "cerberusd_action_v15_verify"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -31,40 +31,49 @@ ActionExecutor::~ActionExecutor() {
     cleanup_binder();
 }
 
-// [核心修复] 实现"主动压制"策略
+// [核心重构] 实现带物理验证的冻结流程并返回明确的结果
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (pids.empty()) return 0;
 
     int binder_result = handle_binder_freeze(pids, true);
 
-    if (binder_result < 0) {
+    if (binder_result == -1) { // 致命错误
         LOGE("Binder freeze for %s failed critically. Rolling back...", key.first.c_str());
         handle_binder_freeze(pids, false);
-        return -1;
+        return -1; // -1: 彻底失败
     }
 
-    // 新策略：如果遇到软失败 (EAGAIN)，立即升级为 SIGSTOP
-    if (binder_result > 0) {
-        LOGW("Binder freeze for %s was resisted (EAGAIN). Escalating to SIGSTOP.", key.first.c_str());
-        freeze_sigstop(pids); // 强制暂停
-        // 即使SIGSTOP了，我们依然尝试cgroup，因为它更节能
-        bool cgroup_ok = freeze_cgroup(key, pids);
-        if (!cgroup_ok) {
-             LOGW("Cgroup freeze failed for %s after SIGSTOP.", key.first.c_str());
-        }
-        // 报告成功，因为进程已经被暂停了
-        return 0;
+    if (binder_result == 2) { // 软失败 (EAGAIN)
+        LOGW("Binder freeze for %s was resisted (EAGAIN). Escalating to SIGSTOP as fallback.", key.first.c_str());
+        freeze_sigstop(pids);
+        return 1; // 1: SIGSTOP 成功
     }
     
-    // 原有逻辑：Binder成功，继续cgroup
+    // Binder 成功，尝试 Cgroup 冻结
     LOGI("Binder freeze phase for %s completed. Proceeding with physical freeze.", key.first.c_str());
-    bool physical_ok = freeze_cgroup(key, pids);
-    if (!physical_ok) {
+    bool cgroup_ok = freeze_cgroup(key, pids);
+
+    if (cgroup_ok) {
+        // 验证 Cgroup 是否真的生效
+        bool verified = false;
+        if (!pids.empty()) {
+            usleep(50000); // 等待50ms让cgroup状态写入文件系统
+            verified = is_pid_frozen_by_cgroup(pids[0], key);
+        }
+
+        if(verified) {
+             LOGI("Cgroup freeze for %s succeeded and verified.", key.first.c_str());
+             return 0; // 0: Cgroup 成功
+        } else {
+             LOGW("Cgroup freeze for %s verification failed! Escalating to SIGSTOP.", key.first.c_str());
+             freeze_sigstop(pids);
+             return 1; // 1: SIGSTOP 成功
+        }
+    } else {
         LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
         freeze_sigstop(pids);
+        return 1; // 1: SIGSTOP 成功
     }
-
-    return 0;
 }
 
 
@@ -76,8 +85,9 @@ bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>&
     return true;
 }
 
+// [核心重构] 调整返回码以区分软/硬失败
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
-    if (binder_state_.fd < 0) return 0;
+    if (binder_state_.fd < 0) return 0; // 0: 成功 (无操作)
     
     bool has_soft_failure = false;
     binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
@@ -102,34 +112,26 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
             } 
             else if (freeze && (errno == EINVAL || errno == EPERM)) {
                 LOGW("Cannot freeze pid %d (error: %s), likely a privileged process. Skipping this PID.", pid, strerror(errno));
-                op_success = true;
+                op_success = true; // 跳过此PID视为操作成功
                 break;
             }
             else {
                 LOGE("Binder op for pid %d failed with unrecoverable error: %s", pid, strerror(errno));
-                return -1;
+                return -1; // -1: 致命失败
             }
         }
         
         if (!op_success && !has_soft_failure) {
-            return -1;
+            return -1; // -1: 致命失败
         }
     }
     
-    return has_soft_failure ? 1 : 0;
+    return has_soft_failure ? 2 : 0; // 2: 软失败, 0: 完全成功
 }
 
-bool ActionExecutor::is_pid_frozen_by_uid_cgroup(int pid) {
-    struct stat proc_stat;
-    char path_buffer[64];
-    snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
-    if (stat(path_buffer, &proc_stat) != 0) {
-        return false;
-    }
-    
-    uid_t uid = proc_stat.st_uid;
-    
-    std::string freeze_path = "/sys/fs/cgroup/uid_" + std::to_string(uid) + "/cgroup.freeze";
+// [核心重构] 重命名并实现我们自己cgroup的验证
+bool ActionExecutor::is_pid_frozen_by_cgroup(int pid, const AppInstanceKey& key) {
+    std::string freeze_path = get_instance_cgroup_path(key) + "/cgroup.freeze";
 
     std::ifstream freeze_file(freeze_path);
     if (freeze_file.is_open()) {

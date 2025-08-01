@@ -6,6 +6,7 @@
         "xstring": "cpp",
         "set": "cpp",
         "memory": "cpp",
-        "vector": "cpp"
+        "vector": "cpp",
+        "xtree": "cpp"
     }
 }

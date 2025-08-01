@@ -28,7 +28,6 @@ data class ConfigurationUiState(
 
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
 
-    // 架构重构：获取唯一的单例实例
     private val daemonRepository = DaemonRepository.getInstance()
     private val appInfoRepository = AppInfoRepository.getInstance(application)
     private val packageManager: PackageManager = application.packageManager
@@ -56,36 +55,36 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             )
     }
 
+    // [核心重构] 修复分身应用无法被发现的问题
     fun loadConfiguration() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
+            // 1. 获取主空间所有可启动应用作为基础列表
+            val launchableApps = getAllLaunchableApps()
+            // 2. 从daemon获取完整的配置，其中可能包含分身应用的策略
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             } ?: emptyMap()
 
-            val allLaunchableApps = getAllLaunchableApps()
-
-            val finalAppList = mutableListOf<AppInfo>()
-            val seenPackages = mutableSetOf<String>()
-
-            allLaunchableApps.forEach { appInfo ->
-                finalAppList.add(appInfo)
-                seenPackages.add(appInfo.packageName)
-            }
-
+            val finalAppMap = launchableApps.associateBy {
+                AppInstanceKey(it.packageName, it.userId)
+            }.toMutableMap()
+            
+            // 3. 遍历daemon的策略，补充发现分身应用
             daemonPolicyMap.values.forEach { policy ->
-                if (policy.userId != 0 && seenPackages.contains(policy.packageName)) {
-                    val baseAppInfo = allLaunchableApps.find { it.packageName == policy.packageName }
-                    finalAppList.add(
-                        AppInfo(
-                            packageName = policy.packageName,
-                            appName = baseAppInfo?.appName ?: policy.packageName,
-                            icon = baseAppInfo?.icon,
-                            isSystemApp = baseAppInfo?.isSystemApp ?: false,
-                            userId = policy.userId
-                        )
+                val key = AppInstanceKey(policy.packageName, policy.userId)
+                // 如果这个应用实例还没在我们的列表里（通常是因为它是分身应用）
+                if (!finalAppMap.containsKey(key)) {
+                    // 尝试从主空间“借用”应用名称和图标
+                    val baseAppInfo = appInfoRepository.getAppInfo(policy.packageName)
+                    finalAppMap[key] = AppInfo(
+                        packageName = policy.packageName,
+                        appName = baseAppInfo?.appName ?: policy.packageName,
+                        icon = baseAppInfo?.icon,
+                        isSystemApp = baseAppInfo?.isSystemApp ?: false,
+                        userId = policy.userId
                     )
                 }
             }
@@ -93,7 +92,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    allInstalledApps = finalAppList.distinctBy { app -> "${app.packageName}-${app.userId}" },
+                    allInstalledApps = finalAppMap.values.toList(),
                     policies = daemonPolicyMap,
                     fullConfig = configPayload
                 )
@@ -114,7 +113,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                         appName = appInfo.loadLabel(packageManager).toString(),
                         icon = appInfo.loadIcon(packageManager),
                         isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                        userId = 0
+                        userId = 0 // queryIntentActivities 只能获取主空间，所以 userId 固定为 0
                     )
                 } catch (e: Exception) {
                     null
@@ -157,6 +156,5 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
 
     override fun onCleared() {
         super.onCleared()
-        // 架构重构：ViewModel不再负责停止Repository
     }
 }

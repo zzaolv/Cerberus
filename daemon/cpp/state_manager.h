@@ -26,6 +26,13 @@ struct AppRuntimeState {
         FROZEN
     } current_status = Status::STOPPED;
 
+    // [新增] 记录冻结方式
+    enum class FreezeMethod {
+        NONE,
+        CGROUP,
+        SIGSTOP
+    } freeze_method = FreezeMethod::NONE;
+
     std::string package_name;
     std::string app_name;
     int uid = -1;
@@ -77,12 +84,9 @@ public:
     StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
                  std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
     
-    // [新增] 启动预热函数
     void initial_full_scan_and_warmup();
-
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
-
     void process_new_metrics(const MetricsRecord& record);
     bool tick_state_machine();
     bool perform_deep_scan();
@@ -91,7 +95,6 @@ public:
     json get_dashboard_payload();
     json get_full_config_for_ui();
     json get_probe_config_payload();
-    
     void on_app_foreground_event(const json& payload);
     void on_app_background_event(const json& payload);
     void on_proactive_unfreeze_request(const json& payload);
@@ -99,7 +102,6 @@ public:
     void on_temp_unfreeze_request_by_pkg(const json& payload);
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
-    
     bool perform_staggered_stats_scan();
 
 private:
@@ -119,7 +121,6 @@ private:
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
     bool check_timers();
-
     bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
@@ -132,22 +133,16 @@ private:
     
     MasterConfig master_config_;
     std::unique_ptr<DozeManager> doze_manager_;
-
     std::mutex state_mutex_;
     std::set<AppInstanceKey> last_known_visible_app_keys_;
-    
     std::optional<MetricsRecord> last_metrics_record_;
     std::optional<std::pair<int, long long>> last_battery_level_info_; 
-    
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
-    
     std::map<AppInstanceKey, long long> doze_start_cpu_jiffies_;
-    
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
-    
     std::map<AppInstanceKey, AppRuntimeState>::iterator next_scan_iterator_;
 };
 
