@@ -1,5 +1,5 @@
 // daemon/cpp/system_monitor.cpp
-#include "system_monitor.h"
+#include "system_monitor.hh"
 #include <fstream>
 #include <sstream>
 #include <android/log.h>
@@ -23,15 +23,19 @@
 #include <string>
 #include <memory>
 #include <map>
-#include <unordered_set> // 新增
+#include <unordered_set>
 
-#define LOG_TAG "cerberusd_monitor_v26_audio_policy" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v27_location_policy" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// ... ProcFileReader, read_file_once, exec_shell_pipe_efficient, get_uid_from_pid ...
+// ... 和其他 SystemMonitor 的成员函数保持不变，直到 update_location_state ...
+// (为了简洁，我将省略这部分未改变的代码，请以前一个响应中的版本为准)
 
 SystemMonitor::ProcFileReader::ProcFileReader(std::string path) : path_(std::move(path)) {}
 
@@ -407,9 +411,7 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// [核心重构] 实现您提出的新的音频豁免逻辑
 void SystemMonitor::update_audio_state() {
-    // 存储每个UID有多少播放器，以及有多少是暂停状态
     struct PlayerStats {
         int total_count = 0;
         int paused_count = 0;
@@ -430,14 +432,12 @@ void SystemMonitor::update_audio_state() {
             continue;
         }
         
-        // 遇到结束标记，停止处理
         if (line.find("ducked players piids:") != std::string::npos) {
             break;
         }
         
         if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
             try {
-                // 1. 过滤系统提示音等无关播放器
                 bool is_ignored = false;
                 for (const auto& usage : ignored_usages) {
                     if (line.find(usage) != std::string::npos) {
@@ -447,7 +447,6 @@ void SystemMonitor::update_audio_state() {
                 }
                 if (is_ignored) continue;
 
-                // 2. 解析 UID 和 state
                 int uid = -1;
                 std::string state_str;
 
@@ -464,7 +463,6 @@ void SystemMonitor::update_audio_state() {
                     line_ss >> state_str;
                 }
                 
-                // 3. 统计总数和暂停数
                 uid_player_stats[uid].total_count++;
                 if (state_str == "paused") {
                     uid_player_stats[uid].paused_count++;
@@ -474,7 +472,6 @@ void SystemMonitor::update_audio_state() {
     }
 
     std::set<int> active_uids;
-    // 4. 决策：如果一个UID有播放器，且暂停的播放器数量为0，则豁免
     for (const auto& [uid, stats] : uid_player_stats) {
         if (stats.total_count > 0 && stats.paused_count == 0) {
             active_uids.insert(uid);
@@ -682,46 +679,48 @@ std::string SystemMonitor::get_current_ime_package() {
     return current_ime_package_;
 }
 
+// [核心重构] 实现您提出的新的定位豁免逻辑
 void SystemMonitor::update_location_state() {
     std::set<int> active_uids;
     std::string result = exec_shell_pipe_efficient({"dumpsys", "location"});
     std::stringstream ss(result);
     std::string line;
 
-    std::string current_provider_line;
+    bool in_gps_provider_section = false;
     while (std::getline(ss, line)) {
-        
-        if (line.rfind("LocationProvider[", 0) == 0) {
-            current_provider_line = line;
-            continue;
-        }
-
-        if (current_provider_line.find("PASSIVE") != std::string::npos) {
-            continue;
-        }
-        
-        if (line.find("Request[") != std::string::npos) {
-            if (line.find("PASSIVE") != std::string::npos) {
-                continue;
-            }
-
-            try {
-                size_t pkg_start = line.find("package=");
-                if (pkg_start == std::string::npos) continue;
-                pkg_start += 8;
-                size_t pkg_end = line.find(' ', pkg_start);
-                if (pkg_end == std::string::npos) continue;
-                std::string pkg_name = line.substr(pkg_start, pkg_end - pkg_start);
-                
-                int pid = get_pid_from_pkg(pkg_name);
-                if (pid != -1) {
-                    int uid = get_uid_from_pid(pid);
-                    if (uid >= 10000) {
-                        active_uids.insert(uid);
-                    }
+        if (!in_gps_provider_section) {
+            if (line.find("gps provider:") != std::string::npos) {
+                in_gps_provider_section = true;
+                // 检查GPS是否关闭
+                if (line.find("[OFF]") != std::string::npos) {
+                    // 如果GPS关闭，直接跳过此区域
+                    in_gps_provider_section = false; 
                 }
+            }
+            continue;
+        }
 
+        // 遇到结束标记，停止处理
+        if (line.find("user 0:") != std::string::npos) {
+            in_gps_provider_section = false;
+            continue; // 继续扫描，以防有其他provider
+        }
+        
+        // 在gps provider区域内，寻找WorkSource
+        size_t ws_pos = line.find("WorkSource{");
+        if (ws_pos != std::string::npos) {
+            try {
+                // WorkSource{10388 com.baidu.BaiduMap}
+                std::string ws_content = line.substr(ws_pos + 11);
+                std::stringstream ws_ss(ws_content);
+                int uid = -1;
+                ws_ss >> uid;
+
+                if (uid >= 10000) {
+                    active_uids.insert(uid);
+                }
             } catch (const std::exception& e) {
+                 LOGW("Failed to parse WorkSource line: %s", line.c_str());
             }
         }
     }
@@ -731,11 +730,13 @@ void SystemMonitor::update_location_state() {
         if (uids_using_location_ != active_uids) {
             std::stringstream log_ss;
             for(int uid : active_uids) { log_ss << uid << " "; }
-            LOGI("Active location UIDs changed. Old count: %zu, New count: %zu. Active UIDs: [ %s]", uids_using_location_.size(), active_uids.size(), log_ss.str().c_str());
+            LOGI("Active location UIDs changed (gps provider policy). Old count: %zu, New count: %zu. Active UIDs: [ %s]", 
+                uids_using_location_.size(), active_uids.size(), log_ss.str().c_str());
             uids_using_location_ = active_uids;
         }
     }
 }
+
 
 bool SystemMonitor::is_uid_using_location(int uid) {
     std::lock_guard<std::mutex> lock(location_uids_mutex_);
