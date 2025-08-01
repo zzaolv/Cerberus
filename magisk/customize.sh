@@ -1,55 +1,58 @@
 #!/system/bin/sh
-# D:/project/Cerberus/Cerberus_Module/customize.sh
 
-##########################################################################################
-#
-# Cerberus Module Installer Script v1.2 (with APK install)
-#
-##########################################################################################
+# --- 环境检查 ---
+$BOOTMODE || abort "- 错误: 请在 Magisk 或 KernelSU 环境中安装！"
+[ "$API" -ge 30 ] || abort "- 错误: Cerberus 仅支持 Android 11 (API 30) 及以上版本！"
 
-ui_print "*******************************"
-ui_print "    Project Cerberus Daemon    "
-ui_print "*******************************"
+ui_print "- 安卓版本 $API, 符合要求。"
+ui_print "- 设备架构: $ARCH (将使用默认的arm64二进制文件)。"
 
-# --- 冲突模块处理 ---
-ui_print "- Checking for conflicting modules..."
-if [ -d "/data/adb/modules/hans_config" ]; then
-  ui_print "  > Found 'Hans Config', removing..."
-  rm -rf /data/adb/modules/hans_config
-fi
-if [ -d "/data/adb/modules/millet_config" ]; then
-  ui_print "  > Found 'Millet Config', removing..."
-  rm -rf /data/adb/modules/millet_config
-fi
+# --- 文件权限设置 ---
+ui_print "- 设置文件权限..."
+set_perm_recursive "$MODPATH" 0 0 0755 0644
+set_perm "$MODPATH/system/bin/cerberusd" 0 0 0755
+set_perm "$MODPATH/tools/magiskpolicy" 0 0 0755
+set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
+set_perm "$MODPATH/service.sh" 0 0 0755
+set_perm "$MODPATH/uninstall.sh" 0 0 0755
 
-# --- 提取文件 ---
-ui_print "- Extracting module files"
-unzip -o "$ZIPFILE" 'system/*' -d $MODPATH >&2
-unzip -o "$ZIPFILE" 'sepolicy.rule' -d $MODPATH >&2
-unzip -o "$ZIPFILE" 'Cerberus.apk' -d $MODPATH >&2
 
-# --- [核心新增] 安装捆绑的 APK ---
+# --- APK安装 ---
 APK_PATH="$MODPATH/Cerberus.apk"
+APK_PACKAGE_NAME="com.crfzit.crfzit"
 if [ -f "$APK_PATH" ]; then
-  ui_print "- Installing Cerberus App..."
-  # 使用 pm install 命令进行安装。-r 表示如果已安装则替换，-d 表示允许降级安装。
-  pm install -r -d "$APK_PATH"
-  if [ $? -eq 0 ]; then
-    ui_print "  > App installed successfully."
+  ui_print "- 正在安装 Cerberus 控制面板..."
+  TMP_APK_PATH="/data/local/tmp/Cerberus.apk"
+  cp "$APK_PATH" "$TMP_APK_PATH"
+  chmod 644 "$TMP_APK_PATH"
+
+  # 尝试安装
+  install_output=$(pm install -r "$TMP_APK_PATH" 2>&1)
+
+  if echo "$install_output" | grep -q "Success"; then
+    ui_print "  > 控制面板安装成功。"
+    rm "$TMP_APK_PATH"
   else
-    ui_print "  > WARN: App installation failed. Please install manually."
+    ui_print "  > 安装失败，原因: $install_output"
+    ui_print "  > 正在尝试卸载旧版本后重装..."
+    pm uninstall "$APK_PACKAGE_NAME" >/dev/null 2>&1
+    sleep 1
+    reinstall_output=$(pm install -r "$TMP_APK_PATH" 2>&1)
+    if echo "$reinstall_output" | grep -q "Success"; then
+      ui_print "  > 重装成功！如果之前已启用，请在LSPosed中检查其状态。"
+      rm "$TMP_APK_PATH"
+    else
+      ui_print "  > [!!!] 重装失败: $reinstall_output"
+      ui_print "  > [!!!] 请在重启后手动安装位于 /sdcard/Download/Cerberus.apk 的APK文件。"
+      cp "$TMP_APK_PATH" "/sdcard/Download/Cerberus.apk"
+    fi
   fi
-else
-  ui_print "- WARN: Cerberus.apk not found in module zip."
+  rm "$APK_PATH"
 fi
 
-# --- 设置权限 ---
-ui_print "- Setting permissions"
-set_perm_recursive $MODPATH 0 0 0755 0644
-set_perm $MODPATH/system/bin/cerberusd 0 0 0755 u:object_r:system_file:s0
-set_perm $MODPATH/service.sh 0 0 0755
-set_perm $MODPATH/post-fs-data.sh 0 0 0755
-set_perm $MODPATH/uninstall.sh 0 0 0755
-
-ui_print "- Installation complete!"
-ui_print "- Please reboot your device."
+ui_print " "
+ui_print "--- Cerberus 安装完成 ---"
+ui_print "- 请在 LSPosed Manager 中启用 [Cerberus] 模块"
+ui_print "- 并确保其作用域包含了 [Android 系统]"
+ui_print "- 重启设备以激活所有功能！"
+ui_print " "

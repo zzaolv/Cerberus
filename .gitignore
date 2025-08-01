@@ -29,3 +29,4 @@ magisk/system/bin/cerberusd
 magisk/system/Cerberus-UI/Cerberus-UI.apk
 hs_err_*.log
 replay_*.log
+magisk/Cerberus.apk

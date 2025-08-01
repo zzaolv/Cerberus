@@ -1,56 +1,69 @@
 #!/system/bin/sh
-# D:/project/Cerberus/Cerberus_Module/service.sh
 
 MODDIR=${0%/*}
-LOG_FILE="/data/adb/cerberus/daemon_service.log"
+DATA_DIR="/data/adb/cerberus"
+LOG_FILE="$DATA_DIR/boot.log"
 PROP_FILE="$MODDIR/module.prop"
 
-# 将此脚本的所有输出都重定向到日志文件
-exec 1>>$LOG_FILE 2>&1
+exec >> "$LOG_FILE" 2>&1
 
 echo "----------------------------------------"
-echo "[$(date)] service.sh started."
+echo "[$(date)] service.sh script invoked..."
 
-# 等待系统启动完成
+DAEMON_PATH="$MODDIR/system/bin/cerberusd"
+
+is_daemon_running() {
+  if pgrep -f "$DAEMON_PATH" > /dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+if is_daemon_running; then
+  echo "[$(date)] Daemon is already running. Skipping new instance."
+  exit 0
+fi
+
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
   sleep 5
 done
-echo "[$(date)] Boot completed."
-
-# 延迟一点，确保系统服务都已就绪
+echo "[$(date)] Boot completed. Preparing to start Cerberus daemon..."
 sleep 10
 
-# --- 动态更新模块描述 ---
-update_description() {
-    echo "[$(date)] Updating module description..."
-    DAEMON_PID=$(pgrep -f "$MODDIR/system/bin/cerberusd")
+if is_daemon_running; then
+  echo "[$(date)] Daemon was started by another event while waiting. Exiting."
+  exit 0
+fi
 
-    if [ -n "$DAEMON_PID" ]; then
-        echo "[$(date)] Daemon is running with PID: $DAEMON_PID"
-        DESCRIPTION="😊 Guardian Running, PID: [$DAEMON_PID] A system-level guardian for performance and battery."
-    else
-        echo "[$(date)] Daemon failed to start. PID not found."
-        DESCRIPTION="😅 Guardian Failed to Start. Check Magisk logs and /data/adb/cerberus/daemon_service.log for errors."
-    fi
-    
-    # 检查写入前的文件内容
-    echo "[$(date)] Before update: $(cat $PROP_FILE | grep 'description=')"
-    
-    sed -i "s|description=.*|$DESCRIPTION|" "$PROP_FILE"
-    
-    # 检查写入后的文件内容
-    echo "[$(date)] After update:  $(cat $PROP_FILE | grep 'description=')"
-    echo "[$(date)] Description update finished."
-}
+if [ -f "$DAEMON_PATH" ]; then
+    echo "[$(date)] Starting cerberusd daemon..."
+    nohup "$DAEMON_PATH" &
+else
+    echo "[$(date)] ERROR: Daemon executable not found at $DAEMON_PATH!"
+    sed -i "s|description=.*|description=❌ ERROR: Daemon file missing!|" "$PROP_FILE"
+    exit 1
+fi
 
-# --- 启动守护进程 ---
-echo "[$(date)] Starting cerberusd daemon..."
-nohup $MODDIR/system/bin/cerberusd &
-
-# 启动后等待几秒
 sleep 5
 
-# 更新描述
-update_description
 
-echo "[$(date)] service.sh finished."
+echo "[$(date)] Updating module description..."
+
+DAEMON_PID=$(pgrep -f "$DAEMON_PATH")
+
+echo "[$(date)] Check Result: Daemon PID is '$DAEMON_PID'."
+echo "[$(date)] Before update: $(grep 'description=' $PROP_FILE)"
+
+if [ -n "$DAEMON_PID" ]; then
+    DESCRIPTION="description=✅ Guardian Running [PID: $DAEMON_PID]. System protected by Cerberus."
+else
+    DESCRIPTION="description=❌ Guardian FAILED to start. Check logs in $DATA_DIR"
+fi
+
+sed -i "s|description=.*|$DESCRIPTION|" "$PROP_FILE"
+
+echo "[$(date)] After update:  $(grep 'description=' $PROP_FILE)"
+echo "[$(date)] Description update finished. Note: UI change might appear after a reboot."
+
+echo "[$(date)] service.sh finished successfully."

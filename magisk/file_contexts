@@ -1,7 +1,5 @@
 # magisk/file_contexts
 
-# 将我们的守护进程可执行文件标记为 cerberusd_exec
 /system/bin/cerberusd    u:object_r:cerberusd_exec:s0
 
-# 将我们的数据目录及其下所有内容标记为 cerberus_data_file (关键新增!)
 /data/adb/cerberus(/.*)? u:object_r:cerberus_data_file:s0

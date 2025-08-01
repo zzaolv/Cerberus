@@ -1,14 +1,26 @@
 #!/system/bin/sh
-# D:/project/Cerberus/Cerberus_Module/uninstall.sh
 
-# 当用户在 Manager 中卸载模块时，这个脚本会自动执行
+# --- 清理守护进程 ---
+DAEMON_PATH="/data/adb/modules/Cerberus/system/bin/cerberusd"
+DAEMON_PID=$(pgrep -f "$DAEMON_PATH")
+if [ -n "$DAEMON_PID" ]; then
+  kill -9 "$DAEMON_PID"
+fi
 
-# 还原可能被我们修改过的系统属性
-# resetprop -p 会删除属性，让系统恢复到默认值
-resetprop -p --delete persist.vendor.enable.hans
+# --- 清理应用 ---
+(
+  while [ "$(getprop sys.boot_completed)" != "1" ]; do
+    sleep 2
+  done
+  pm uninstall "com.crfzit.crfzit"
+) &
+
+# --- 清理数据目录 ---
+rm -rf "/data/adb/cerberus"
+
+# --- 恢复系统属性 ---
 resetprop -p --delete persist.sys.gz.enable
-resetprop -p --delete persist.sys.brightmillet.enable
+resetprop -p --delete persist.sys.millet.handshake
 resetprop -p --delete persist.sys.powmillet.enable
-
-# 删除我们的日志文件和目录
-rm -rf /data/adb/cerberus
+resetprop -p --delete persist.sys.brightmillet.enable
+resetprop -p --delete persist.vendor.enable.hans

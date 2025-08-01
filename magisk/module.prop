@@ -1,7 +1,6 @@
-# D:/project/Cerberus/Cerberus_Module/module.prop
-id=CerberusDaemon
-name=Cerberus Daemon
-version=1.2
-versionCode=3
+id=Cerberus
+name=Cerberus
+version=1.0.1_beta
+versionCode=101
 author=zzaolv
-description=A system-level guardian for performance and battery. Please reboot to activate.
+description=Initializing... Please reboot to activate the module.
