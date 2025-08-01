@@ -55,7 +55,7 @@ data class LogEntry(
     val category: String,
     val message: String,
     val packageName: String?,
-    val userId: Int = -1
+    val userId: Int = -1,
     val details: JsonElement? = null
 )
 
