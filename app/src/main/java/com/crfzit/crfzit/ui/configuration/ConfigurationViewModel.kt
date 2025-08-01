@@ -5,10 +5,8 @@ import android.app.Application
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.crfzit.crfzit.R
 import com.crfzit.crfzit.data.model.*
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
@@ -55,14 +53,11 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             )
     }
 
-    // [核心重构] 修复分身应用无法被发现的问题
     fun loadConfiguration() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // 1. 获取主空间所有可启动应用作为基础列表
             val launchableApps = getAllLaunchableApps()
-            // 2. 从daemon获取完整的配置，其中可能包含分身应用的策略
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
@@ -71,13 +66,12 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             val finalAppMap = launchableApps.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             }.toMutableMap()
-            
-            // 3. 遍历daemon的策略，补充发现分身应用
+
             daemonPolicyMap.values.forEach { policy ->
                 val key = AppInstanceKey(policy.packageName, policy.userId)
-                // 如果这个应用实例还没在我们的列表里（通常是因为它是分身应用）
-                if (!finalAppMap.containsKey(key)) {
-                    // 尝试从主空间“借用”应用名称和图标
+
+                // [核心修复] 只有当应用是分身应用(userId != 0)且不在现有列表中时，才进行补充
+                if (!finalAppMap.containsKey(key) && policy.userId != 0) {
                     val baseAppInfo = appInfoRepository.getAppInfo(policy.packageName)
                     finalAppMap[key] = AppInfo(
                         packageName = policy.packageName,
@@ -99,7 +93,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
         }
     }
-    
+
     private suspend fun getAllLaunchableApps(): List<AppInfo> = withContext(Dispatchers.IO) {
         val intent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
@@ -113,7 +107,7 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                         appName = appInfo.loadLabel(packageManager).toString(),
                         icon = appInfo.loadIcon(packageManager),
                         isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                        userId = 0 // queryIntentActivities 只能获取主空间，所以 userId 固定为 0
+                        userId = 0
                     )
                 } catch (e: Exception) {
                     null
@@ -125,7 +119,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         val currentConfig = _uiState.value.fullConfig ?: return
 
         val newPolicies = currentConfig.policies.toMutableList()
-
         val existingPolicyIndex = newPolicies.indexOfFirst { it.packageName == packageName && it.userId == userId }
 
         if (existingPolicyIndex != -1) {
@@ -135,14 +128,12 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         }
 
         val newConfig = currentConfig.copy(policies = newPolicies)
-
         _uiState.update {
             it.copy(
                 policies = newPolicies.associateBy { p -> AppInstanceKey(p.packageName, p.userId) },
                 fullConfig = newConfig
             )
         }
-
         daemonRepository.setPolicy(newConfig)
     }
 

@@ -26,7 +26,6 @@ struct AppRuntimeState {
         FROZEN
     } current_status = Status::STOPPED;
 
-    // [修复] 将 SIGSTOP 重命名为 SIG_STOP 以避免宏冲突
     enum class FreezeMethod {
         NONE,
         CGROUP,
@@ -77,6 +76,14 @@ private:
     std::chrono::steady_clock::time_point deep_doze_start_time_;
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<ActionExecutor> action_executor_;
+};
+
+// [核心重构] 为Doze报告增加一个专门的结构体
+struct DozeProcessRecord {
+    long long start_jiffies;
+    std::string process_name;
+    std::string package_name;
+    int user_id;
 };
 
 class StateManager {
@@ -139,7 +146,10 @@ private:
     std::optional<std::pair<int, long long>> last_battery_level_info_;
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
-    std::map<AppInstanceKey, long long> doze_start_cpu_jiffies_;
+    
+    // [核心重构] 修改Doze数据结构，以PID为key
+    std::map<int, DozeProcessRecord> doze_start_process_info_;
+
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;

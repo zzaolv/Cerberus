@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v32_log_fix"
+#define LOG_TAG "cerberusd_state_v34_freeze_count" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -26,7 +26,6 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         switch (app.freeze_method) {
             case AppRuntimeState::FreezeMethod::CGROUP: return "已冻结 (V2)";
-            // [修复] 使用新的枚举成员名
             case AppRuntimeState::FreezeMethod::SIG_STOP: return "已冻结 (SIG)";
             default: return "已冻结";
         }
@@ -559,15 +558,20 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     auto doze_event = doze_manager_->process_metrics(record);
 
     if (doze_event == DozeManager::DozeEvent::ENTERED_DEEP_DOZE) {
-        doze_start_cpu_jiffies_.clear();
+        doze_start_process_info_.clear();
         for (const auto& [key, app] : managed_apps_) {
-            if (!app.pids.empty()) {
-                doze_start_cpu_jiffies_[key] = sys_monitor_->get_total_cpu_jiffies_for_pids(app.pids);
+            for (int pid : app.pids) {
+                doze_start_process_info_[pid] = {
+                    .start_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid}),
+                    .process_name = sys_monitor_->get_app_name_from_pid(pid),
+                    .package_name = app.package_name,
+                    .user_id = app.user_id
+                };
             }
         }
     } else if (doze_event == DozeManager::DozeEvent::EXITED_DEEP_DOZE) {
         generate_doze_exit_report();
-        doze_start_cpu_jiffies_.clear();
+        doze_start_process_info_.clear();
     }
 
     if (last_metrics_record_) {
@@ -579,53 +583,74 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
 }
 
 void StateManager::generate_doze_exit_report() {
-    struct AppCpuActivity {
-        std::string app_name;
-        std::string package_name;
+    struct ProcessActivity {
+        std::string process_name;
         double cpu_seconds;
     };
 
-    std::vector<AppCpuActivity> activity_list;
+    struct AppActivitySummary {
+        std::string app_name;
+        double total_cpu_seconds = 0.0;
+        std::vector<ProcessActivity> processes;
+    };
+
+    std::map<AppInstanceKey, AppActivitySummary> grouped_activities;
     const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
 
-    for (const auto& [key, app] : managed_apps_) {
-        if (app.pids.empty()) continue;
-
-        long long start_jiffies = 0;
-        auto it = doze_start_cpu_jiffies_.find(key);
-        if (it != doze_start_cpu_jiffies_.end()) start_jiffies = it->second;
-
-        long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids(app.pids);
-
-        if (end_jiffies > start_jiffies) {
-            double cpu_seconds = static_cast<double>(end_jiffies - start_jiffies) / TCK;
+    for (const auto& [pid, start_record] : doze_start_process_info_) {
+        long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid});
+        if (end_jiffies > start_record.start_jiffies) {
+            double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
             if (cpu_seconds > 0.01) {
-                activity_list.push_back({app.app_name, app.package_name, cpu_seconds});
+                AppInstanceKey key = {start_record.package_name, start_record.user_id};
+                grouped_activities[key].processes.push_back({start_record.process_name, cpu_seconds});
             }
         }
     }
 
-    std::sort(activity_list.begin(), activity_list.end(),
-              [](const AppCpuActivity& a, const AppCpuActivity& b) { return a.cpu_seconds > b.cpu_seconds; });
+    if (grouped_activities.empty()) {
+        logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间:\n| | 无明显应用活动。");
+        return;
+    }
+
+    std::vector<std::pair<AppInstanceKey, double>> sorted_apps;
+    for (auto& [key, summary] : grouped_activities) {
+        auto it = managed_apps_.find(key);
+        if (it != managed_apps_.end()) {
+            summary.app_name = it->second.app_name;
+        } else {
+            summary.app_name = key.first;
+        }
+        for (const auto& proc : summary.processes) {
+            summary.total_cpu_seconds += proc.cpu_seconds;
+        }
+        sorted_apps.push_back({key, summary.total_cpu_seconds});
+    }
+
+    std::sort(sorted_apps.begin(), sorted_apps.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
 
     std::stringstream report_ss;
     report_ss << "Doze期间应用的CPU活跃时间:";
 
-    if (activity_list.empty()) {
-        report_ss << "\n| | 无明显应用活动。";
-    } else {
-        for (const auto& activity : activity_list) {
-            std::string display_name = (activity.app_name == activity.package_name)
-                                       ? activity.package_name
-                                       : activity.app_name + " (" + activity.package_name + ")";
+    for (const auto& pair : sorted_apps) {
+        const AppInstanceKey& key = pair.first;
+        const auto& summary = grouped_activities[key];
 
-            report_ss << "\n| | [活跃: " << std::fixed << std::setprecision(3) << activity.cpu_seconds << "秒] | [" << display_name << "]";
+        report_ss << "\n| | [总活跃: " << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s] | ["
+                  << summary.app_name << " (" << key.first << ")]";
+
+        if (summary.processes.size() > 1 || (summary.processes.size() == 1 && summary.processes[0].process_name != key.first)) {
+            for (const auto& proc : summary.processes) {
+                 report_ss << "\n| |   - [活跃: " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s] | [" << proc.process_name << "]";
+            }
         }
     }
 
     logger_->log(LogLevel::BATCH_PARENT, "报告", report_ss.str());
 }
+
 
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (old_record.is_charging != new_record.is_charging) {
@@ -1120,6 +1145,8 @@ bool StateManager::check_timers() {
                 if (app.freeze_retry_count > 0) timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
 
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
+                    // [新增] 冻结日志计数
+                    size_t total_pids = app.pids.size();
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
 
@@ -1134,15 +1161,20 @@ bool StateManager::check_timers() {
                         strategy_log_msg = "执行“常规打击”";
                         pids_to_freeze = app.pids;
                     }
+                    size_t frozen_pids_count = pids_to_freeze.size();
 
                     logger_->log(LogLevel::INFO, "冻结", strategy_log_msg, app.package_name, app.user_id);
                     int freeze_result = action_executor_->freeze(key, pids_to_freeze);
+                    
+                    std::stringstream log_msg_ss;
+                    log_msg_ss << "[" << frozen_pids_count << "/" << total_pids << "] ";
 
                     switch (freeze_result) {
                         case 0: // Cgroup
                             app.current_status = AppRuntimeState::Status::FROZEN;
                             app.freeze_method = AppRuntimeState::FreezeMethod::CGROUP;
-                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结 (Cgroup)", app.package_name, app.user_id);
+                            log_msg_ss << "因后台超时被冻结 (Cgroup)";
+                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", log_msg_ss.str(), app.package_name, app.user_id);
                             schedule_timed_unfreeze(app);
                             probe_config_needs_update = true;
                             app.background_since = 0;
@@ -1150,9 +1182,9 @@ bool StateManager::check_timers() {
                             break;
                         case 1: // SIGSTOP
                             app.current_status = AppRuntimeState::Status::FROZEN;
-                            // [修复] 使用新的枚举成员名
                             app.freeze_method = AppRuntimeState::FreezeMethod::SIG_STOP;
-                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", "因后台超时被冻结 (SIGSTOP)", app.package_name, app.user_id);
+                            log_msg_ss << "因后台超时被冻结 (SIGSTOP)";
+                            logger_->log(LogLevel::ACTION_FREEZE, "冻结", log_msg_ss.str(), app.package_name, app.user_id);
                             schedule_timed_unfreeze(app);
                             probe_config_needs_update = true;
                             app.background_since = 0;
