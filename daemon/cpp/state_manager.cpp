@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v39_report_grouping" // 版本号更新
+#define LOG_TAG "cerberusd_state_v40_report_top7" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -602,7 +602,6 @@ void StateManager::generate_doze_exit_report() {
     if (TCK <= 0) return;
 
     for (const auto& [pid, start_record] : doze_start_process_info_) {
-        // [核心修复] 确保start_record中的package_name是规范化的根包名
         std::string base_package_name = start_record.package_name;
         size_t colon_pos = base_package_name.find(':');
         if (colon_pos != std::string::npos) {
@@ -613,11 +612,9 @@ void StateManager::generate_doze_exit_report() {
         if (end_jiffies > start_record.start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
             if (cpu_seconds > 0.01) {
-                // 使用规范化的包名作为Key
                 AppInstanceKey key = {base_package_name, start_record.user_id};
                 if (grouped_activities.find(key) == grouped_activities.end()) {
                     auto it = managed_apps_.find(key);
-                    // [核心修复] 优先使用AppRuntimeState中的appName，如果找不到，则使用根包名
                     grouped_activities[key].app_name = (it != managed_apps_.end() && !it->second.app_name.empty()) ? it->second.app_name : key.first;
                     grouped_activities[key].package_name = key.first;
                     grouped_activities[key].user_id = key.second;
@@ -632,8 +629,12 @@ void StateManager::generate_doze_exit_report() {
         logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间无明显应用活动。");
         return;
     }
+    
+    std::vector<LogEntry> batch_log_entries;
+    long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 
-    logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间：");
+    batch_log_entries.push_back({now_ms, LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间：", "", -1});
 
     std::vector<AppActivitySummary> sorted_apps;
     for (auto const& [key, val] : grouped_activities) {
@@ -642,9 +643,13 @@ void StateManager::generate_doze_exit_report() {
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
+    // [核心修改] 只取前7个
+    const int REPORT_LIMIT = 7;
+    int count = 0;
     for (const auto& summary : sorted_apps) {
+        if (++count > REPORT_LIMIT) break;
+
         std::stringstream report_ss;
-        
         report_ss << summary.app_name << " 总计: "
                   << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
         
@@ -655,9 +660,10 @@ void StateManager::generate_doze_exit_report() {
         for (const auto& proc : summary.processes) {
             report_ss << "\n- " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
         }
-
-        logger_->log(LogLevel::REPORT, "报告", report_ss.str(), summary.package_name, summary.user_id);
+        batch_log_entries.push_back({now_ms, LogLevel::REPORT, "报告", report_ss.str(), summary.package_name, summary.user_id});
     }
+
+    logger_->log_batch(batch_log_entries);
 }
 
 
@@ -1585,12 +1591,9 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
 
-    // [核心修复] 只有在app_name是默认包名时，才尝试用进程名更新它
-    // 这避免了用一个不重要的进程名（如:push）覆盖掉一个好的进程名
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
         if (!friendly_name.empty()) {
-            // 再次规范化，确保不会把 a.b:push 存为 app_name
             size_t colon_pos = friendly_name.find(':');
             if (colon_pos != std::string::npos) {
                 app->app_name = friendly_name.substr(0, colon_pos);

@@ -40,8 +40,6 @@ struct LogEntry {
     std::string message;
     std::string package_name;
     int user_id;
-    // [核心修复] 移除 details 字段
-    // json details;
 
     json to_json() const;
 };
@@ -54,35 +52,41 @@ public:
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    // [核心修复] 移除 log 函数的 details 参数
     void log(LogLevel level, const std::string& category, const std::string& message,
              const std::string& package_name = "", int user_id = -1);
+    
+    // [新] 批量日志记录，用于Doze报告
+    void log_batch(const std::vector<LogEntry>& entries);
 
-    std::vector<LogEntry> get_logs(std::optional<long long> since_timestamp_ms,
-                                   std::optional<long long> before_timestamp_ms,
-                                   int limit) const;
+    // [修改] get_logs 现在接受文件名
+    std::vector<LogEntry> get_logs_from_file(const std::string& filename, int limit, long long before_timestamp_ms) const;
+    
+    // [新] 获取日志文件列表
+    std::vector<std::string> get_log_files() const;
+
     void stop();
 
 private:
     explicit Logger(const std::string& log_dir_path);
     void writer_thread_func();
-    void ensure_log_file();
-    void read_logs_from_file(std::vector<LogEntry>& out_logs,
-                             std::optional<long long> since_timestamp_ms,
-                             std::optional<long long> before_timestamp_ms,
-                             int limit) const;
-
+    
+    // [新] 文件管理逻辑
+    void manage_log_files();
+    void rotate_log_file_if_needed(size_t new_entries_count);
+    void cleanup_old_files();
+    
     static std::shared_ptr<Logger> instance_;
     static std::mutex instance_mutex_;
 
     std::string log_dir_path_;
     std::string current_log_file_path_;
+    int current_log_line_count_ = 0;
+
     std::deque<LogEntry> log_queue_;
     mutable std::mutex queue_mutex_;
     std::condition_variable cv_;
     std::thread writer_thread_;
     std::atomic<bool> is_running_;
-    int current_day_ = -1;
 };
 
 #endif // CERBERUS_LOGGER_H

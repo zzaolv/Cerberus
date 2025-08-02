@@ -9,7 +9,6 @@ import com.crfzit.crfzit.data.model.LogEntry
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -18,12 +17,13 @@ data class UiLogEntry(
     val appName: String?
 )
 
-// [分页加载] 扩展UI状态以支持分页
 data class LogsUiState(
     val isLoading: Boolean = true,
     val logs: List<UiLogEntry> = emptyList(),
     val isLoadingMore: Boolean = false,
-    val hasReachedEnd: Boolean = false
+    val hasReachedEnd: Boolean = false,
+    val logFiles: List<String> = emptyList(),
+    val currentFileIndex: Int = 0
 )
 
 class LogsViewModel(application: Application) : AndroidViewModel(application) {
@@ -37,105 +37,108 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(LogsUiState())
     val uiState: StateFlow<LogsUiState> = _uiState.asStateFlow()
 
-    private var pollingJob: Job? = null
-
     init {
         viewModelScope.launch {
+            // 预加载应用信息
             appInfoRepository.getAllApps(forceRefresh = true)
+            // 加载初始日志
             loadInitialLogs()
-            startPollingForNewLogs()
         }
     }
 
     private fun loadInitialLogs() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, logs = emptyList(), hasReachedEnd = false) }
-            val history = daemonRepository.getLogs(limit = PAGE_SIZE) ?: emptyList()
-            val uiHistory = history.map { log -> mapToUiLog(log) }
+            
+            val files = daemonRepository.getLogFiles() ?: emptyList()
+            if (files.isEmpty()) {
+                _uiState.update { it.copy(isLoading = false, hasReachedEnd = true) }
+                return@launch
+            }
+            
+            _uiState.update { it.copy(logFiles = files, currentFileIndex = 0) }
+
+            val initialLogs = daemonRepository.getLogs(filename = files[0], limit = PAGE_SIZE) ?: emptyList()
+            val uiHistory = initialLogs.map { log -> mapToUiLog(log) }
+            
             _uiState.update {
                 it.copy(
                     isLoading = false,
                     logs = uiHistory,
-                    hasReachedEnd = history.size < PAGE_SIZE
+                    // 如果第一页就没满，并且只有一个文件，那才算到底
+                    hasReachedEnd = initialLogs.size < PAGE_SIZE && files.size <= 1
                 )
             }
         }
     }
 
-    // [分页加载] 新增加载更多日志的函数
     fun loadMoreLogs() {
-        // 防止重复加载
-        if (_uiState.value.isLoadingMore || _uiState.value.hasReachedEnd) return
+        val currentState = _uiState.value
+        if (currentState.isLoadingMore || currentState.hasReachedEnd) return
 
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingMore = true) }
 
-            val lastLogTimestamp = _uiState.value.logs.lastOrNull()?.originalLog?.timestamp
-            if (lastLogTimestamp == null) {
+            val lastLogTimestamp = currentState.logs.lastOrNull()?.originalLog?.timestamp
+            val currentFilename = currentState.logFiles.getOrNull(currentState.currentFileIndex)
+
+            if (currentFilename == null || lastLogTimestamp == null) {
                 _uiState.update { it.copy(isLoadingMore = false, hasReachedEnd = true) }
                 return@launch
             }
+            
+            var olderLogs = daemonRepository.getLogs(
+                filename = currentFilename, 
+                before = lastLogTimestamp, 
+                limit = PAGE_SIZE
+            ) ?: emptyList()
 
-            val olderLogs = daemonRepository.getLogs(before = lastLogTimestamp, limit = PAGE_SIZE) ?: emptyList()
+            // 如果当前文件没找到更多日志，并且还有更旧的文件，就去读下一个文件
+            if (olderLogs.isEmpty() && currentState.currentFileIndex + 1 < currentState.logFiles.size) {
+                val nextFileIndex = currentState.currentFileIndex + 1
+                val nextFilename = currentState.logFiles[nextFileIndex]
+                _uiState.update { it.copy(currentFileIndex = nextFileIndex) }
+                
+                // 从新文件的末尾开始读
+                olderLogs = daemonRepository.getLogs(filename = nextFilename, limit = PAGE_SIZE) ?: emptyList()
+            }
+            
             if (olderLogs.isNotEmpty()) {
                 val newUiLogs = olderLogs.map { mapToUiLog(it) }
-                _uiState.update { currentState ->
-                    currentState.copy(
+                _uiState.update { state ->
+                    state.copy(
                         isLoadingMore = false,
-                        logs = currentState.logs + newUiLogs
+                        logs = state.logs + newUiLogs
                     )
                 }
             }
-
-            // 如果返回的日志数量小于请求的数量，说明已经到底了
-            if (olderLogs.size < PAGE_SIZE) {
+            
+            // 如果这次返回的日志数量少于请求数，并且已经是最后一个文件了，说明真的到底了
+            val isLastFile = currentState.currentFileIndex >= currentState.logFiles.size - 1
+            if (olderLogs.size < PAGE_SIZE && isLastFile) {
                 _uiState.update { it.copy(hasReachedEnd = true) }
             }
             _uiState.update { it.copy(isLoadingMore = false) }
         }
     }
-
-    private fun startPollingForNewLogs() {
-        pollingJob?.cancel()
-        pollingJob = viewModelScope.launch {
-            while (true) {
-                delay(3000)
-                try {
-                    val latestTimestamp = _uiState.value.logs.firstOrNull()?.originalLog?.timestamp
-                    val newLogs = daemonRepository.getLogs(since = latestTimestamp)
-
-                    if (!newLogs.isNullOrEmpty()) {
-                        val newUiLogs = newLogs.map { mapToUiLog(it) }
-                        _uiState.update { currentState ->
-                            val currentLogsMap = currentState.logs.associateBy {
-                                it.originalLog.timestamp.toString() + it.originalLog.message + it.originalLog.packageName
-                            }
-                            val newLogsMap = newUiLogs.associateBy {
-                                it.originalLog.timestamp.toString() + it.originalLog.message + it.originalLog.packageName
-                            }
-
-                            val combinedLogs = (newLogsMap + currentLogsMap).values.toList() // 新日志放前面
-                                .sortedByDescending { it.originalLog.timestamp }
-
-                            currentState.copy(logs = combinedLogs)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w("LogsViewModel", "Error polling for new logs: ${e.message}")
-                }
-            }
-        }
-    }
+    
+    // Polling is complex with file-based logs, we can disable it for now or implement it later
+    // private fun startPollingForNewLogs() { ... }
 
     private suspend fun mapToUiLog(log: LogEntry): UiLogEntry {
         val appName = log.packageName?.let { pkg ->
-            appInfoRepository.getAppInfo(pkg)?.appName
+            // 对分身应用添加后缀
+            val baseName = appInfoRepository.getAppInfo(pkg)?.appName
+            if (log.user_id != 0 && log.user_id != -1) {
+                "$baseName (分身)"
+            } else {
+                baseName
+            }
         }
-        return UiLogEntry(originalLog = log, appName = appName)
+        return UiLogEntry(originalLog = log, appName = appName ?: log.packageName)
     }
 
     override fun onCleared() {
-        pollingJob?.cancel()
         super.onCleared()
     }
 }

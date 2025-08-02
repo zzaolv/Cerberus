@@ -13,6 +13,15 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
+// [新] 为 getLogFiles 和 getLogs 定义 payload
+data class GetLogFilesPayload(val placeholder: Int = 0) // 可以是空对象
+data class GetLogsByFilePayload(
+    val filename: String?,
+    val before: Long?,
+    val limit: Int?
+)
+
+
 class DaemonRepository private constructor(
     private val scope: CoroutineScope
 ) {
@@ -47,38 +56,39 @@ class DaemonRepository private constructor(
                 null
             }
         }
+    
+    // [新] 获取日志文件列表
+    suspend fun getLogFiles(): List<String>? {
+        return query("query.get_log_files", GetLogFilesPayload()) { responseJson ->
+            val responseType = object : TypeToken<CerberusMessage<List<String>>>() {}.type
+            val message = gson.fromJson<CerberusMessage<List<String>>>(responseJson, responseType)
+            if (message?.type == "resp.get_log_files") {
+                message.payload
+            } else {
+                null
+            }
+        }
+    }
 
+    // [修改] getLogs 现在按文件获取
     suspend fun getLogs(
-        since: Long? = null,
+        filename: String,
         before: Long? = null,
         limit: Int? = null
     ): List<LogEntry>? {
-        val reqId = UUID.randomUUID().toString()
-        val deferred = CompletableDeferred<String>()
-        pendingRequests[reqId] = deferred
-
-        val requestPayload = GetLogsPayload(since = since, before = before, limit = limit)
-        val requestMsg = CerberusMessage(type = "query.get_logs", requestId = reqId, payload = requestPayload)
-        tcpClient.sendMessage(gson.toJson(requestMsg))
-
-        return try {
-            val responseJson = withTimeout(5000) { deferred.await() }
+        val payload = GetLogsByFilePayload(filename = filename, before = before, limit = limit)
+        return query("query.get_logs", payload) { responseJson ->
             val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
             val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
 
             if (message?.type == "resp.get_logs") {
                 message.payload.map { p ->
-                    // [核心修复] 更新构造函数调用，不再传递 details
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
                 }
             } else {
                 Log.e("DaemonRepository", "Query 'get_logs' received unexpected response type '${message?.type}'")
                 null
             }
-        } catch (e: Exception) {
-            Log.e("DaemonRepository", "Failed to query 'get_logs': ${e.message}")
-            pendingRequests.remove(reqId)
-            null
         }
     }
 
@@ -113,50 +123,52 @@ class DaemonRepository private constructor(
         }
 
     suspend fun getAllLogs(): List<LogEntry>? {
-        return getLogs(limit = 50)
+        // 这个函数现在不再有意义，可以考虑删除或修改
+        return null
     }
 
-    suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats") { json ->
-        val type = object : TypeToken<List<MetricsRecordPayload>>() {}.type
-        val payloads = gson.fromJson<List<MetricsRecordPayload>>(json, type) ?: emptyList()
-        payloads.map { p ->
-            MetricsRecord(
-                timestamp = p.timestamp,
-                cpuUsagePercent = p.cpuUsagePercent,
-                memTotalKb = p.memTotalKb,
-                memAvailableKb = p.memAvailableKb,
-                swapTotalKb = p.swapTotalKb,
-                swapFreeKb = p.swapFreeKb,
-                batteryLevel = p.batteryLevel,
-                batteryTempCelsius = p.batteryTempCelsius,
-                batteryPowerWatt = p.batteryPowerWatt,
-                isCharging = p.isCharging,
-                isScreenOn = p.isScreenOn,
-                isAudioPlaying = p.isAudioPlaying,
-                isLocationActive = p.isLocationActive
-            )
+    suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats", EmptyPayload) { responseJson ->
+        val type = object : TypeToken<CerberusMessage<List<MetricsRecordPayload>>>() {}.type
+        val message = gson.fromJson<CerberusMessage<List<MetricsRecordPayload>>>(responseJson, type)
+        if (message?.type == "resp.history_stats") {
+            message.payload.map { p ->
+                 MetricsRecord(
+                    timestamp = p.timestamp,
+                    cpuUsagePercent = p.cpuUsagePercent,
+                    memTotalKb = p.memTotalKb,
+                    memAvailableKb = p.memAvailableKb,
+                    swapTotalKb = p.swapTotalKb,
+                    swapFreeKb = p.swapFreeKb,
+                    batteryLevel = p.batteryLevel,
+                    batteryTempCelsius = p.batteryTempCelsius,
+                    batteryPowerWatt = p.batteryPowerWatt,
+                    isCharging = p.isCharging,
+                    isScreenOn = p.isScreenOn,
+                    isAudioPlaying = p.isAudioPlaying,
+                    isLocationActive = p.isLocationActive
+                )
+            }
+        } else {
+            null
         }
     }
-
-    private suspend fun <T> query(queryType: String, payloadParser: (String) -> T): T? {
+    
+    // [重构] 泛型 query 函数
+    private suspend fun <ReqT, RespT> query(
+        queryType: String,
+        payload: ReqT,
+        responseParser: (String) -> RespT?
+    ): RespT? {
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
 
-        val requestMsg = CerberusMessage(type = queryType, requestId = reqId, payload = EmptyPayload)
+        val requestMsg = CerberusMessage(type = queryType, requestId = reqId, payload = payload)
         tcpClient.sendMessage(gson.toJson(requestMsg))
 
         return try {
             val responseJson = withTimeout(5000) { deferred.await() }
-            val expectedResponseType = queryType.replace("query.", "resp.")
-
-            val baseMsg = gson.fromJson(responseJson, BaseMessageWithPayload::class.java)
-            if (baseMsg?.type == expectedResponseType && baseMsg.payload != null) {
-                payloadParser(baseMsg.payload.toString())
-            } else {
-                Log.e("DaemonRepository", "Query '$queryType' received unexpected response type '${baseMsg?.type}' or null payload")
-                null
-            }
+            responseParser(responseJson)
         } catch (e: Exception) {
             Log.e("DaemonRepository", "Failed to query '$queryType': ${e.message}")
             pendingRequests.remove(reqId)
@@ -170,22 +182,10 @@ class DaemonRepository private constructor(
     }
 
     suspend fun getAllPolicies(): FullConfigPayload? {
-        val reqId = UUID.randomUUID().toString()
-        val deferred = CompletableDeferred<String>()
-        pendingRequests[reqId] = deferred
-
-        val requestMsg = CerberusMessage(type = "query.get_all_policies", requestId = reqId, payload = EmptyPayload)
-        tcpClient.sendMessage(gson.toJson(requestMsg))
-
-        return try {
-            val responseJson = withTimeout(5000) { deferred.await() }
+       return query("query.get_all_policies", EmptyPayload) { responseJson ->
             val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
             val message = gson.fromJson<CerberusMessage<FullConfigPayload>>(responseJson, type)
             if (message?.type == "resp.all_policies") message.payload else null
-        } catch (e: Exception) {
-            Log.e("DaemonRepository", "Failed to get all policies: ${e.message}")
-            pendingRequests.remove(reqId)
-            null
         }
     }
 
@@ -207,11 +207,6 @@ class DaemonRepository private constructor(
 
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
-    private data class BaseMessageWithPayload(
-        val type: String,
-        @SerializedName("req_id") val requestId: String?,
-        val payload: com.google.gson.JsonElement?
-    )
 
     companion object {
         @Volatile

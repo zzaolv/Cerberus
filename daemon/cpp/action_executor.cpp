@@ -213,21 +213,17 @@ std::string ActionExecutor::get_instance_cgroup_path(const AppInstanceKey& key) 
     return cgroup_root_path_ + "cerberus_" + sanitized_package_name + "_" + std::to_string(key.second);
 }
 
-// [核心修复] 增加对残留cgroup的预清理逻辑
+
 bool ActionExecutor::freeze_cgroup(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (cgroup_version_ != CgroupVersion::V2) return false;
     std::string instance_path = get_instance_cgroup_path(key);
 
-    // 如果cgroup目录已存在，这可能是上次异常退出的残留物。
-    // 我们先执行一次完整的清理流程，以确保我们从一个干净的状态开始。
     if (fs::exists(instance_path)) {
         LOGW("Residual cgroup found for %s. Attempting cleanup before freeze.", key.first.c_str());
-        // unfreeze_cgroup 包含了所有必要的重置操作：解冻、移出进程、尝试删除。
         unfreeze_cgroup(key);
     }
 
     if (!create_instance_cgroup(instance_path)) {
-        // 如果清理后创建仍然失败，则说明存在更严重的问题
         LOGE("Failed to create cgroup '%s' even after cleanup attempt.", instance_path.c_str());
         return false;
     }
@@ -259,8 +255,7 @@ bool ActionExecutor::unfreeze_cgroup(const AppInstanceKey& key) {
         move_pids_to_default_cgroup(pids_to_move); 
     }
     
-    // 短暂等待，给内核一点时间来处理进程迁移
-    usleep(20000); 
+    usleep(50000); 
 
     remove_instance_cgroup(instance_path);
     return true;
@@ -294,8 +289,6 @@ bool ActionExecutor::create_instance_cgroup(const std::string& path) {
 bool ActionExecutor::remove_instance_cgroup(const std::string& path) {
     if (!fs::exists(path)) return true;
     if (rmdir(path.c_str()) != 0) {
-        // 在高负载下，即使进程已移出，内核也可能未能及时更新cgroup状态
-        // 导致rmdir失败。这种情况可以接受，下次freeze时会被预清理逻辑处理。
         LOGW("Cannot remove cgroup '%s': %s. It might not be empty yet.", path.c_str(), strerror(errno));
         return false;
     }

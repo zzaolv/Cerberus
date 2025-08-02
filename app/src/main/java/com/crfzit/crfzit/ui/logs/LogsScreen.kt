@@ -1,8 +1,6 @@
 // app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
 package com.crfzit.crfzit.ui.logs
 
-// import android.util.Log // [核心修复] 不再需要
-// import androidx.compose.animation.AnimatedVisibility // [核心修复] 不再需要
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -22,11 +20,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogLevel
 import com.crfzit.crfzit.ui.stats.StatisticsScreen
-// [核心修复] 以下 Gson 和 data class 导入不再需要
-// import com.google.gson.Gson
-// import com.google.gson.JsonElement
-// import com.google.gson.annotations.SerializedName
-// import com.google.gson.reflect.TypeToken
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -75,7 +68,8 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 itemsIndexed(
                     items = uiState.logs,
                     key = { _, log ->
-                        "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}"
+                        // 使用更多信息确保Key的唯一性
+                        "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}-${log.originalLog.user_id}"
                     }
                 ) { _, log ->
                     LogItem(log = log)
@@ -99,7 +93,8 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
             val shouldLoadMore = remember(layoutInfo) {
                 derivedStateOf {
                     val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
-                    lastVisibleItem != null && lastVisibleItem.index >= layoutInfo.totalItemsCount - 5
+                    // 触发加载的阈值可以调大一些，比如最后10个
+                    lastVisibleItem != null && lastVisibleItem.index >= layoutInfo.totalItemsCount - 10
                 }
             }
 
@@ -112,19 +107,13 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
     }
 }
 
-// [核心修复] 这两个数据类不再需要，予以删除
-// data class ProcessActivity(...)
-// data class AppActivitySummary(...)
-
 @Composable
 fun LogItem(log: UiLogEntry) {
     val originalLog = log.originalLog
     
-    // [核心修复] 简化 LogItem，不再特殊处理报告。
-    // 直接渲染 message 字段，它现在包含了后端格式化好的所有信息。
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val (icon, color) = getLogAppearance(originalLog.level)
-    val displayAppName = log.appName ?: originalLog.packageName
+    
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
             append(formatter.format(Date(originalLog.timestamp)))
@@ -135,11 +124,12 @@ fun LogItem(log: UiLogEntry) {
         }
         append(" ")
 
-        // 对于报告类型的消息，其 message 已经包含了所有内容，无需再拼接应用名
-        if (originalLog.category != "报告" && !displayAppName.isNullOrEmpty()) {
+        // [核心修改] ViewModel已经处理好了应用名和分身标识
+        // 这里只需要判断是否需要显示应用名即可
+        if (originalLog.category != "报告" && !log.appName.isNullOrEmpty()) {
             append("应用 ‘")
             withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
-                append(displayAppName)
+                append(log.appName)
             }
             append("’ ")
         }
@@ -156,10 +146,6 @@ fun LogItem(log: UiLogEntry) {
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
     )
 }
-
-
-// [核心修复] ReportDetails Composable 不再需要，予以删除
-// @Composable private fun ReportDetails(...) {}
 
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {

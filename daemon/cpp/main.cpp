@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v31_pagination" // 版本号更新
+#define LOG_TAG "cerberusd_main_v32_file_log" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -52,18 +52,17 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [分页加载] 修改消息处理以支持新的分页参数
+        // [修改] 新的日志查询逻辑
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
-            long long since_ts = payload_json.value("since", 0LL);
-            long long before_ts = payload_json.value("before", 0LL);
-            int limit = payload_json.value("limit", 200);
+            std::string filename = payload_json.value("filename", "");
+            long long before_ts = payload_json.value("before", 9223372036854775807LL); // LLONG_MAX
+            int limit = payload_json.value("limit", 50);
 
-            auto logs = g_logger->get_logs(
-                since_ts > 0 ? std::optional(since_ts) : std::nullopt,
-                before_ts > 0 ? std::optional(before_ts) : std::nullopt,
-                limit
-            );
+            std::vector<LogEntry> logs;
+            if (!filename.empty()) {
+                logs = g_logger->get_logs_from_file(filename, limit, before_ts);
+            }
 
             json log_array = json::array();
             for(const auto& log : logs) { log_array.push_back(log.to_json()); }
@@ -72,6 +71,17 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 {"type", "resp.get_logs"},
                 {"req_id", msg.value("req_id", "")},
                 {"payload", log_array}
+            }.dump());
+            return;
+        }
+        
+        // [新] 获取日志文件列表的请求
+        if (type == "query.get_log_files") {
+            auto files = g_logger->get_log_files();
+            g_server->send_message(client_fd, json{
+                {"type", "resp.get_log_files"},
+                {"req_id", msg.value("req_id", "")},
+                {"payload", files}
             }.dump());
             return;
         }
@@ -127,8 +137,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
-
-// 其他函数 (handle_client_disconnect, broadcast_dashboard_update, worker_thread_func, main, etc.) 保持不变...
 
 void handle_client_disconnect(int client_fd) {
     LOGI("Client fd %d has disconnected.", client_fd);
