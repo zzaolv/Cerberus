@@ -48,8 +48,6 @@ class DaemonRepository private constructor(
             }
         }
 
-
-    // [分页加载] 修改getLogs函数，使其支持所有分页参数
     suspend fun getLogs(
         since: Long? = null,
         before: Long? = null,
@@ -70,7 +68,8 @@ class DaemonRepository private constructor(
 
             if (message?.type == "resp.get_logs") {
                 message.payload.map { p ->
-                    LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1, p.details)
+                    // [核心修复] 更新构造函数调用，不再传递 details
+                    LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
                 }
             } else {
                 Log.e("DaemonRepository", "Query 'get_logs' received unexpected response type '${message?.type}'")
@@ -114,7 +113,6 @@ class DaemonRepository private constructor(
         }
 
     suspend fun getAllLogs(): List<LogEntry>? {
-        // [分页加载] 此函数现在代理到新的 getLogs 函数，用于初始加载
         return getLogs(limit = 50)
     }
 

@@ -1,9 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
 package com.crfzit.crfzit.data.model
 
-// [内存优化] Drawable已从数据模型中移除。这是一个非常重要的改动。
-// import android.graphics.drawable.Drawable
-import com.google.gson.JsonElement
+// import com.google.gson.JsonElement // [核心修复] 不再需要
 
 enum class Policy(val value: Int) {
     EXEMPTED(0),
@@ -19,8 +17,6 @@ enum class Policy(val value: Int) {
 data class AppInfo(
     val packageName: String,
     val appName: String,
-    // [内存优化] 移除 icon 字段，极大地减小了每个AppInfo对象的内存占用。
-    // val icon: Drawable?,
     val isSystemApp: Boolean,
     val userId: Int = 0,
 
@@ -57,8 +53,9 @@ data class LogEntry(
     val category: String,
     val message: String,
     val packageName: String?,
-    val userId: Int = -1,
-    val details: JsonElement? = null
+    val userId: Int = -1
+    // [核心修复] 移除 details 字段
+    // val details: JsonElement? = null 
 )
 
 data class MetricsRecord(

@@ -1,8 +1,8 @@
 // app/src/main/java/com/crfzit/crfzit/ui/logs/LogsScreen.kt
 package com.crfzit.crfzit.ui.logs
 
-import android.util.Log
-import androidx.compose.animation.AnimatedVisibility
+// import android.util.Log // [核心修复] 不再需要
+// import androidx.compose.animation.AnimatedVisibility // [核心修复] 不再需要
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -22,10 +22,11 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.crfzit.crfzit.data.model.LogLevel
 import com.crfzit.crfzit.ui.stats.StatisticsScreen
-import com.google.gson.Gson
-import com.google.gson.JsonElement
-import com.google.gson.annotations.SerializedName
-import com.google.gson.reflect.TypeToken
+// [核心修复] 以下 Gson 和 data class 导入不再需要
+// import com.google.gson.Gson
+// import com.google.gson.JsonElement
+// import com.google.gson.annotations.SerializedName
+// import com.google.gson.reflect.TypeToken
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -111,142 +112,54 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
     }
 }
 
-// [核心修复] 重命名数据类以匹配C++侧的JSON结构和逻辑命名
-data class ProcessActivity(
-    @SerializedName("process_name")
-    val processName: String,
-    @SerializedName("cpu_seconds")
-    val cpuSeconds: Double
-)
-data class AppActivitySummary(
-    @SerializedName("app_name")
-    val appName: String,
-    @SerializedName("package_name")
-    val packageName: String,
-    @SerializedName("total_cpu_seconds")
-    val totalCpuSeconds: Double,
-    val processes: List<ProcessActivity>
-)
-
+// [核心修复] 这两个数据类不再需要，予以删除
+// data class ProcessActivity(...)
+// data class AppActivitySummary(...)
 
 @Composable
 fun LogItem(log: UiLogEntry) {
     val originalLog = log.originalLog
-    val isReport = originalLog.category == "报告" && originalLog.details != null && !originalLog.details.isJsonNull
-
-    val cardColors = if (isReport) {
-        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
-    } else {
-        CardDefaults.cardColors(containerColor = Color.Transparent)
-    }
-
-    val cardElevation = if (isReport) CardDefaults.cardElevation() else CardDefaults.cardElevation(defaultElevation = 0.dp)
-
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = cardColors,
-        elevation = cardElevation
-    ) {
-        Column(
-            modifier = Modifier.padding(
-                horizontal = if(isReport) 12.dp else 0.dp,
-                vertical = if(isReport) 12.dp else 2.dp
-            )
-        ) {
-            val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-            val (icon, color) = getLogAppearance(originalLog.level)
-            val displayAppName = log.appName ?: originalLog.packageName
-            val annotatedString = buildAnnotatedString {
-                withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-                    append(formatter.format(Date(originalLog.timestamp)))
-                }
-                append(" ")
-                withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
-                    append("$icon[${originalLog.category}]")
-                }
-                append(" ")
-                if (!displayAppName.isNullOrEmpty()) {
-                    append("应用 ‘")
-                    withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
-                        append(displayAppName)
-                    }
-                    append("’ ")
-                }
-                append(originalLog.message)
-            }
-            Text(
-                text = annotatedString,
-                style = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = FontFamily.Monospace,
-                    lineHeight = 16.sp
-                )
-            )
-
-            AnimatedVisibility(visible = isReport) {
-                ReportDetails(details = originalLog.details)
-            }
+    
+    // [核心修复] 简化 LogItem，不再特殊处理报告。
+    // 直接渲染 message 字段，它现在包含了后端格式化好的所有信息。
+    val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val (icon, color) = getLogAppearance(originalLog.level)
+    val displayAppName = log.appName ?: originalLog.packageName
+    val annotatedString = buildAnnotatedString {
+        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
+            append(formatter.format(Date(originalLog.timestamp)))
         }
+        append(" ")
+        withStyle(style = SpanStyle(color = color, fontWeight = FontWeight.Bold)) {
+            append("$icon[${originalLog.category}]")
+        }
+        append(" ")
+
+        // 对于报告类型的消息，其 message 已经包含了所有内容，无需再拼接应用名
+        if (originalLog.category != "报告" && !displayAppName.isNullOrEmpty()) {
+            append("应用 ‘")
+            withStyle(style = SpanStyle(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)) {
+                append(displayAppName)
+            }
+            append("’ ")
+        }
+        
+        append(originalLog.message)
     }
+
+    Text(
+        text = annotatedString,
+        style = MaterialTheme.typography.bodySmall.copy(
+            fontFamily = FontFamily.Monospace,
+            lineHeight = 16.sp
+        ),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+    )
 }
 
-@Composable
-private fun ReportDetails(details: JsonElement?) {
-    // [核心修复] 使用正确的数据类 AppActivitySummary 进行JSON解析
-    val reportData: List<AppActivitySummary> = remember(details) {
-        try {
-            if (details != null && !details.isJsonNull) {
-                val type = object : TypeToken<List<AppActivitySummary>>() {}.type
-                Gson().fromJson(details, type) ?: emptyList()
-            } else {
-                emptyList()
-            }
-        } catch (e: Exception) {
-            Log.e("ReportDetails", "Failed to parse Doze report details.", e)
-            emptyList()
-        }
-    }
 
-    Spacer(Modifier.height(8.dp))
-
-    if (reportData.isEmpty()) {
-        Text("Doze期间无明显应用活动。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 16.dp))
-    } else {
-        reportData.take(5).forEach { appActivity ->
-            Column(Modifier.padding(start = 8.dp, top = 4.dp)) {
-                Text(
-                    buildAnnotatedString {
-                        withStyle(style = SpanStyle(fontWeight = FontWeight.Bold)) {
-                            append("▶ ${appActivity.appName}")
-                        }
-                        withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
-                            append(" (${appActivity.packageName})")
-                        }
-                        append(" - 总计: ${"%.3f".format(appActivity.totalCpuSeconds)}s")
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    lineHeight = 16.sp
-                )
-
-                appActivity.processes.sortedByDescending { it.cpuSeconds }.take(3).forEach { process ->
-                    Text(
-                        text = "  - ${process.processName}: ${"%.3f".format(process.cpuSeconds)}s",
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        modifier = Modifier.padding(start = 16.dp),
-                        lineHeight = 16.sp
-                    )
-                }
-            }
-        }
-        if (reportData.size > 5) {
-            Text(
-                text = "...等 ${reportData.size - 5} 个其他应用。",
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(start = 8.dp, top = 4.dp)
-            )
-        }
-    }
-}
+// [核心修复] ReportDetails Composable 不再需要，予以删除
+// @Composable private fun ReportDetails(...) {}
 
 @Composable
 fun getLogAppearance(level: LogLevel): Pair<String, Color> {

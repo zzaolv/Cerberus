@@ -1,7 +1,7 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/IPCModels.kt
 package com.crfzit.crfzit.data.model
 
-import com.google.gson.JsonElement
+// import com.google.gson.JsonElement // [核心修复] 不再需要
 import com.google.gson.annotations.SerializedName
 
 // --- 通用消息结构 (保持不变) ---
@@ -115,8 +115,9 @@ data class LogEntryPayload(
     val category: String,
     val message: String,
     @SerializedName("package_name") val packageName: String?,
-    @SerializedName("user_id") val userId: Int?,
-    val details: JsonElement? = null
+    @SerializedName("user_id") val userId: Int?
+    // [核心修复] 移除 details 字段
+    // val details: JsonElement? = null
 )
 
 data class MetricsRecordPayload(
@@ -135,7 +136,6 @@ data class MetricsRecordPayload(
     @SerializedName("is_location_active") val isLocationActive: Boolean
 )
 
-// [分页加载] 扩展日志请求Payload
 data class GetLogsPayload(
     val since: Long? = null,
     val before: Long? = null,

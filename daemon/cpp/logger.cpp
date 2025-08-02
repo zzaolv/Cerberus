@@ -8,15 +8,15 @@
 #include <algorithm>
 #include <android/log.h>
 
-#define LOG_TAG "cerberusd_logger_v4_pagination"
+#define LOG_TAG "cerberusd_logger_v5_no_details" // 版本号更新
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
 
-// [核心修复] 添加对静态成员变量的定义
 std::shared_ptr<Logger> Logger::instance_ = nullptr;
 std::mutex Logger::instance_mutex_;
 
+// [核心修复] 从 to_json 中移除 details
 json LogEntry::to_json() const {
     json j = {
         {"timestamp", timestamp_ms},
@@ -26,9 +26,9 @@ json LogEntry::to_json() const {
         {"package_name", package_name},
         {"user_id", user_id}
     };
-    if (!details.is_null()) {
-        j["details"] = details;
-    }
+    // if (!details.is_null()) {
+    //     j["details"] = details;
+    // }
     return j;
 }
 
@@ -67,12 +67,13 @@ void Logger::stop() {
     }
 }
 
-void Logger::log(LogLevel level, const std::string& category, const std::string& message, const std::string& package_name, int user_id, const json& details) {
+// [核心修复] 移除 details 参数
+void Logger::log(LogLevel level, const std::string& category, const std::string& message, const std::string& package_name, int user_id) {
     long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 
-    LogEntry entry{timestamp, level, category, message, package_name, user_id, details};
+    LogEntry entry{timestamp, level, category, message, package_name, user_id};
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -147,15 +148,16 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs,
             if (before_timestamp_ms.has_value() && timestamp >= before_timestamp_ms.value()) {
                 continue;
             }
-
+            
+            // [核心修复] 移除 details 的解析
             LogEntry entry{
                 .timestamp_ms = timestamp,
                 .level = static_cast<LogLevel>(j.value("lvl", 0)),
                 .category = j.value("cat", ""),
                 .message = j.value("msg", ""),
                 .package_name = j.value("pkg", ""),
-                .user_id = j.value("uid", -1),
-                .details = j.value("details", nullptr)
+                .user_id = j.value("uid", -1)
+                // .details = j.value("details", nullptr) // 移除
             };
             out_logs.push_back(entry);
         } catch (const json::exception& e) {
@@ -168,12 +170,12 @@ void Logger::read_logs_from_file(std::vector<LogEntry>& out_logs,
 void Logger::ensure_log_file() {
     time_t now = time(nullptr);
     tm ltm = {};
-    localtime_r(&now,&ltm);
+    localtime_r(&now,<m);
 
     if (ltm.tm_yday != current_day_) {
         current_day_ = ltm.tm_yday;
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d",&ltm);
+        strftime(buf, sizeof(buf), "%Y-%m-%d",<m);
         current_log_file_path_ = fs::path(log_dir_path_) / (std::string("events-") + buf + ".log");
     }
 }
@@ -199,6 +201,7 @@ void Logger::writer_thread_func() {
         }
 
         for (const auto& entry : temp_queue) {
+            // [核心修复] 移除 details 的序列化
             json file_json = {
                 {"ts", entry.timestamp_ms},
                 {"lvl", static_cast<int>(entry.level)},
@@ -207,7 +210,7 @@ void Logger::writer_thread_func() {
             };
             if (!entry.package_name.empty()) file_json["pkg"] = entry.package_name;
             if (entry.user_id != -1) file_json["uid"] = entry.user_id;
-            if (!entry.details.is_null()) file_json["details"] = entry.details;
+            // if (!entry.details.is_null()) file_json["details"] = entry.details; // 移除
 
             log_file << file_json.dump() << std::endl;
         }

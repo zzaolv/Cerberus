@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v36_final_fix" // 最终修复版本
+#define LOG_TAG "cerberusd_state_v37_report_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -480,7 +480,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "org.lineageos.setupwizard.auto_generated_rro_product__",
         "org.lineageos.updater.auto_generated_rro_product__",
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
-    };
+      };
 
     load_all_configs();
     next_scan_iterator_ = managed_apps_.begin();
@@ -536,7 +536,6 @@ bool StateManager::perform_staggered_stats_scan() {
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
     
-    // [修复问题 #3] 直接获取前台应用集合，不再有“假前台”的概念
     auto visible_app_keys = sys_monitor_->get_visible_app_keys();
     
     state_has_changed |= update_foreground_state(visible_app_keys);
@@ -584,13 +583,11 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
+// [核心修复] 重写此函数以生成格式化字符串，而不是JSON
 void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
         std::string process_name;
         double cpu_seconds;
-        json to_json() const {
-            return {{"process_name", process_name}, {"cpu_seconds", cpu_seconds}};
-        }
     };
 
     struct AppActivitySummary {
@@ -598,18 +595,6 @@ void StateManager::generate_doze_exit_report() {
         std::string package_name;
         double total_cpu_seconds = 0.0;
         std::vector<ProcessActivity> processes;
-        json to_json() const {
-            json proc_array = json::array();
-            for (const auto& p : processes) {
-                proc_array.push_back(p.to_json());
-            }
-            return {
-                {"app_name", app_name},
-                {"package_name", package_name},
-                {"total_cpu_seconds", total_cpu_seconds},
-                {"processes", proc_array}
-            };
-        }
     };
 
     std::map<AppInstanceKey, AppActivitySummary> grouped_activities;
@@ -620,21 +605,13 @@ void StateManager::generate_doze_exit_report() {
         long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid});
         if (end_jiffies > start_record.start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) {
+            if (cpu_seconds > 0.01) { // 过滤掉微不足道的活动
                 AppInstanceKey key = {start_record.package_name, start_record.user_id};
-
                 if (grouped_activities.find(key) == grouped_activities.end()) {
-                    AppActivitySummary summary;
-                    summary.package_name = key.first;
                     auto it = managed_apps_.find(key);
-                    if (it != managed_apps_.end()) {
-                        summary.app_name = it->second.app_name;
-                    } else {
-                        summary.app_name = key.first;
-                    }
-                    grouped_activities[key] = summary;
+                    grouped_activities[key].app_name = (it != managed_apps_.end()) ? it->second.app_name : key.first;
+                    grouped_activities[key].package_name = key.first;
                 }
-
                 grouped_activities[key].processes.push_back({start_record.process_name, cpu_seconds});
                 grouped_activities[key].total_cpu_seconds += cpu_seconds;
             }
@@ -642,7 +619,7 @@ void StateManager::generate_doze_exit_report() {
     }
 
     if (grouped_activities.empty()) {
-        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动");
+        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动。");
         return;
     }
 
@@ -654,13 +631,25 @@ void StateManager::generate_doze_exit_report() {
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
-    json details_array = json::array();
+    std::stringstream report_ss;
+    report_ss << "Doze期间应用的CPU活跃时间:";
+
     for (const auto& summary : sorted_apps) {
-        details_array.push_back(summary.to_json());
+        report_ss << "\n▶ " << summary.app_name << " (" << summary.package_name << ") - 总计: "
+                  << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
+        
+        // 为了简洁，只显示超过1个进程或进程名与包名不符的详细信息
+        if (summary.processes.size() > 1 || (summary.processes.size() == 1 && summary.processes[0].process_name != summary.package_name)) {
+             for (const auto& proc : summary.processes) {
+                report_ss << "\n  - " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
+            }
+        }
     }
 
-    logger_->log(LogLevel::REPORT, "报告", "Doze期间应用的CPU活跃时间", "", -1, details_array);
+    // 使用格式化后的字符串作为 message 发送日志
+    logger_->log(LogLevel::REPORT, "报告", report_ss.str());
 }
+
 
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (old_record.is_charging != new_record.is_charging) {
@@ -835,7 +824,6 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
     return state_has_changed;
 }
 
-// [修复问题 #2] `update_foreground_state_from_pids` 现在能处理新发现的应用
 bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pids) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
