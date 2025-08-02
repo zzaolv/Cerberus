@@ -26,7 +26,7 @@
 #include <unordered_set>
 #include <numeric>
 
-#define LOG_TAG "cerberusd_monitor_v30_simplified_fg" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v31_full_procname" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -177,7 +177,6 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-// [修复问题 #3] 简化函数，只返回一个集合
 std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
     std::lock_guard<std::mutex> lock(visible_apps_mutex_);
     auto now = std::chrono::steady_clock::now();
@@ -200,13 +199,11 @@ std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
     std::stringstream ss(dumpsys_output);
     std::string line;
     
-    // 从后向前查找，因为相关信息总是在输出的末尾
     std::vector<std::string> lines;
     while(std::getline(ss, line)) {
         lines.push_back(line);
     }
     
-    // 限制只检查最后15行，提高效率
     size_t start_index = (lines.size() > 15) ? (lines.size() - 15) : 0;
     
     for (size_t i = start_index; i < lines.size(); ++i) {
@@ -229,7 +226,6 @@ std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
                     } catch (...) { /* ignore parse errors */ }
                 }
             }
-            // 找到后就可以停止了，因为这是最后的信息
             break;
         }
     }
@@ -822,7 +818,17 @@ void SystemMonitor::update_app_stats(const std::vector<int>& pids, long& total_m
     }
 }
 
+// [核心修复] 优先使用完整的 cmdline，解决进程名截断问题
 std::string SystemMonitor::get_app_name_from_pid(int pid) {
+    // 1. 优先尝试 cmdline，因为它最完整
+    std::string cmdline = read_file_once("/proc/" + std::to_string(pid) + "/cmdline");
+    if (!cmdline.empty()) {
+        size_t null_pos = cmdline.find('\0');
+        if(null_pos != std::string::npos) cmdline.resize(null_pos);
+        if(!cmdline.empty()) return cmdline;
+    }
+
+    // 2. 如果 cmdline 失败，回退到 status 文件
     std::string status_content = read_file_once("/proc/" + std::to_string(pid) + "/status");
     if (!status_content.empty()) {
         std::stringstream ss(status_content);
@@ -830,18 +836,14 @@ std::string SystemMonitor::get_app_name_from_pid(int pid) {
         while (std::getline(ss, line)) {
             if (line.rfind("Name:", 0) == 0) {
                 std::string name = line.substr(line.find(":") + 1);
+                // 清理前后空格
                 name.erase(0, name.find_first_not_of(" \t"));
                 name.erase(name.find_last_not_of(" \t\n") + 1);
                 return name;
             }
         }
     }
-    std::string cmdline = read_file_once("/proc/" + std::to_string(pid) + "/cmdline");
-    if (!cmdline.empty()) {
-        size_t null_pos = cmdline.find('\0');
-        if(null_pos != std::string::npos) cmdline.resize(null_pos);
-        return cmdline;
-    }
+    
     return "Unknown";
 }
 

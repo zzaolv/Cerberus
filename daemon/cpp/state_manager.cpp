@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v38_hierarchical_report" // 版本号更新
+#define LOG_TAG "cerberusd_state_v39_report_grouping" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -583,7 +583,6 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [核心修改] 重写此函数以生成分层日志
 void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
         std::string process_name;
@@ -603,14 +602,23 @@ void StateManager::generate_doze_exit_report() {
     if (TCK <= 0) return;
 
     for (const auto& [pid, start_record] : doze_start_process_info_) {
+        // [核心修复] 确保start_record中的package_name是规范化的根包名
+        std::string base_package_name = start_record.package_name;
+        size_t colon_pos = base_package_name.find(':');
+        if (colon_pos != std::string::npos) {
+            base_package_name = base_package_name.substr(0, colon_pos);
+        }
+
         long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid});
         if (end_jiffies > start_record.start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) { // 过滤掉微不足道的活动
-                AppInstanceKey key = {start_record.package_name, start_record.user_id};
+            if (cpu_seconds > 0.01) {
+                // 使用规范化的包名作为Key
+                AppInstanceKey key = {base_package_name, start_record.user_id};
                 if (grouped_activities.find(key) == grouped_activities.end()) {
                     auto it = managed_apps_.find(key);
-                    grouped_activities[key].app_name = (it != managed_apps_.end()) ? it->second.app_name : key.first;
+                    // [核心修复] 优先使用AppRuntimeState中的appName，如果找不到，则使用根包名
+                    grouped_activities[key].app_name = (it != managed_apps_.end() && !it->second.app_name.empty()) ? it->second.app_name : key.first;
                     grouped_activities[key].package_name = key.first;
                     grouped_activities[key].user_id = key.second;
                 }
@@ -625,7 +633,6 @@ void StateManager::generate_doze_exit_report() {
         return;
     }
 
-    // 1. 先记录一个父条目
     logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间：");
 
     std::vector<AppActivitySummary> sorted_apps;
@@ -635,25 +642,20 @@ void StateManager::generate_doze_exit_report() {
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
-    // 2. 循环为每个应用记录一个格式化的子条目
     for (const auto& summary : sorted_apps) {
         std::stringstream report_ss;
         
-        // 第一行：应用名和总时间
         report_ss << summary.app_name << " 总计: "
                   << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
         
-        // 如果有详细进程，则添加 "包括:"
         if (!summary.processes.empty()) {
-            report_ss << "\n包括:"; // 使用 \n 来换行
+            report_ss << "\n包括:";
         }
         
-        // 后续行：每个进程的详细信息
         for (const auto& proc : summary.processes) {
             report_ss << "\n- " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
         }
 
-        // 记录这个应用的报告
         logger_->log(LogLevel::REPORT, "报告", report_ss.str(), summary.package_name, summary.user_id);
     }
 }
@@ -1583,10 +1585,18 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
 
+    // [核心修复] 只有在app_name是默认包名时，才尝试用进程名更新它
+    // 这避免了用一个不重要的进程名（如:push）覆盖掉一个好的进程名
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
         if (!friendly_name.empty()) {
-            app->app_name = friendly_name;
+            // 再次规范化，确保不会把 a.b:push 存为 app_name
+            size_t colon_pos = friendly_name.find(':');
+            if (colon_pos != std::string::npos) {
+                app->app_name = friendly_name.substr(0, colon_pos);
+            } else {
+                app->app_name = friendly_name;
+            }
         }
     }
 
