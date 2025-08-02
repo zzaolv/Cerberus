@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v32_file_log" // 版本号更新
+#define LOG_TAG "cerberusd_main_v33_polling" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -52,16 +52,20 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [修改] 新的日志查询逻辑
+        // [修改] 最终版的日志查询逻辑
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
             std::string filename = payload_json.value("filename", "");
-            long long before_ts = payload_json.value("before", 9223372036854775807LL); // LLONG_MAX
+            long long before_ts = payload_json.value("before", 0LL);
+            long long since_ts = payload_json.value("since", 0LL);
             int limit = payload_json.value("limit", 50);
 
             std::vector<LogEntry> logs;
             if (!filename.empty()) {
-                logs = g_logger->get_logs_from_file(filename, limit, before_ts);
+                // 现在 get_logs_from_file 可以处理 since 和 before
+                logs = g_logger->get_logs_from_file(filename, limit, 
+                    before_ts > 0 ? std::optional(before_ts) : std::nullopt,
+                    since_ts > 0 ? std::optional(since_ts) : std::nullopt);
             }
 
             json log_array = json::array();
@@ -75,7 +79,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
         
-        // [新] 获取日志文件列表的请求
         if (type == "query.get_log_files") {
             auto files = g_logger->get_log_files();
             g_server->send_message(client_fd, json{

@@ -10,7 +10,7 @@
 #include <vector>
 #include <regex>
 
-#define LOG_TAG "cerberusd_logger_v6_rotation" // 版本号更新
+#define LOG_TAG "cerberusd_logger_v7_polling" // 版本号更新
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
@@ -33,7 +33,6 @@ json LogEntry::to_json() const {
     return j;
 }
 
-// --- Logger Singleton ---
 std::shared_ptr<Logger> Logger::instance_ = nullptr;
 std::mutex Logger::instance_mutex_;
 
@@ -47,9 +46,6 @@ std::shared_ptr<Logger> Logger::get_instance(const std::string& log_dir_path) {
     }
     return instance_;
 }
-
-
-// --- Logger Implementation ---
 Logger::Logger(const std::string& log_dir_path)
     : log_dir_path_(log_dir_path), is_running_(true) {
     if (!fs::exists(log_dir_path_)) {
@@ -58,11 +54,9 @@ Logger::Logger(const std::string& log_dir_path)
     manage_log_files(); // 初始化时就管理一下
     writer_thread_ = std::thread(&Logger::writer_thread_func, this);
 }
-
 Logger::~Logger() {
     stop();
 }
-
 void Logger::stop() {
     if (!is_running_.exchange(false)) return;
     cv_.notify_one();
@@ -70,7 +64,6 @@ void Logger::stop() {
         writer_thread_.join();
     }
 }
-
 void Logger::log(LogLevel level, const std::string& category, const std::string& message, const std::string& package_name, int user_id) {
     long long timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
@@ -83,8 +76,6 @@ void Logger::log(LogLevel level, const std::string& category, const std::string&
     }
     cv_.notify_one();
 }
-
-// [新] 批量日志方法
 void Logger::log_batch(const std::vector<LogEntry>& entries) {
     if (entries.empty()) return;
     {
@@ -95,7 +86,6 @@ void Logger::log_batch(const std::vector<LogEntry>& entries) {
     }
     cv_.notify_one();
 }
-
 std::vector<std::string> Logger::get_log_files() const {
     std::vector<std::string> files;
     try {
@@ -110,13 +100,14 @@ std::vector<std::string> Logger::get_log_files() const {
     } catch (const fs::filesystem_error& e) {
         LOGE("Error listing log files: %s", e.what());
     }
-    // 按文件名降序排序 (fct_2024-01-02_1 > fct_2024-01-01_3)
     std::sort(files.rbegin(), files.rend());
     return files;
 }
 
-// [修改] 按文件名正向读取日志
-std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, int limit, long long before_timestamp_ms) const {
+// [修改] 实现 since 和 before 的逻辑
+std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, int limit,
+                                                 std::optional<long long> before_timestamp_ms,
+                                                 std::optional<long long> since_timestamp_ms) const {
     std::vector<LogEntry> results;
     fs::path file_path = fs::path(log_dir_path_) / filename;
 
@@ -125,22 +116,29 @@ std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, in
     std::ifstream log_file(file_path);
     if (!log_file.is_open()) return results;
 
+    // 为了 polling (since)，我们需要正向读取
     std::vector<std::string> lines;
     std::string line;
     while (std::getline(log_file, line)) {
         lines.push_back(line);
     }
 
-    // 从后往前遍历行，以获取最新的日志
+    // 从后往前遍历，这样可以很容易地应用 limit 和 before
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
-        if (results.size() >= limit) break;
+        if (limit > 0 && results.size() >= limit && !since_timestamp_ms) break;
 
         try {
             json j = json::parse(*it);
             long long timestamp = j.value("ts", 0LL);
 
-            if (timestamp >= before_timestamp_ms) {
-                continue; // 跳过比 before_timestamp_ms 更新或相等的日志
+            if (before_timestamp_ms.has_value() && timestamp >= before_timestamp_ms.value()) {
+                continue;
+            }
+            
+            if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
+                // 如果是 polling 请求，读到比 since 旧的就停止
+                if (!before_timestamp_ms.has_value()) break; 
+                else continue;
             }
             
             LogEntry entry{
@@ -152,9 +150,28 @@ std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, in
                 .user_id = j.value("uid", -1)
             };
             results.push_back(entry);
-        } catch (const json::exception& e) { /* ignore malformed lines */ }
+        } catch (...) { /* ignore */ }
     }
-    // 注意：这里返回的日志是时间降序的，前端可以直接使用
+
+    // 如果是 polling，结果需要是时间升序的
+    if (since_timestamp_ms.has_value()) {
+        std::reverse(results.begin(), results.end());
+    }
+    
+    // Polling 也可能从内存队列获取
+    if (since_timestamp_ms) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for(const auto& entry : log_queue_) {
+            if (entry.timestamp_ms > since_timestamp_ms.value()) {
+                results.push_back(entry);
+            }
+        }
+        // 再次排序确保内存和文件的日志顺序正确
+        std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+            return a.timestamp_ms < b.timestamp_ms;
+        });
+    }
+
     return results;
 }
 
@@ -204,8 +221,6 @@ void Logger::manage_log_files() {
         current_log_line_count_ = std::count(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>(), '\n');
     }
 }
-
-
 void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     time_t now = time(nullptr);
     tm ltm = {};
@@ -240,12 +255,7 @@ void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
         cleanup_old_files();
     }
 }
-
-void Logger::cleanup_old_files() {
-     // 这部分逻辑现在移到 manage_log_files 中，定期执行
-}
-
-
+void Logger::cleanup_old_files() {}
 void Logger::writer_thread_func() {
     while (is_running_) {
         std::unique_lock<std::mutex> lock(queue_mutex_);

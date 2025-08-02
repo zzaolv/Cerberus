@@ -55,22 +55,19 @@ public:
     void log(LogLevel level, const std::string& category, const std::string& message,
              const std::string& package_name = "", int user_id = -1);
     
-    // [新] 批量日志记录，用于Doze报告
     void log_batch(const std::vector<LogEntry>& entries);
 
-    // [修改] get_logs 现在接受文件名
-    std::vector<LogEntry> get_logs_from_file(const std::string& filename, int limit, long long before_timestamp_ms) const;
+    // [修改] get_logs_from_file 现在支持 since 和 before
+    std::vector<LogEntry> get_logs_from_file(const std::string& filename, int limit,
+                                             std::optional<long long> before_timestamp_ms,
+                                             std::optional<long long> since_timestamp_ms) const;
     
-    // [新] 获取日志文件列表
     std::vector<std::string> get_log_files() const;
-
     void stop();
 
 private:
     explicit Logger(const std::string& log_dir_path);
     void writer_thread_func();
-    
-    // [新] 文件管理逻辑
     void manage_log_files();
     void rotate_log_file_if_needed(size_t new_entries_count);
     void cleanup_old_files();

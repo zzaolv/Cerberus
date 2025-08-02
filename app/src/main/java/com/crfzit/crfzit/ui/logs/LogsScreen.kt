@@ -68,8 +68,8 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
                 itemsIndexed(
                     items = uiState.logs,
                     key = { _, log ->
-                        // 使用更多信息确保Key的唯一性
-                        "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}-${log.originalLog.user_id}"
+                        // [修正] 使用正确的驼峰命名
+                        "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.packageName}-${log.originalLog.userId}"
                     }
                 ) { _, log ->
                     LogItem(log = log)
@@ -110,10 +110,10 @@ fun EventTimelineTab(viewModel: LogsViewModel) {
 @Composable
 fun LogItem(log: UiLogEntry) {
     val originalLog = log.originalLog
-    
+
     val formatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val (icon, color) = getLogAppearance(originalLog.level)
-    
+
     val annotatedString = buildAnnotatedString {
         withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
             append(formatter.format(Date(originalLog.timestamp)))
@@ -133,7 +133,7 @@ fun LogItem(log: UiLogEntry) {
             }
             append("’ ")
         }
-        
+
         append(originalLog.message)
     }
 

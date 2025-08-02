@@ -70,13 +70,13 @@ class DaemonRepository private constructor(
         }
     }
 
-    // [修改] getLogs 现在按文件获取
     suspend fun getLogs(
         filename: String,
         before: Long? = null,
+        since: Long? = null,
         limit: Int? = null
     ): List<LogEntry>? {
-        val payload = GetLogsByFilePayload(filename = filename, before = before, limit = limit)
+        val payload = GetLogsByFilePayload(filename = filename, before = before, since = since, limit = limit)
         return query("query.get_logs", payload) { responseJson ->
             val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
             val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
@@ -91,8 +91,7 @@ class DaemonRepository private constructor(
             }
         }
     }
-
-
+    
     fun getStatsStream(): Flow<MetricsRecord> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
