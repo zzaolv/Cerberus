@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v37_report_fix" // 版本号更新
+#define LOG_TAG "cerberusd_state_v38_hierarchical_report" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -583,7 +583,7 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [核心修复] 重写此函数以生成格式化字符串，而不是JSON
+// [核心修改] 重写此函数以生成分层日志
 void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
         std::string process_name;
@@ -593,6 +593,7 @@ void StateManager::generate_doze_exit_report() {
     struct AppActivitySummary {
         std::string app_name;
         std::string package_name;
+        int user_id;
         double total_cpu_seconds = 0.0;
         std::vector<ProcessActivity> processes;
     };
@@ -611,6 +612,7 @@ void StateManager::generate_doze_exit_report() {
                     auto it = managed_apps_.find(key);
                     grouped_activities[key].app_name = (it != managed_apps_.end()) ? it->second.app_name : key.first;
                     grouped_activities[key].package_name = key.first;
+                    grouped_activities[key].user_id = key.second;
                 }
                 grouped_activities[key].processes.push_back({start_record.process_name, cpu_seconds});
                 grouped_activities[key].total_cpu_seconds += cpu_seconds;
@@ -619,35 +621,41 @@ void StateManager::generate_doze_exit_report() {
     }
 
     if (grouped_activities.empty()) {
-        logger_->log(LogLevel::REPORT, "报告", "Doze期间无明显应用活动。");
+        logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间无明显应用活动。");
         return;
     }
+
+    // 1. 先记录一个父条目
+    logger_->log(LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间：");
 
     std::vector<AppActivitySummary> sorted_apps;
     for (auto const& [key, val] : grouped_activities) {
         sorted_apps.push_back(val);
     }
-
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
-    std::stringstream report_ss;
-    report_ss << "Doze期间应用的CPU活跃时间:";
-
+    // 2. 循环为每个应用记录一个格式化的子条目
     for (const auto& summary : sorted_apps) {
-        report_ss << "\n▶ " << summary.app_name << " (" << summary.package_name << ") - 总计: "
+        std::stringstream report_ss;
+        
+        // 第一行：应用名和总时间
+        report_ss << summary.app_name << " 总计: "
                   << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
         
-        // 为了简洁，只显示超过1个进程或进程名与包名不符的详细信息
-        if (summary.processes.size() > 1 || (summary.processes.size() == 1 && summary.processes[0].process_name != summary.package_name)) {
-             for (const auto& proc : summary.processes) {
-                report_ss << "\n  - " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
-            }
+        // 如果有详细进程，则添加 "包括:"
+        if (!summary.processes.empty()) {
+            report_ss << "\n包括:"; // 使用 \n 来换行
         }
-    }
+        
+        // 后续行：每个进程的详细信息
+        for (const auto& proc : summary.processes) {
+            report_ss << "\n- " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
+        }
 
-    // 使用格式化后的字符串作为 message 发送日志
-    logger_->log(LogLevel::REPORT, "报告", report_ss.str());
+        // 记录这个应用的报告
+        logger_->log(LogLevel::REPORT, "报告", report_ss.str(), summary.package_name, summary.user_id);
+    }
 }
 
 
