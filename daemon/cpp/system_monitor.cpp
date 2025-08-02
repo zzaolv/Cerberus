@@ -26,13 +26,15 @@
 #include <unordered_set>
 #include <numeric>
 
-#define LOG_TAG "cerberusd_monitor_v28_audio_fix" // 版本号更新
+#define LOG_TAG "cerberusd_monitor_v30_simplified_fg" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+constexpr long long CACHE_DURATION_MS = 2000;
 
 SystemMonitor::ProcFileReader::ProcFileReader(std::string path) : path_(std::move(path)) {}
 
@@ -166,6 +168,8 @@ SystemMonitor::SystemMonitor() : proc_stat_reader_("/proc/stat") {
     }
     float dummy_usage;
     update_cpu_usage(dummy_usage);
+    last_screen_state_check_time_ = {};
+    last_visible_apps_check_time_ = {};
 }
 
 SystemMonitor::~SystemMonitor() {
@@ -173,67 +177,65 @@ SystemMonitor::~SystemMonitor() {
     stop_network_snapshot_thread();
 }
 
-// [前台识别] 重构 get_visible_app_keys 函数
-VisibleAppsResult SystemMonitor::get_visible_app_keys() {
-    VisibleAppsResult result;
+// [修复问题 #3] 简化函数，只返回一个集合
+std::set<AppInstanceKey> SystemMonitor::get_visible_app_keys() {
+    std::lock_guard<std::mutex> lock(visible_apps_mutex_);
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_visible_apps_check_time_).count();
+
+    if (elapsed_ms < CACHE_DURATION_MS) {
+        return cached_visible_app_keys_;
+    }
+    
+    LOGD("Visible apps cache expired, executing dumpsys activity activities...");
+    last_visible_apps_check_time_ = now;
+
+    std::set<AppInstanceKey> visible_keys;
     std::string dumpsys_output = exec_shell_pipe_efficient({"dumpsys", "activity", "activities"});
     if (dumpsys_output.empty()) {
-        return result;
+        cached_visible_app_keys_ = visible_keys;
+        return visible_keys;
     }
 
-    std::vector<std::string> lines;
     std::stringstream ss(dumpsys_output);
     std::string line;
+    
+    // 从后向前查找，因为相关信息总是在输出的末尾
+    std::vector<std::string> lines;
     while(std::getline(ss, line)) {
         lines.push_back(line);
     }
-
-    // 只处理最后15行，足够覆盖摘要区域
+    
+    // 限制只检查最后15行，提高效率
     size_t start_index = (lines.size() > 15) ? (lines.size() - 15) : 0;
     
-    // 辅助解析函数
-    auto parse_line_for_apps = [&](const std::string& line_to_parse) {
-        std::set<AppInstanceKey> found_apps;
-        std::stringstream line_ss(line_to_parse);
-        std::string token;
-        while (line_ss >> token) {
-            // 查找类似 u0a123 或 u999a123 的模式
-            size_t u_pos = token.find("/u");
-            if (u_pos != std::string::npos) {
-                try {
-                    std::string package_name = token.substr(0, u_pos);
-                    // 跳过 /u，直接解析 user_id
-                    std::string user_part = token.substr(u_pos + 2);
-                    // 移除 'a' 后缀 (例如 u0a342)
-                    size_t a_pos = user_part.find('a');
-                    if (a_pos != std::string::npos) {
-                        user_part = user_part.substr(0, a_pos);
-                    }
-                    int user_id = std::stoi(user_part);
-                    found_apps.insert({package_name, user_id});
-                } catch (...) { /* ignore parse errors */ }
-            }
-        }
-        return found_apps;
-    };
-
-    std::set<AppInstanceKey> resumed_keys;
-
     for (size_t i = start_index; i < lines.size(); ++i) {
         const auto& current_line = lines[i];
-        if (current_line.find("ResumedActivity:") != std::string::npos) {
-             resumed_keys = parse_line_for_apps(current_line);
-        } else if (current_line.find("VisibleActivityProcess:") != std::string::npos) {
-             result.true_foreground = parse_line_for_apps(current_line);
+        if (current_line.find("VisibleActivityProcess:") != std::string::npos) {
+            std::stringstream line_ss(current_line);
+            std::string token;
+            while (line_ss >> token) {
+                size_t u_pos = token.find("/u");
+                if (u_pos != std::string::npos) {
+                    try {
+                        std::string package_name = token.substr(0, u_pos);
+                        std::string user_part = token.substr(u_pos + 2);
+                        size_t a_pos = user_part.find('a');
+                        if (a_pos != std::string::npos) {
+                            user_part = user_part.substr(0, a_pos);
+                        }
+                        int user_id = std::stoi(user_part);
+                        visible_keys.insert({package_name, user_id});
+                    } catch (...) { /* ignore parse errors */ }
+                }
+            }
+            // 找到后就可以停止了，因为这是最后的信息
+            break;
         }
     }
-
-    // 计算假前台：在 Resumed 但不在 Visible 的应用
-    std::set_difference(resumed_keys.begin(), resumed_keys.end(),
-                        result.true_foreground.begin(), result.true_foreground.end(),
-                        std::inserter(result.fake_foreground, result.fake_foreground.begin()));
-
-    return result;
+    
+    cached_visible_app_keys_ = visible_keys;
+    return visible_keys;
 }
 
 std::map<int, ProcessInfo> SystemMonitor::get_full_process_tree() {
@@ -323,13 +325,26 @@ std::optional<MetricsRecord> SystemMonitor::collect_current_metrics() {
 }
 
 bool SystemMonitor::get_screen_state() {
+    std::lock_guard<std::mutex> lock(screen_state_mutex_);
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_screen_state_check_time_).count();
+
+    if (elapsed_ms < CACHE_DURATION_MS) {
+        return cached_screen_on_state_;
+    }
+
+    LOGD("Screen state cache expired, executing dumpsys power...");
+    last_screen_state_check_time_ = now;
+
     std::string result = exec_shell_pipe_efficient({"dumpsys", "power"});
     size_t pos = result.find("mWakefulness=");
     if(pos == std::string::npos) pos = result.find("mWakefulnessRaw=");
     if(pos != std::string::npos) {
-        return result.find("Awake", pos) != std::string::npos;
+        cached_screen_on_state_ = result.find("Awake", pos) != std::string::npos;
+        return cached_screen_on_state_;
     }
-    return false;
+    
+    return cached_screen_on_state_;
 }
 
 void SystemMonitor::get_battery_stats(int& level, float& temp, float& power, bool& charging) {
@@ -422,9 +437,7 @@ void SystemMonitor::top_app_monitor_thread() {
     LOGI("Top-app monitor stopped.");
 }
 
-// [音频识别] 重构 update_audio_state 函数
 void SystemMonitor::update_audio_state() {
-    // 临时存储每个UID的所有音频会话状态 (1 for started, 0 for paused)
     std::map<int, std::vector<int>> uid_session_states;
     std::unordered_set<std::string> ignored_usages = {"USAGE_ASSISTANCE_SONIFICATION", "USAGE_TOUCH_INTERACTION_RESPONSE"};
 
@@ -442,7 +455,7 @@ void SystemMonitor::update_audio_state() {
         }
         
         if (line.find("ducked players piids:") != std::string::npos) {
-            break; // 到达播放器列表末尾
+            break;
         }
         
         if (line.find("AudioPlaybackConfiguration") != std::string::npos) {
@@ -480,9 +493,7 @@ void SystemMonitor::update_audio_state() {
     std::set<int> active_uids;
     for (const auto& [uid, states] : uid_session_states) {
         if (states.empty()) continue;
-        // 计算所有状态的乘积
         int product = std::accumulate(states.begin(), states.end(), 1, std::multiplies<int>());
-        // 如果乘积为1，说明所有会话都是started
         if (product == 1) {
             active_uids.insert(uid);
         }

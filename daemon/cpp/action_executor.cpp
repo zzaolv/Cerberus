@@ -85,6 +85,9 @@ bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>&
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
 
+    const int BINDER_FREEZE_MAX_ATTEMPTS = 5;
+    const useconds_t BINDER_FREEZE_RETRY_WAIT_US = 70000;
+
     bool has_soft_failure = false;
     binder_freeze_info info{ .pid = 0, .enable = (uint32_t)(freeze ? 1 : 0), .timeout_ms = 100 };
 
@@ -92,18 +95,21 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
         info.pid = static_cast<__u32>(pid);
         bool op_success = false;
 
-        for (int retry = 0; retry < 3; ++retry) {
+        // 使用上面定义的常量来控制循环
+        for (int attempt = 0; attempt < BINDER_FREEZE_MAX_ATTEMPTS; ++attempt) {
             if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
                 op_success = true;
                 break;
             }
 
             if (errno == EAGAIN) {
-                if (retry == 2) {
-                    LOGW("Binder op for pid %d still has pending transactions (EAGAIN). Marking as soft failure.", pid);
+                if (attempt == BINDER_FREEZE_MAX_ATTEMPTS - 1) {
+                    LOGW("Binder op for pid %d still has pending transactions (EAGAIN) after %d attempts. Marking as soft failure.", pid, BINDER_FREEZE_MAX_ATTEMPTS);
                     has_soft_failure = true;
+                } else {
+                    LOGD("Binder op for pid %d got EAGAIN, retrying in %d ms... (Attempt %d/%d)", pid, BINDER_FREEZE_RETRY_WAIT_US / 1000, attempt + 1, BINDER_FREEZE_MAX_ATTEMPTS);
                 }
-                usleep(50000);
+                usleep(BINDER_FREEZE_RETRY_WAIT_US);
                 continue;
             }
             else if (freeze && (errno == EINVAL || errno == EPERM)) {

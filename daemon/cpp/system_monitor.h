@@ -13,14 +13,11 @@
 #include <functional>
 #include <optional>
 #include <utility>
+#include <chrono>
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-// [前台识别] 新增结构体，用于返回真前台和假前台两个集合
-struct VisibleAppsResult {
-    std::set<AppInstanceKey> true_foreground; // 来自 VisibleActivityProcess
-    std::set<AppInstanceKey> fake_foreground; // 在 ResumedActivity 但不在 VisibleActivityProcess
-};
+// [修复问题 #3] VisibleAppsResult 结构体已移除，因为不再需要区分真假前台
 
 struct CpuTimeSlice {
     long long app_jiffies = 0;
@@ -65,8 +62,8 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
 
-    // [前台识别] 修改函数返回类型
-    VisibleAppsResult get_visible_app_keys();
+    // [修复问题 #3] 函数直接返回前台应用集合
+    std::set<AppInstanceKey> get_visible_app_keys();
     std::map<int, ProcessInfo> get_full_process_tree();
 
     void update_audio_state();
@@ -133,6 +130,15 @@ private:
     mutable std::mutex ime_mutex_;
     std::string current_ime_package_;
     time_t last_ime_check_time_ = 0;
+
+    mutable std::mutex screen_state_mutex_;
+    std::chrono::steady_clock::time_point last_screen_state_check_time_;
+    bool cached_screen_on_state_ = true;
+
+    // [修复问题 #3] 缓存类型也改为简单的集合
+    mutable std::mutex visible_apps_mutex_;
+    std::chrono::steady_clock::time_point last_visible_apps_check_time_;
+    std::set<AppInstanceKey> cached_visible_app_keys_;
 
     void network_snapshot_thread_func();
     std::map<int, TrafficStats> read_current_traffic();

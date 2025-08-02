@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v34_freeze_count" // 版本号更新
+#define LOG_TAG "cerberusd_state_v36_final_fix" // 最终修复版本
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -535,26 +535,13 @@ bool StateManager::perform_staggered_stats_scan() {
 
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
-
-    // [前台识别] 使用新的函数和返回类型
-    auto visible_result = sys_monitor_->get_visible_app_keys();
-
-    // [前台识别] 日志记录假前台应用
-    for (const auto& key : visible_result.fake_foreground) {
-        auto it = managed_apps_.find(key);
-        if (it != managed_apps_.end()) {
-            // 只在状态首次出现时记录，避免日志刷屏
-            if (!it->second.has_logged_rogue_warning) {
-                logger_->log(LogLevel::WARN, "审计", "检测到假前台活动", key.first, key.second);
-                it->second.has_logged_rogue_warning = true;
-            }
-        }
-    }
     
-    // [前台识别] 仅使用 "真前台" 集合来更新状态
-    state_has_changed |= update_foreground_state(visible_result.true_foreground);
+    // [修复问题 #3] 直接获取前台应用集合，不再有“假前台”的概念
+    auto visible_app_keys = sys_monitor_->get_visible_app_keys();
+    
+    state_has_changed |= update_foreground_state(visible_app_keys);
 
-    if(state_has_changed) {
+    if (state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
     }
@@ -598,7 +585,6 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
 }
 
 void StateManager::generate_doze_exit_report() {
-    // [核心修复] 重构此函数
     struct ProcessActivity {
         std::string process_name;
         double cpu_seconds;
@@ -626,7 +612,6 @@ void StateManager::generate_doze_exit_report() {
         }
     };
 
-    // 使用 AppInstanceKey 作为 map 的键，确保每个应用只有一个条目
     std::map<AppInstanceKey, AppActivitySummary> grouped_activities;
     const long TCK = sysconf(_SC_CLK_TCK);
     if (TCK <= 0) return;
@@ -635,10 +620,9 @@ void StateManager::generate_doze_exit_report() {
         long long end_jiffies = sys_monitor_->get_total_cpu_jiffies_for_pids({pid});
         if (end_jiffies > start_record.start_jiffies) {
             double cpu_seconds = static_cast<double>(end_jiffies - start_record.start_jiffies) / TCK;
-            if (cpu_seconds > 0.01) { // 阈值过滤
+            if (cpu_seconds > 0.01) {
                 AppInstanceKey key = {start_record.package_name, start_record.user_id};
 
-                // 如果应用条目不存在，则创建它
                 if (grouped_activities.find(key) == grouped_activities.end()) {
                     AppActivitySummary summary;
                     summary.package_name = key.first;
@@ -646,13 +630,11 @@ void StateManager::generate_doze_exit_report() {
                     if (it != managed_apps_.end()) {
                         summary.app_name = it->second.app_name;
                     } else {
-                        // 如果在managed_apps_中找不到，就用包名作为后备
                         summary.app_name = key.first;
                     }
                     grouped_activities[key] = summary;
                 }
 
-                // 将进程活动累加到已有的应用条目中
                 grouped_activities[key].processes.push_back({start_record.process_name, cpu_seconds});
                 grouped_activities[key].total_cpu_seconds += cpu_seconds;
             }
@@ -664,13 +646,11 @@ void StateManager::generate_doze_exit_report() {
         return;
     }
 
-    // 将 map 转换为 vector 以便排序
     std::vector<AppActivitySummary> sorted_apps;
     for (auto const& [key, val] : grouped_activities) {
         sorted_apps.push_back(val);
     }
 
-    // 按总CPU时间降序排序
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
@@ -855,6 +835,7 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
     return state_has_changed;
 }
 
+// [修复问题 #2] `update_foreground_state_from_pids` 现在能处理新发现的应用
 bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pids) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
@@ -862,12 +843,15 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
 
+        std::map<int, AppInstanceKey> pid_to_key_map;
         std::set<AppInstanceKey> top_app_keys;
         for (int pid : top_pids) {
             int uid = -1, user_id = -1;
             std::string pkg_name = get_package_name_from_pid(pid, uid, user_id);
             if (!pkg_name.empty() && user_id != -1) {
-                top_app_keys.insert({pkg_name, user_id});
+                AppInstanceKey key = {pkg_name, user_id};
+                top_app_keys.insert(key);
+                pid_to_key_map[pid] = key;
             }
         }
 
@@ -876,23 +860,41 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
             top_app_keys.insert({current_ime_pkg, 0});
         }
 
+        for (const auto& key : top_app_keys) {
+            if (managed_apps_.find(key) == managed_apps_.end()) {
+                LOGI("Discovered new top app via fast path: %s (user %d). Creating state...", key.first.c_str(), key.second);
+                AppRuntimeState* new_app = get_or_create_app_state(key.first, key.second);
+                if (new_app) {
+                    for (const auto& [pid, mapped_key] : pid_to_key_map) {
+                        if (mapped_key == key) {
+                            int uid = -1, user_id_ignored = -1;
+                            get_package_name_from_pid(pid, uid, user_id_ignored);
+                            add_pid_to_app(pid, key.first, key.second, uid);
+                        }
+                    }
+                    LOGI("State created and PIDs populated for new app %s.", key.first.c_str());
+                    state_has_changed = true;
+                }
+            }
+        }
+
         std::set<AppInstanceKey> prev_foreground_keys;
         for (const auto& [key, app] : managed_apps_) {
             if (app.is_foreground) prev_foreground_keys.insert(key);
         }
 
-        if (top_app_keys == prev_foreground_keys) {
+        if (top_app_keys == prev_foreground_keys && !state_has_changed) {
             return false;
         }
 
         const auto& final_foreground_keys = top_app_keys;
-
+        
         time_t now = time(nullptr);
         for (auto& [key, app] : managed_apps_) {
             bool is_now_foreground = final_foreground_keys.count(key);
             if (app.is_foreground != is_now_foreground) {
                 state_has_changed = true;
-                 app.is_foreground = is_now_foreground;
+                app.is_foreground = is_now_foreground;
 
                 if (is_now_foreground) {
                     app.has_logged_rogue_warning = false;
@@ -1175,7 +1177,6 @@ bool StateManager::check_timers() {
                 if (app.freeze_retry_count > 0) timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
 
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                    // [新增] 冻结日志计数
                     size_t total_pids = app.pids.size();
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
@@ -1200,7 +1201,7 @@ bool StateManager::check_timers() {
                     log_msg_ss << "[" << frozen_pids_count << "/" << total_pids << "] ";
 
                     switch (freeze_result) {
-                        case 0: // Cgroup
+                        case 0:
                             app.current_status = AppRuntimeState::Status::FROZEN;
                             app.freeze_method = AppRuntimeState::FreezeMethod::CGROUP;
                             log_msg_ss << "因后台超时被冻结 (Cgroup)";
@@ -1210,7 +1211,7 @@ bool StateManager::check_timers() {
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
-                        case 1: // SIGSTOP
+                        case 1:
                             app.current_status = AppRuntimeState::Status::FROZEN;
                             app.freeze_method = AppRuntimeState::FreezeMethod::SIG_STOP;
                             log_msg_ss << "因后台超时被冻结 (SIGSTOP)";
@@ -1220,7 +1221,7 @@ bool StateManager::check_timers() {
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
                             break;
-                        case 2: // Soft Failure
+                        case 2:
                             app.freeze_retry_count++;
                             if (app.freeze_retry_count > MAX_FREEZE_RETRIES) {
                                 logger_->log(LogLevel::WARN, "冻结", "多次尝试冻结失败，已放弃", app.package_name, app.user_id);
@@ -1231,7 +1232,7 @@ bool StateManager::check_timers() {
                                 app.background_since = now;
                             }
                             break;
-                        default: // Hard Failure
+                        default:
                              logger_->log(LogLevel::ERROR, "冻结", "冻结遇到致命错误，已中止", app.package_name, app.user_id);
                             app.background_since = 0;
                             app.freeze_retry_count = 0;
@@ -1408,7 +1409,7 @@ json StateManager::get_dashboard_payload() {
 
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
-        if (app.pids.empty()) {
+        if (app.pids.empty() && app.current_status == AppRuntimeState::Status::STOPPED) {
             continue;
         }
         json app_json;
