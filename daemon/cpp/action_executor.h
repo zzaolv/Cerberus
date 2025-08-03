@@ -33,10 +33,10 @@ private:
     int handle_binder_freeze(const std::vector<int>& pids, bool freeze);
     
     /**
-     * @brief [核心] 通过检查我们自己创建的cgroup.freeze文件来验证进程是否被物理冻结。
-     * @return true 如果进程被cgroup冻结，否则 false。
+     * @brief [核心修正] 通过检查 cgroup.freeze 文件来验证整个 cgroup 是否被冻结。
+     * @return true 如果 cgroup.freeze 的值为 '1'，否则 false。
      */
-    bool is_pid_frozen_by_cgroup(int pid, const AppInstanceKey& key);
+    bool is_cgroup_frozen(const AppInstanceKey& key);
 
     enum class CgroupVersion { V2, UNKNOWN };
     bool initialize_cgroup();

@@ -15,7 +15,7 @@
 #include <fcntl.h>
 #include <vector>
 
-#define LOG_TAG "cerberusd_action_v16_resilience" // 版本号更新
+#define LOG_TAG "cerberusd_action_v18_resilient_freeze" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -35,42 +35,52 @@ ActionExecutor::~ActionExecutor() {
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (pids.empty()) return 0;
 
+    // --- 阶段 1: Binder 冻结 ---
     int binder_result = handle_binder_freeze(pids, true);
-
     if (binder_result == -1) {
         LOGE("Binder freeze for %s failed critically. Rolling back...", key.first.c_str());
         handle_binder_freeze(pids, false);
         return -1;
     }
-
+    // [核心策略调整] 即使Binder软失败（result==2），我们依然继续尝试Cgroup冻结
     if (binder_result == 2) {
-        LOGW("Binder freeze for %s was resisted (EAGAIN). Escalating to SIGSTOP as fallback.", key.first.c_str());
-        freeze_sigstop(pids);
-        return 1;
+        LOGW("Binder freeze for %s resisted (EAGAIN). Continuing with Cgroup freeze attempt anyway.", key.first.c_str());
     }
 
-    LOGI("Binder freeze phase for %s completed. Proceeding with physical freeze.", key.first.c_str());
+    // --- 阶段 2: Cgroup v2 冻结 ---
+    LOGI("Binder phase complete for %s. Attempting Cgroup v2 freeze.", key.first.c_str());
     bool cgroup_ok = freeze_cgroup(key, pids);
 
     if (cgroup_ok) {
+        // [验证升级] 从固定等待升级为轮询验证
         bool verified = false;
-        if (!pids.empty()) {
-            usleep(50000);
-            verified = is_pid_frozen_by_cgroup(pids[0], key);
+        const int VERIFICATION_ATTEMPTS = 4;
+        const useconds_t VERIFICATION_INTERVAL_US = 50000; // 50ms
+
+        for (int i = 0; i < VERIFICATION_ATTEMPTS; ++i) {
+            if (is_cgroup_frozen(key)) {
+                verified = true;
+                break;
+            }
+            if (i < VERIFICATION_ATTEMPTS - 1) {
+                usleep(VERIFICATION_INTERVAL_US);
+            }
         }
 
-        if(verified) {
-             LOGI("Cgroup freeze for %s succeeded and verified.", key.first.c_str());
-             return 0;
+        if (verified) {
+            LOGI("Cgroup freeze for %s succeeded and verified.", key.first.c_str());
+            return 0; // Cgroup 冻结成功
         } else {
              LOGW("Cgroup freeze for %s verification failed! Escalating to SIGSTOP.", key.first.c_str());
+             unfreeze_cgroup(key);
              freeze_sigstop(pids);
-             return 1;
+             return 1; // SIGSTOP 后备方案
         }
     } else {
-        LOGW("Cgroup freeze failed for %s, falling back to SIGSTOP.", key.first.c_str());
+        LOGW("Cgroup freeze attempt failed for %s. Falling back to SIGSTOP.", key.first.c_str());
+        unfreeze_cgroup(key); 
         freeze_sigstop(pids);
-        return 1;
+        return 1; // SIGSTOP 后备方案
     }
 }
 
@@ -96,7 +106,6 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
         info.pid = static_cast<__u32>(pid);
         bool op_success = false;
 
-        // 使用上面定义的常量来控制循环
         for (int attempt = 0; attempt < BINDER_FREEZE_MAX_ATTEMPTS; ++attempt) {
             if (ioctl(binder_state_.fd, BINDER_FREEZE, &info) == 0) {
                 op_success = true;
@@ -132,19 +141,17 @@ int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool free
     return has_soft_failure ? 2 : 0;
 }
 
-bool ActionExecutor::is_pid_frozen_by_cgroup(int pid, const AppInstanceKey& key) {
+bool ActionExecutor::is_cgroup_frozen(const AppInstanceKey& key) {
+    if (cgroup_version_ != CgroupVersion::V2) return false;
     std::string freeze_path = get_instance_cgroup_path(key) + "/cgroup.freeze";
 
     std::ifstream freeze_file(freeze_path);
-    if (freeze_file.is_open()) {
-        char state;
-        freeze_file >> state;
-        if (state == '1') {
-            return true;
-        }
+    if (!freeze_file.is_open()) {
+        return false; 
     }
-
-    return false;
+    char state = '0';
+    freeze_file >> state;
+    return state == '1';
 }
 
 bool ActionExecutor::initialize_binder() {
@@ -296,7 +303,13 @@ bool ActionExecutor::remove_instance_cgroup(const std::string& path) {
     return true;
 }
 
+
+// [健壮性增强] 使该函数能容忍单个PID写入失败
 bool ActionExecutor::move_pids_to_cgroup(const std::vector<int>& pids, const std::string& cgroup_path) {
+    if (pids.empty()) {
+        return true; // 没有PID需要移动，操作成功
+    }
+
     std::string procs_file = cgroup_path + "/cgroup.procs";
     std::ofstream ofs(procs_file, std::ios_base::app);
     if (!ofs.is_open()) {
@@ -306,11 +319,13 @@ bool ActionExecutor::move_pids_to_cgroup(const std::vector<int>& pids, const std
     for (int pid : pids) {
         ofs << pid << std::endl;
         if (ofs.fail()) {
-            LOGE("Error writing pid %d to %s", pid, procs_file.c_str());
-            return false;
+            // 这通常意味着PID不存在（进程已死亡），这不是一个致命错误
+            LOGW("Error writing pid %d to %s. Process might have already died.", pid, procs_file.c_str());
+            // 清除错误状态，继续尝试下一个PID
+            ofs.clear();
         }
     }
-    return true;
+    return true; // 只要文件能打开，我们就认为操作是成功的
 }
 
 bool ActionExecutor::move_pids_to_default_cgroup(const std::vector<int>& pids) {
