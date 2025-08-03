@@ -1401,7 +1401,7 @@ json StateManager::get_dashboard_payload() {
     json payload;
     if (last_metrics_record_) {
         payload["global_stats"] = {
-            {"total_cpu_usage_percent", last_metrics_record_->cpu_usage_percent},
+            {"total_cpu_usage_percent", last_metrics_record_->total_cpu_usage_percent},
             {"total_mem_kb", last_metrics_record_->mem_total_kb},
             {"avail_mem_kb", last_metrics_record_->mem_available_kb},
             {"swap_total_kb", last_metrics_record_->swap_total_kb},

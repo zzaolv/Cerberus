@@ -3,6 +3,7 @@ package com.crfzit.crfzit.ui.stats
 
 import android.graphics.Paint
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
