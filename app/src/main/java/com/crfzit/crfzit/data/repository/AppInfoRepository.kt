@@ -11,10 +11,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * [内存优化] 此仓库现在是一个轻量级的元数据提供者。
- * 它缓存的AppInfo对象不包含Drawable，因此缓存占用的内存非常小。
- */
 class AppInfoRepository private constructor(private val context: Context) {
 
     private val packageManager: PackageManager = context.packageManager

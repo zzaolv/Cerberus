@@ -18,6 +18,7 @@ data class GetLogFilesPayload(val placeholder: Int = 0) // 可以是空对象
 data class GetLogsByFilePayload(
     val filename: String?,
     val before: Long?,
+    val since: Long?, // [修正] 添加缺失的 since 字段
     val limit: Int?
 )
 
@@ -56,7 +57,7 @@ class DaemonRepository private constructor(
                 null
             }
         }
-    
+
     // [新] 获取日志文件列表
     suspend fun getLogFiles(): List<String>? {
         return query("query.get_log_files", GetLogFilesPayload()) { responseJson ->
@@ -70,6 +71,7 @@ class DaemonRepository private constructor(
         }
     }
 
+    // [修改] getLogs 现在按文件获取
     suspend fun getLogs(
         filename: String,
         before: Long? = null,
@@ -91,7 +93,7 @@ class DaemonRepository private constructor(
             }
         }
     }
-    
+
     fun getStatsStream(): Flow<MetricsRecord> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
@@ -121,17 +123,12 @@ class DaemonRepository private constructor(
             }
         }
 
-    suspend fun getAllLogs(): List<LogEntry>? {
-        // 这个函数现在不再有意义，可以考虑删除或修改
-        return null
-    }
-
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats", EmptyPayload) { responseJson ->
         val type = object : TypeToken<CerberusMessage<List<MetricsRecordPayload>>>() {}.type
         val message = gson.fromJson<CerberusMessage<List<MetricsRecordPayload>>>(responseJson, type)
         if (message?.type == "resp.history_stats") {
             message.payload.map { p ->
-                 MetricsRecord(
+                MetricsRecord(
                     timestamp = p.timestamp,
                     cpuUsagePercent = p.cpuUsagePercent,
                     memTotalKb = p.memTotalKb,
@@ -151,7 +148,7 @@ class DaemonRepository private constructor(
             null
         }
     }
-    
+
     // [重构] 泛型 query 函数
     private suspend fun <ReqT, RespT> query(
         queryType: String,
@@ -181,7 +178,7 @@ class DaemonRepository private constructor(
     }
 
     suspend fun getAllPolicies(): FullConfigPayload? {
-       return query("query.get_all_policies", EmptyPayload) { responseJson ->
+        return query("query.get_all_policies", EmptyPayload) { responseJson ->
             val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
             val message = gson.fromJson<CerberusMessage<FullConfigPayload>>(responseJson, type)
             if (message?.type == "resp.all_policies") message.payload else null

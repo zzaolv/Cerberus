@@ -31,7 +31,6 @@ object AppIcons {
         }
     } }
 
-    // [FIX] Re-added the missing ListAlt icon definition.
     val ListAlt: ImageVector by lazy { materialIcon("AutoMirrored.Filled.ListAlt") {
         materialPath {
             moveTo(19.0f, 5.0f); verticalLineTo(3.0f); horizontalLineTo(5.0f); curveTo(3.9f, 3.0f, 3.0f, 3.9f, 3.0f, 5.0f); verticalLineToRelative(14.0f); curveToRelative(0.0f, 1.1f, 0.9f, 2.0f, 2.0f, 2.0f); horizontalLineToRelative(14.0f); curveToRelative(1.1f, 0.0f, 2.0f, -0.9f, 2.0f, -2.0f); verticalLineTo(5.0f); horizontalLineTo(19.0f); close()

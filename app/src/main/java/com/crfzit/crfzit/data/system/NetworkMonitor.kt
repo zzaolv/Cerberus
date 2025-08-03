@@ -50,8 +50,8 @@ class NetworkMonitor {
             lastTotalTxBytes = currentTxBytes
             lastTimestamp = currentTimestamp
 
-            // [FIX] 刷新间隔改为3秒
-            delay(3000)
+            // [FIX] 刷新间隔改为5秒
+            delay(5000)
         }
     }
 }

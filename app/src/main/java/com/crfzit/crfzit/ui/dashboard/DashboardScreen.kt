@@ -136,7 +136,7 @@ fun AppRuntimeCard(app: UiAppRuntime) {
                 painter = rememberAsyncImagePainter(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(AppIcon(state.packageName)) // 使用自定义数据类作为请求模型
-                        .size(128) // 限制图片加载的最大尺寸为128x128像素
+                        .size(73) // 限制图片加载的最大尺寸为73x73像素
                         .bitmapConfig(Bitmap.Config.RGB_565)
                         .placeholder(R.drawable.ic_launcher_foreground) // 使用一个轻量级占位符
                         .error(R.drawable.ic_launcher_foreground)
@@ -197,8 +197,6 @@ fun AppRuntimeCard(app: UiAppRuntime) {
         }
     }
 }
-
-// GlobalStatusArea, StatusGridItem, AppStatusIcons, 等其他Composable保持不变...
 
 @Composable
 fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {

@@ -1,8 +1,6 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
 package com.crfzit.crfzit.data.model
 
-// import com.google.gson.JsonElement // [核心修复] 不再需要
-
 enum class Policy(val value: Int) {
     EXEMPTED(0),
     IMPORTANT(1),
@@ -54,8 +52,6 @@ data class LogEntry(
     val message: String,
     val packageName: String?,
     val userId: Int = -1
-    // [核心修复] 移除 details 字段
-    // val details: JsonElement? = null 
 )
 
 data class MetricsRecord(

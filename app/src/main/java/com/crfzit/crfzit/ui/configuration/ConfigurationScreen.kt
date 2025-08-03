@@ -125,7 +125,7 @@ fun AppPolicyItem(
                 painter = rememberAsyncImagePainter(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(AppIcon(appInfo.packageName))
-                        .size(128)
+                        .size(73)
                         .bitmapConfig(Bitmap.Config.RGB_565)
                         .placeholder(R.drawable.ic_launcher_foreground)
                         .error(R.drawable.ic_launcher_foreground)

@@ -40,7 +40,7 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
 
             // [核心新增] 定时解冻设置组
             item {
-                SettingsGroup(title = "定时解冻 (心跳)") {
+                SettingsGroup(title = "定时解冻") {
                     SwitchSetting(
                         title = "启用定时解冻",
                         subtitle = "定期唤醒应用以同步消息，平衡续航与通知",

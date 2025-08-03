@@ -1,10 +1,8 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/IPCModels.kt
 package com.crfzit.crfzit.data.model
 
-// import com.google.gson.JsonElement // [核心修复] 不再需要
 import com.google.gson.annotations.SerializedName
 
-// --- 通用消息结构 (保持不变) ---
 data class CerberusMessage<T>(
     @SerializedName("v")
     val version: Int = 12,
@@ -14,7 +12,6 @@ data class CerberusMessage<T>(
     val payload: T
 )
 
-// --- UI <-> Daemon 模型 (保持不变) ---
 data class DashboardPayload(
     @SerializedName("global_stats")
     val globalStats: GlobalStats,
@@ -116,8 +113,6 @@ data class LogEntryPayload(
     val message: String,
     @SerializedName("package_name") val packageName: String?,
     @SerializedName("user_id") val userId: Int?
-    // [核心修复] 移除 details 字段
-    // val details: JsonElement? = null
 )
 
 data class MetricsRecordPayload(

@@ -56,9 +56,9 @@ echo "[$(date)] Check Result: Daemon PID is '$DAEMON_PID'."
 echo "[$(date)] Before update: $(grep 'description=' $PROP_FILE)"
 
 if [ -n "$DAEMON_PID" ]; then
-    DESCRIPTION="description=✅ Guardian Running [PID: $DAEMON_PID]. System protected by Cerberus."
+    DESCRIPTION="description=✅ 运行成功 [1001|PID: $DAEMON_PID]. "
 else
-    DESCRIPTION="description=❌ Guardian FAILED to start. Check logs in $DATA_DIR"
+    DESCRIPTION="description=❌ 运行失败. 检查日志： $DATA_DIR"
 fi
 
 sed -i "s|description=.*|$DESCRIPTION|" "$PROP_FILE"
