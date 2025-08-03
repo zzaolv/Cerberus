@@ -19,6 +19,13 @@
 
 using json = nlohmann::json;
 
+enum class WakeupType {
+    GENERIC_NOTIFICATION, // 普通通知，重冻时间较短
+    FCM_PUSH,             // FCM推送，重冻时间较长
+    PROACTIVE_START,      // 用户主动启动，重冻时间可能更长或由其他逻辑决定
+    OTHER                 // 其他类型
+};
+
 struct AppRuntimeState {
     enum class Status {
         STOPPED,
@@ -110,12 +117,13 @@ public:
     void on_temp_unfreeze_request_by_uid(const json& payload);
     void on_temp_unfreeze_request_by_pid(const json& payload);
     bool perform_staggered_stats_scan();
+    void on_wakeup_request_from_probe(const json& payload);
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
-    bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason);
+    bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupType wakeup_type = WakeupType::OTHER);
     bool reconcile_process_state_full();
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);

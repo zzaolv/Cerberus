@@ -713,7 +713,7 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
     }
 }
 
-bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason) {
+bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupType wakeup_type) {
     cancel_timed_unfreeze(app);
 
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
@@ -723,7 +723,21 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
-        app.observation_since = time(nullptr);
+        
+        // [核心新增] 根据唤醒类型设置不同的观察期（即重冻延迟）
+        time_t now = time(nullptr);
+        switch(wakeup_type) {
+            case WakeupType::GENERIC_NOTIFICATION:
+                app.observation_since = now - 7; // 观察期10秒，减7秒等于3秒后检查
+                break;
+            case WakeupType::FCM_PUSH:
+                app.observation_since = now + 5; // 观察期10秒，加5秒等于15秒后检查
+                break;
+            default:
+                app.observation_since = now; // 默认10秒观察期
+                break;
+        }
+        
         app.background_since = 0;
         app.freeze_retry_count = 0;
 
@@ -732,6 +746,42 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
             reason.c_str(), app.package_name.c_str(), static_cast<int>(app.current_status));
         return false;
+    }
+}
+
+void StateManager::on_wakeup_request_from_probe(const json& payload) {
+    bool state_changed = false;
+    try {
+        int uid = payload.value("uid", -1);
+        int type_int = payload.value("type_int", static_cast<int>(WakeupType::OTHER));
+        auto wakeup_type = static_cast<WakeupType>(type_int);
+        
+        if (uid < 0) return;
+
+        std::string reason = (wakeup_type == WakeupType::FCM_PUSH) ? "FCM" : "Notification";
+        LOGD("Received wakeup request for UID: %d, Reason: %s", uid, reason.c_str());
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        bool app_found = false;
+        for (auto& [key, app] : managed_apps_) {
+            if (app.uid == uid) {
+                app_found = true;
+                if (unfreeze_and_observe_nolock(app, reason, wakeup_type)) {
+                    state_changed = true;
+                }
+                break; // 假设一个UID只对应一个应用实例
+            }
+        }
+        if (!app_found) {
+            LOGW("Wakeup request for unknown UID: %d", uid);
+        }
+    } catch (const json::exception& e) {
+        LOGE("Error processing wakeup request from probe: %s", e.what());
+    }
+
+    if (state_changed) {
+        broadcast_dashboard_update();
+        notify_probe_of_config_change();
     }
 }
 
@@ -980,7 +1030,7 @@ void StateManager::on_proactive_unfreeze_request(const json& payload) {
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
             if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
-                 if(unfreeze_and_observe_nolock(it->second, "PROACTIVE_START")) {
+                 if(unfreeze_and_observe_nolock(it->second, "PROACTIVE_START", WakeupType::PROACTIVE_START)) {
                     broadcast_dashboard_update();
                     notify_probe_of_config_change();
                  }
@@ -1062,7 +1112,7 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
         for (auto& [key, app] : managed_apps_) {
             if (app.uid == uid) {
                 app_found = true;
-                if (unfreeze_and_observe_nolock(app, "AUDIO_FOCUS")) {
+                if (unfreeze_and_observe_nolock(app, "AUDIO_FOCUS", WakeupType::OTHER)) {
                     state_changed = true;
                 }
                 break;
@@ -1380,7 +1430,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
                 app->config = new_config;
 
                 if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
-                     if (unfreeze_and_observe_nolock(*app, "策略变更")) {
+                     if (unfreeze_and_observe_nolock(*app, "策略变更", WakeupType::OTHER)) {
                          probe_config_needs_update = true;
                      }
                 }
