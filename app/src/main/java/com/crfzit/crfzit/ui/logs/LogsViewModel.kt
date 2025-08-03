@@ -22,24 +22,20 @@ sealed interface TimelineItem {
     val id: String
     val timestamp: Long
 }
-
 data class SingleLogItem(val log: UiLogEntry) : TimelineItem {
     override val id: String = "${log.originalLog.timestamp}-${log.originalLog.level}-${log.originalLog.message}-${UUID.randomUUID()}"
     override val timestamp: Long = log.originalLog.timestamp
 }
-
 data class LogGroupItem(val parentLog: UiLogEntry, val childLogs: List<UiLogEntry>) : TimelineItem {
     override val id: String = "${parentLog.originalLog.timestamp}-group-${UUID.randomUUID()}"
     override val timestamp: Long = parentLog.originalLog.timestamp
 }
-
 data class UiLogEntry(val originalLog: LogEntry, val appName: String?)
 
-// [核心修复] 1. State持有原始日志数据，UI模型由它派生，确保数据源统一
 data class LogsUiState(
     val isLoading: Boolean = true,
-    val rawLogs: List<UiLogEntry> = emptyList(), // 保存原始、未分组的日志
-    val timelineItems: List<TimelineItem> = emptyList(), // 保存分组后的UI模型
+    val rawLogs: List<UiLogEntry> = emptyList(),
+    val timelineItems: List<TimelineItem> = emptyList(),
     val isLoadingMore: Boolean = false,
     val hasReachedEnd: Boolean = false,
     val logFiles: List<String> = emptyList(),
@@ -49,6 +45,8 @@ data class LogsUiState(
 class LogsViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val PAGE_SIZE = 50
+        // [核心新增] 控制内存中最多保留的日志条数
+        private const val MAX_LOGS_IN_MEMORY = 1000
     }
 
     private val daemonRepository = DaemonRepository.getInstance()
@@ -73,16 +71,13 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
             uiStateUpdateMutex.withLock {
                 _uiState.value = LogsUiState(isLoading = true)
             }
-
             val files = daemonRepository.getLogFiles() ?: emptyList()
             if (files.isEmpty()) {
                 _uiState.update { it.copy(isLoading = false, hasReachedEnd = true) }
                 return@launch
             }
-
             val initialLogs = daemonRepository.getLogs(filename = files[0], limit = PAGE_SIZE) ?: emptyList()
             val uiHistory = initialLogs.map { mapToUiLog(it) }
-
             _uiState.update {
                 it.copy(
                     isLoading = false,
@@ -99,29 +94,27 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
     fun loadMoreLogs() {
         viewModelScope.launch {
             if (_uiState.value.isLoadingMore || _uiState.value.hasReachedEnd) return@launch
-
             uiStateUpdateMutex.withLock {
                 val currentState = _uiState.value
                 if (currentState.isLoadingMore || currentState.hasReachedEnd) return@withLock
                 _uiState.update { it.copy(isLoadingMore = true) }
-
                 val lastLogTimestamp = currentState.rawLogs.lastOrNull()?.originalLog?.timestamp
                 val currentFilename = currentState.logFiles.getOrNull(currentState.currentFileIndex)
-
                 if (currentFilename == null || lastLogTimestamp == null) {
                     _uiState.update { it.copy(isLoadingMore = false, hasReachedEnd = true) }
                     return@withLock
                 }
-
                 var olderLogs = daemonRepository.getLogs(filename = currentFilename, before = lastLogTimestamp, limit = PAGE_SIZE) ?: emptyList()
                 var nextFileIndex = currentState.currentFileIndex
                 if (olderLogs.isEmpty() && currentState.currentFileIndex + 1 < currentState.logFiles.size) {
                     nextFileIndex = currentState.currentFileIndex + 1
                     olderLogs = daemonRepository.getLogs(filename = currentState.logFiles[nextFileIndex], limit = PAGE_SIZE) ?: emptyList()
                 }
-
                 val newUiLogs = if (olderLogs.isNotEmpty()) olderLogs.map { mapToUiLog(it) } else emptyList()
-                val combinedRawLogs = currentState.rawLogs + newUiLogs
+
+                // [核心修改] 确保加载更多时也不会超过内存上限
+                val combinedRawLogs = (currentState.rawLogs + newUiLogs).takeLast(MAX_LOGS_IN_MEMORY)
+
                 _uiState.update {
                     it.copy(
                         isLoadingMore = false,
@@ -139,22 +132,21 @@ class LogsViewModel(application: Application) : AndroidViewModel(application) {
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch {
             while (true) {
-                delay(5000) // 增加轮询间隔以减少不必要的刷新
+                delay(3000)
                 try {
                     val latestTimestamp = _uiState.value.rawLogs.firstOrNull()?.originalLog?.timestamp
                     val files = daemonRepository.getLogFiles() ?: emptyList()
                     if (files.isEmpty()) continue
-
                     val newLogs = daemonRepository.getLogs(filename = files[0], since = latestTimestamp)
                     if (!newLogs.isNullOrEmpty()) {
                         val newUiLogs = newLogs.map { mapToUiLog(it) }
                         uiStateUpdateMutex.withLock {
-                            // [核心修复] 2. 合并新旧原始日志，去重，然后整体重新生成UI模型
                             val currentState = _uiState.value
+                            // [核心修改] 合并并截断，确保内存占用可控
                             val combinedRawLogs = (newUiLogs + currentState.rawLogs)
                                 .distinctBy { log -> "${log.originalLog.timestamp}-${log.originalLog.message}-${log.originalLog.level}" }
                                 .sortedByDescending { log -> log.originalLog.timestamp }
-
+                                .take(MAX_LOGS_IN_MEMORY)
                             _uiState.update {
                                 it.copy(
                                     rawLogs = combinedRawLogs,

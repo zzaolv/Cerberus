@@ -76,4 +76,35 @@ object AppIcons {
             moveTo(5.0f, 13.0f); lineToRelative(2.0f, 2.0f); curveToRelative(2.76f, -2.76f, 7.24f, -2.76f, 10.0f, 0.0f); lineToRelative(2.0f, -2.0f); curveTo(15.14f, 9.14f, 8.86f, 9.14f, 5.0f, 13.0f); close()
         }
     } }
+    val GitHub: ImageVector by lazy { materialIcon(name = "Custom.GitHub") {
+        materialPath {
+            moveTo(12f, 2f)
+            curveTo(6.48f, 2f, 2f, 6.48f, 2f, 12f)
+            curveToRelative(0f, 4.42f, 2.87f, 8.17f, 6.84f, 9.5f)
+            curveToRelative(0.5f, 0.09f, 0.68f, -0.22f, 0.68f, -0.48f)
+            curveToRelative(0f, -0.24f, -0.01f, -0.82f, -0.01f, -1.6f)
+            curveToRelative(-2.78f, 0.6f, -3.37f, -1.34f, -3.37f, -1.34f)
+            curveToRelative(-0.45f, -1.16f, -1.11f, -1.47f, -1.11f, -1.47f)
+            curveToRelative(-0.91f, -0.62f, 0.07f, -0.61f, 0.07f, -0.61f)
+            curveToRelative(1f, 0.07f, 1.53f, 1.03f, 1.53f, 1.03f)
+            curveToRelative(0.9f, 1.52f, 2.34f, 1.08f, 2.91f, 0.83f)
+            curveToRelative(0.09f, -0.65f, 0.35f, -1.08f, 0.63f, -1.33f)
+            curveToRelative(-2.22f, -0.25f, -4.55f, -1.11f, -4.55f, -4.94f)
+            curveToRelative(0f, -1.1f, 0.39f, -1.99f, 1.03f, -2.69f)
+            curveToRelative(-0.1f, -0.25f, -0.45f, -1.27f, 0.1f, -2.65f)
+            curveToRelative(0f, 0f, 0.84f, -0.27f, 2.75f, 1.02f)
+            curveToRelative(0.8f, -0.22f, 1.65f, -0.33f, 2.5f, -0.33f)
+            curveToRelative(0.85f, 0f, 1.7f, 0.11f, 2.5f, 0.33f)
+            curveToRelative(1.91f, -1.29f, 2.75f, -1.02f, 2.75f, -1.02f)
+            curveToRelative(0.55f, 1.38f, 0.2f, 2.4f, 0.1f, 2.65f)
+            curveToRelative(0.64f, 0.7f, 1.03f, 1.6f, 1.03f, 2.69f)
+            curveToRelative(0f, 3.84f, -2.34f, 4.68f, -4.57f, 4.93f)
+            curveToRelative(0.36f, 0.31f, 0.68f, 0.92f, 0.68f, 1.85f)
+            curveToRelative(0f, 1.34f, -0.01f, 2.42f, -0.01f, 2.75f)
+            curveToRelative(0f, 0.27f, 0.18f, 0.58f, 0.69f, 0.48f)
+            curveTo(19.13f, 20.17f, 22f, 16.42f, 22f, 12f)
+            curveTo(22f, 6.48f, 17.52f, 2f, 12f, 2f)
+            close()
+        }
+    } }
 }
