@@ -56,6 +56,7 @@ android {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
             allWarningsAsErrors.set(false)
         }
+        jvmToolchain(17)
     }
 
     buildFeatures {

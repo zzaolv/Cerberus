@@ -56,7 +56,7 @@ echo "[$(date)] Check Result: Daemon PID is '$DAEMON_PID'."
 echo "[$(date)] Before update: $(grep 'description=' $PROP_FILE)"
 
 if [ -n "$DAEMON_PID" ]; then
-    DESCRIPTION="description=✅ 运行成功 [1001|PID: $DAEMON_PID]. "
+    DESCRIPTION="description=✅ 运行成功 [v1.0.01|PID: $DAEMON_PID]. "
 else
     DESCRIPTION="description=❌ 运行失败. 检查日志： $DATA_DIR"
 fi
