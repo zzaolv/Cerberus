@@ -117,7 +117,8 @@ data class LogEntryPayload(
 
 data class MetricsRecordPayload(
     val timestamp: Long,
-    @SerializedName("cpu_usage_percent") val cpuUsagePercent: Float,
+    @SerializedName("cpu_usage_percent") val totalCpuUsagePercent: Float, // [核心修改] 重命名
+    @SerializedName("per_core_cpu_usage_percent") val perCoreCpuUsagePercent: List<Float>?, // [核心新增]
     @SerializedName("mem_total_kb") val memTotalKb: Long,
     @SerializedName("mem_available_kb") val memAvailableKb: Long,
     @SerializedName("swap_total_kb") val swapTotalKb: Long,

@@ -56,7 +56,8 @@ data class LogEntry(
 
 data class MetricsRecord(
     val timestamp: Long,
-    val cpuUsagePercent: Float,
+    val totalCpuUsagePercent: Float, // [核心修改] 重命名
+    val perCoreCpuUsagePercent: List<Float>, // [核心新增]
     val memTotalKb: Long,
     val memAvailableKb: Long,
     val swapTotalKb: Long,

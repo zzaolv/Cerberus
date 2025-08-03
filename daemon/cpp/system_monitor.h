@@ -17,8 +17,6 @@
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-// [修复问题 #3] VisibleAppsResult 结构体已移除，因为不再需要区分真假前台
-
 struct CpuTimeSlice {
     long long app_jiffies = 0;
     long long total_jiffies = 0;
@@ -43,7 +41,6 @@ struct ProcessInfo {
     int uid = -1;
 };
 
-
 extern std::atomic<int> g_top_app_refresh_tickets;
 
 class SystemMonitor {
@@ -62,7 +59,6 @@ public:
     void stop_top_app_monitor();
     std::set<int> read_top_app_pids();
 
-    // [修复问题 #3] 函数直接返回前台应用集合
     std::set<AppInstanceKey> get_visible_app_keys();
     std::map<int, ProcessInfo> get_full_process_tree();
 
@@ -94,7 +90,8 @@ private:
     std::string exec_shell_pipe_efficient(const std::vector<std::string>& args);
     static std::string read_file_once(const std::string& path, size_t max_size = 4096);
 
-    void update_cpu_usage(float& usage);
+    // [核心修改] update_cpu_usage 现在填充 MetricsRecord
+    void update_cpu_usage(MetricsRecord& record);
     void update_mem_info(long& total, long& available, long& swap_total, long& swap_free);
     bool get_screen_state();
     void get_battery_stats(int& level, float& temp, float& power, bool& charging);
@@ -111,7 +108,9 @@ private:
     };
 
     mutable std::mutex data_mutex_;
+    // [核心修改] 存储上一次总CPU和每个核心的CPU时间
     TotalCpuTimes prev_total_cpu_times_;
+    std::vector<TotalCpuTimes> prev_per_core_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;
 
     ProcFileReader proc_stat_reader_;
@@ -135,7 +134,6 @@ private:
     std::chrono::steady_clock::time_point last_screen_state_check_time_;
     bool cached_screen_on_state_ = true;
 
-    // [修复问题 #3] 缓存类型也改为简单的集合
     mutable std::mutex visible_apps_mutex_;
     std::chrono::steady_clock::time_point last_visible_apps_check_time_;
     std::set<AppInstanceKey> cached_visible_app_keys_;

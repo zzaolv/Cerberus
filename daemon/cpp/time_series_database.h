@@ -12,10 +12,12 @@
 
 using json = nlohmann::json;
 
-// [修改] 扩展 MetricsRecord 以包含所有必要的全局统计数据
 struct MetricsRecord {
     long long timestamp_ms;
-    float cpu_usage_percent = 0.0f;
+    // [核心修改] total_cpu_usage_percent 用于仪表盘和旧逻辑
+    float total_cpu_usage_percent = 0.0f; 
+    // [核心新增] per_core_cpu_usage 用于新的统计图表
+    std::vector<float> per_core_cpu_usage; 
     long mem_total_kb = 0;
     long mem_available_kb = 0;
     long swap_total_kb = 0;

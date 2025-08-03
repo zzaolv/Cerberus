@@ -13,15 +13,13 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-// [新] 为 getLogFiles 和 getLogs 定义 payload
-data class GetLogFilesPayload(val placeholder: Int = 0) // 可以是空对象
+data class GetLogFilesPayload(val placeholder: Int = 0)
 data class GetLogsByFilePayload(
     val filename: String?,
     val before: Long?,
-    val since: Long?, // [修正] 添加缺失的 since 字段
+    val since: Long?,
     val limit: Int?
 )
-
 
 class DaemonRepository private constructor(
     private val scope: CoroutineScope
@@ -46,6 +44,25 @@ class DaemonRepository private constructor(
         }
     }
 
+    private fun mapPayloadToMetricsRecord(p: MetricsRecordPayload): MetricsRecord {
+        return MetricsRecord(
+            timestamp = p.timestamp,
+            totalCpuUsagePercent = p.totalCpuUsagePercent, // [核心修改]
+            perCoreCpuUsagePercent = p.perCoreCpuUsagePercent ?: emptyList(), // [核心新增]
+            memTotalKb = p.memTotalKb,
+            memAvailableKb = p.memAvailableKb,
+            swapTotalKb = p.swapTotalKb,
+            swapFreeKb = p.swapFreeKb,
+            batteryLevel = p.batteryLevel,
+            batteryTempCelsius = p.batteryTempCelsius,
+            batteryPowerWatt = p.batteryPowerWatt,
+            isCharging = p.isCharging,
+            isScreenOn = p.isScreenOn,
+            isAudioPlaying = p.isAudioPlaying,
+            isLocationActive = p.isLocationActive
+        )
+    }
+
     fun getDashboardStream(): Flow<DashboardPayload> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
@@ -58,7 +75,6 @@ class DaemonRepository private constructor(
             }
         }
 
-    // [新] 获取日志文件列表
     suspend fun getLogFiles(): List<String>? {
         return query("query.get_log_files", GetLogFilesPayload()) { responseJson ->
             val responseType = object : TypeToken<CerberusMessage<List<String>>>() {}.type
@@ -71,7 +87,6 @@ class DaemonRepository private constructor(
         }
     }
 
-    // [修改] getLogs 现在按文件获取
     suspend fun getLogs(
         filename: String,
         before: Long? = null,
@@ -82,7 +97,6 @@ class DaemonRepository private constructor(
         return query("query.get_logs", payload) { responseJson ->
             val responseType = object : TypeToken<CerberusMessage<List<LogEntryPayload>>>() {}.type
             val message = gson.fromJson<CerberusMessage<List<LogEntryPayload>>>(responseJson, responseType)
-
             if (message?.type == "resp.get_logs") {
                 message.payload.map { p ->
                     LogEntry(p.timestamp, LogLevel.fromInt(p.level), p.category, p.message, p.packageName, p.userId ?: -1)
@@ -100,22 +114,7 @@ class DaemonRepository private constructor(
                 val type = object : TypeToken<CerberusMessage<MetricsRecordPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<MetricsRecordPayload>>(jsonLine, type)
                 if (msg?.type == "stream.new_stats_record") {
-                    val p = msg.payload ?: return@mapNotNull null
-                    MetricsRecord(
-                        timestamp = p.timestamp,
-                        cpuUsagePercent = p.cpuUsagePercent,
-                        memTotalKb = p.memTotalKb,
-                        memAvailableKb = p.memAvailableKb,
-                        swapTotalKb = p.swapTotalKb,
-                        swapFreeKb = p.swapFreeKb,
-                        batteryLevel = p.batteryLevel,
-                        batteryTempCelsius = p.batteryTempCelsius,
-                        batteryPowerWatt = p.batteryPowerWatt,
-                        isCharging = p.isCharging,
-                        isScreenOn = p.isScreenOn,
-                        isAudioPlaying = p.isAudioPlaying,
-                        isLocationActive = p.isLocationActive
-                    )
+                    msg.payload?.let { mapPayloadToMetricsRecord(it) } // [核心修改]
                 } else null
             } catch (e: Exception) {
                 Log.w("DaemonRepository", "Failed to parse MetricsRecordPayload: ${e.message}")
@@ -127,29 +126,12 @@ class DaemonRepository private constructor(
         val type = object : TypeToken<CerberusMessage<List<MetricsRecordPayload>>>() {}.type
         val message = gson.fromJson<CerberusMessage<List<MetricsRecordPayload>>>(responseJson, type)
         if (message?.type == "resp.history_stats") {
-            message.payload.map { p ->
-                MetricsRecord(
-                    timestamp = p.timestamp,
-                    cpuUsagePercent = p.cpuUsagePercent,
-                    memTotalKb = p.memTotalKb,
-                    memAvailableKb = p.memAvailableKb,
-                    swapTotalKb = p.swapTotalKb,
-                    swapFreeKb = p.swapFreeKb,
-                    batteryLevel = p.batteryLevel,
-                    batteryTempCelsius = p.batteryTempCelsius,
-                    batteryPowerWatt = p.batteryPowerWatt,
-                    isCharging = p.isCharging,
-                    isScreenOn = p.isScreenOn,
-                    isAudioPlaying = p.isAudioPlaying,
-                    isLocationActive = p.isLocationActive
-                )
-            }
+            message.payload.map { mapPayloadToMetricsRecord(it) } // [核心修改]
         } else {
             null
         }
     }
 
-    // [重构] 泛型 query 函数
     private suspend fun <ReqT, RespT> query(
         queryType: String,
         payload: ReqT,
@@ -158,13 +140,10 @@ class DaemonRepository private constructor(
         val reqId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
         pendingRequests[reqId] = deferred
-
         val requestMsg = CerberusMessage(type = queryType, requestId = reqId, payload = payload)
         tcpClient.sendMessage(gson.toJson(requestMsg))
-
         return try {
-            val responseJson = withTimeout(5000) { deferred.await() }
-            responseParser(responseJson)
+            withTimeout(5000) { deferred.await() }.let(responseParser)
         } catch (e: Exception) {
             Log.e("DaemonRepository", "Failed to query '$queryType': ${e.message}")
             pendingRequests.remove(reqId)
@@ -205,20 +184,12 @@ class DaemonRepository private constructor(
     private object EmptyPayload
 
     companion object {
-        @Volatile
-        private var INSTANCE: DaemonRepository? = null
-
+        @Volatile private var INSTANCE: DaemonRepository? = null
         fun getInstance(scope: CoroutineScope? = null): DaemonRepository {
             return INSTANCE ?: synchronized(this) {
-                val instance = INSTANCE
-                if (instance != null) {
-                    instance
-                } else {
-                    require(scope != null) { "CoroutineScope must be provided for the first initialization of DaemonRepository" }
-                    val newInstance = DaemonRepository(scope)
-                    INSTANCE = newInstance
-                    newInstance
-                }
+                INSTANCE ?: scope?.let {
+                    DaemonRepository(it).also { INSTANCE = it }
+                } ?: throw IllegalStateException("CoroutineScope must be provided for the first initialization")
             }
         }
     }

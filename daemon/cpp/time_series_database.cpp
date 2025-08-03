@@ -7,11 +7,13 @@ extern std::unique_ptr<UdsServer> g_server;
 std::shared_ptr<TimeSeriesDatabase> TimeSeriesDatabase::instance_ = nullptr;
 std::mutex TimeSeriesDatabase::instance_mutex_;
 
-// [修改] 更新 to_json() 以匹配新的结构体
 json MetricsRecord::to_json() const {
     return json{
         {"timestamp", timestamp_ms},
-        {"cpu_usage_percent", cpu_usage_percent},
+        // [核心修改] 字段重命名以保持一致
+        {"cpu_usage_percent", total_cpu_usage_percent},
+        // [核心新增] 序列化每核心使用率
+        {"per_core_cpu_usage_percent", per_core_cpu_usage},
         {"mem_total_kb", mem_total_kb},
         {"mem_available_kb", mem_available_kb},
         {"swap_total_kb", swap_total_kb},
