@@ -18,7 +18,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v33_polling" // 版本号更新
+#define LOG_TAG "cerberusd_main_v34_wakeup" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -52,7 +52,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [修改] 最终版的日志查询逻辑
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
             std::string filename = payload_json.value("filename", "");
@@ -62,7 +61,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
             std::vector<LogEntry> logs;
             if (!filename.empty()) {
-                // 现在 get_logs_from_file 可以处理 since 和 before
                 logs = g_logger->get_logs_from_file(filename, limit, 
                     before_ts > 0 ? std::optional(before_ts) : std::nullopt,
                     since_ts > 0 ? std::optional(since_ts) : std::nullopt);
@@ -99,7 +97,10 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
         if (!g_state_manager) return;
 
-        if (type == "cmd.proactive_unfreeze") {
+        // [核心新增] 添加对新唤醒事件的处理路由
+        if (type == "event.app_wakeup_request_v2") {
+            g_state_manager->on_wakeup_request_from_probe(msg.at("payload"));
+        } else if (type == "cmd.proactive_unfreeze") {
             g_state_manager->on_proactive_unfreeze_request(msg.at("payload"));
         } else if (type == "event.app_foreground") {
             g_state_manager->on_app_foreground_event(msg.at("payload"));
@@ -114,6 +115,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             g_state_manager->on_temp_unfreeze_request_by_pid(msg.at("payload"));
         }
         else if (type == "event.app_wakeup_request") {
+            // Note: This is the old event type. The new probe sends v2.
+            // We can keep this for backward compatibility or remove it.
             g_state_manager->on_wakeup_request(msg.at("payload"));
         } else if (type == "cmd.set_policy") {
             if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {

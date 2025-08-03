@@ -725,16 +725,25 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
         
         // [核心新增] 根据唤醒类型设置不同的观察期（即重冻延迟）
+        // 观察期总时长为10秒。
         time_t now = time(nullptr);
         switch(wakeup_type) {
             case WakeupType::GENERIC_NOTIFICATION:
-                app.observation_since = now - 7; // 观察期10秒，减7秒等于3秒后检查
+                // 对于普通通知，认为应用处理时间短，设置一个短的观察期。
+                // now - 7 意味着10秒的观察期已经过去了7秒，还剩3秒。
+                app.observation_since = now - 7;
+                LOGI("Smart Unfreeze: %s gets 3s observation for generic notification.", app.package_name.c_str());
                 break;
             case WakeupType::FCM_PUSH:
-                app.observation_since = now + 5; // 观察期10秒，加5秒等于15秒后检查
+                // 对于FCM，应用可能需要联网等操作，给予更长的观察期。
+                // now + 5 意味着10秒的观察期从5秒后才开始计算，总计15秒。
+                app.observation_since = now + 5;
+                LOGI("Smart Unfreeze: %s gets 15s observation for FCM push.", app.package_name.c_str());
                 break;
             default:
-                app.observation_since = now; // 默认10秒观察期
+                // 默认10秒观察期
+                app.observation_since = now;
+                LOGI("Smart Unfreeze: %s gets default 10s observation.", app.package_name.c_str());
                 break;
         }
         
@@ -784,6 +793,7 @@ void StateManager::on_wakeup_request_from_probe(const json& payload) {
         notify_probe_of_config_change();
     }
 }
+
 
 void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
     std::lock_guard<std::mutex> lock(state_mutex_);

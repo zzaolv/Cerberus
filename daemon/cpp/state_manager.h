@@ -22,7 +22,7 @@ using json = nlohmann::json;
 enum class WakeupType {
     GENERIC_NOTIFICATION, // 普通通知，重冻时间较短
     FCM_PUSH,             // FCM推送，重冻时间较长
-    PROACTIVE_START,      // 用户主动启动，重冻时间可能更长或由其他逻辑决定
+    PROACTIVE_START,      // 用户主动启动
     OTHER                 // 其他类型
 };
 
