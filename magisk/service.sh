@@ -20,50 +20,71 @@ is_daemon_running() {
   fi
 }
 
-if is_daemon_running; then
-  echo "[$(date)] Daemon is already running. Skipping new instance."
-  exit 0
-fi
+update_description() {
+    echo "[$(date)] update_description function called."
+    
+    DAEMON_PID=$(pgrep -f "$DAEMON_PATH")
+    
+    echo "[$(date)] Check Result: Daemon PID is '$DAEMON_PID'."
+    echo "[$(date)] Before update: $(grep 'description=' $PROP_FILE)"
 
+    if [ -n "$DAEMON_PID" ]; then
+        DESCRIPTION="description=✅ 运行成功 [v1.0.1_alpha|PID: $DAEMON_PID]. "
+    else
+        DESCRIPTION="description=❌ 运行失败. 检查日志： $DATA_DIR"
+    fi
+
+    # 使用-i参数，确保兼容性
+    sed -i "s|description=.*|$DESCRIPTION|" "$PROP_FILE"
+
+    echo "[$(date)] After update:  $(grep 'description=' $PROP_FILE)"
+    echo "[$(date)] Description update finished. UI change might need a refresh or reboot to show."
+}
+
+# 1. 等待开机完成
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
   sleep 5
 done
 echo "[$(date)] Boot completed. Preparing to start Cerberus daemon..."
-sleep 10
 
-if is_daemon_running; then
-  echo "[$(date)] Daemon was started by another event while waiting. Exiting."
-  exit 0
-fi
-
-if [ -f "$DAEMON_PATH" ]; then
-    echo "[$(date)] Starting cerberusd daemon..."
-    nohup "$DAEMON_PATH" &
+# 2. 启动守护进程
+if ! is_daemon_running; then
+    if [ -f "$DAEMON_PATH" ]; then
+        echo "[$(date)] Starting cerberusd daemon..."
+        nohup "$DAEMON_PATH" >/dev/null 2>&1 &
+    else
+        echo "[$(date)] ERROR: Daemon executable not found at $DAEMON_PATH!"
+        sed -i "s|description=.*|description=❌ ERROR: Daemon file missing!|" "$PROP_FILE"
+        exit 1
+    fi
 else
-    echo "[$(date)] ERROR: Daemon executable not found at $DAEMON_PATH!"
-    sed -i "s|description=.*|description=❌ ERROR: Daemon file missing!|" "$PROP_FILE"
-    exit 1
+    echo "[$(date)] Daemon is already running. Skipping start."
 fi
 
-sleep 5
 
+count=0
+limit=30
 
-echo "[$(date)] Updating module description..."
+echo "[$(date)] Now waiting for system UI to be ready (screen unlock)..."
 
-DAEMON_PID=$(pgrep -f "$DAEMON_PATH")
+while [ $count -lt $limit ]; do
+    locked=$(dumpsys window policy | grep 'mInputRestricted' | cut -d= -f2)
 
-echo "[$(date)] Check Result: Daemon PID is '$DAEMON_PID'."
-echo "[$(date)] Before update: $(grep 'description=' $PROP_FILE)"
+    if [ "$locked" = "false" ]; then
+        echo "[$(date)] Screen is unlocked. System is ready."
+        sleep 5 
+        update_description
+        break
+    fi
 
-if [ -n "$DAEMON_PID" ]; then
-    DESCRIPTION="description=✅ 运行成功 [v1.0.01|PID: $DAEMON_PID]. "
-else
-    DESCRIPTION="description=❌ 运行失败. 检查日志： $DATA_DIR"
-fi
+    if [ $count -eq $((limit - 1)) ]; then
+        echo "[$(date)] Timeout waiting for unlock, attempting description update anyway."
+        update_description
+        break
+    fi
 
-sed -i "s|description=.*|$DESCRIPTION|" "$PROP_FILE"
+    count=$((count + 1))
+    sleep 2
+done
 
-echo "[$(date)] After update:  $(grep 'description=' $PROP_FILE)"
-echo "[$(date)] Description update finished. Note: UI change might appear after a reboot."
-
-echo "[$(date)] service.sh finished successfully."
+echo "[$(date)] service.sh finished."

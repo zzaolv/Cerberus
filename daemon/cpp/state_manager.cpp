@@ -1196,7 +1196,7 @@ bool StateManager::check_timers() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         time_t now = time(nullptr);
-        const double NETWORK_THRESHOLD_KBPS = 50.0;
+        const double NETWORK_THRESHOLD_KBPS = 500.0;
 
         for (auto& [key, app] : managed_apps_) {
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
@@ -1486,6 +1486,9 @@ json StateManager::get_dashboard_payload() {
         app_json["cpu_usage_percent"] = app.cpu_usage_percent;
         app_json["is_whitelisted"] = app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT;
         app_json["is_foreground"] = app.is_foreground;
+        app_json["is_playing_audio"] = is_app_playing_audio(app);
+        app_json["is_using_location"] = sys_monitor_->is_uid_using_location(app.uid);
+        app_json["has_high_network_usage"] = sys_monitor_->get_cached_network_speed(app.uid).download_kbps > HIGH_NETWORK_THRESHOLD_KBPS;        
         if (app.current_status == AppRuntimeState::Status::RUNNING && !app.is_foreground) {
             if (is_app_playing_audio(app)) {
                 app_json["exemption_reason"] = "PLAYING_AUDIO";

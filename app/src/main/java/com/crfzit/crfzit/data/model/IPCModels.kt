@@ -32,6 +32,7 @@ data class GlobalStats(
     val swapFreeKb: Long = 0L
 )
 
+// [核心修正] 在 AppRuntimeState 中添加新的状态字段
 data class AppRuntimeState(
     @SerializedName("package_name")
     val packageName: String,
@@ -50,7 +51,14 @@ data class AppRuntimeState(
     @SerializedName("is_whitelisted")
     val isWhitelisted: Boolean = false,
     @SerializedName("is_foreground")
-    val isForeground: Boolean = false
+    val isForeground: Boolean = false,
+    // 这三个是上次更新后端时新增的，现在在前端模型中补上
+    @SerializedName("is_playing_audio")
+    val isPlayingAudio: Boolean = false,
+    @SerializedName("is_using_location")
+    val isUsingLocation: Boolean = false,
+    @SerializedName("has_high_network_usage")
+    val hasHighNetworkUsage: Boolean = false
 )
 
 // --- Probe -> Daemon 事件模型 ---
@@ -117,8 +125,8 @@ data class LogEntryPayload(
 
 data class MetricsRecordPayload(
     val timestamp: Long,
-    @SerializedName("cpu_usage_percent") val totalCpuUsagePercent: Float, // [核心修改] 重命名
-    @SerializedName("per_core_cpu_usage_percent") val perCoreCpuUsagePercent: List<Float>?, // [核心新增]
+    @SerializedName("cpu_usage_percent") val totalCpuUsagePercent: Float,
+    @SerializedName("per_core_cpu_usage_percent") val perCoreCpuUsagePercent: List<Float>?,
     @SerializedName("mem_total_kb") val memTotalKb: Long,
     @SerializedName("mem_available_kb") val memAvailableKb: Long,
     @SerializedName("swap_total_kb") val swapTotalKb: Long,

@@ -64,13 +64,14 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
                 }
             }
 
-            // [核心新增] “关于”区域
             item {
                 SettingsGroup(title = "关于") {
                     InfoItem(title = "作者", value = "zzaolv")
-                    Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    // [迁移] 将 Divider 重命名为 HorizontalDivider
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     InfoItem(title = "构建时间", value = uiState.buildTime)
-                    Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    // [迁移] 将 Divider 重命名为 HorizontalDivider
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     ClickableInfoItem(
                         title = "项目地址（别点）",
                         icon = AppIcons.GitHub,
@@ -82,7 +83,6 @@ fun SettingsScreen(viewModel: SettingsViewModel = viewModel()) {
     }
 }
 
-// [核心新增] 可重用的信息展示行
 @Composable
 fun InfoItem(title: String, value: String) {
     Row(
@@ -102,7 +102,6 @@ fun InfoItem(title: String, value: String) {
     }
 }
 
-// [核心新增] 可重用的、带图标的、可点击的信息行
 @Composable
 fun ClickableInfoItem(
     title: String,

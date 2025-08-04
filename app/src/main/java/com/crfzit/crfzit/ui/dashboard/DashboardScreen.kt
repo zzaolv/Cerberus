@@ -10,8 +10,12 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.pullrefresh.PullRefreshIndicator
+import androidx.compose.material.pullrefresh.pullRefresh
+import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +33,10 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
+import com.airbnb.lottie.compose.LottieAnimation
+import com.airbnb.lottie.compose.LottieCompositionSpec
+import com.airbnb.lottie.compose.LottieConstants
+import com.airbnb.lottie.compose.rememberLottieComposition
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppRuntimeState
@@ -36,15 +44,18 @@ import com.crfzit.crfzit.data.model.GlobalStats
 import com.crfzit.crfzit.data.system.NetworkSpeed
 import com.crfzit.crfzit.ui.icons.AppIcons
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
-import com.google.accompanist.swiperefresh.SwipeRefresh
-import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
 import java.util.*
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterialApi::class)
 @Composable
 fun DashboardScreen(viewModel: DashboardViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     var showMenu by remember { mutableStateOf(false) }
+
+    val pullRefreshState = rememberPullRefreshState(
+        refreshing = uiState.isRefreshing,
+        onRefresh = { viewModel.refresh() }
+    )
 
     Scaffold(
         topBar = {
@@ -76,14 +87,21 @@ fun DashboardScreen(viewModel: DashboardViewModel) {
             label = "ConnectionState"
         ) { isConnected ->
             if (isConnected) {
-                SwipeRefresh(
-                    state = rememberSwipeRefreshState(isRefreshing = uiState.isRefreshing),
-                    onRefresh = { viewModel.refresh() }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pullRefresh(pullRefreshState)
                 ) {
                     DashboardContent(
                         globalStats = uiState.globalStats,
                         networkSpeed = uiState.networkSpeed,
                         apps = uiState.apps
+                    )
+
+                    PullRefreshIndicator(
+                        refreshing = uiState.isRefreshing,
+                        state = pullRefreshState,
+                        modifier = Modifier.align(Alignment.TopCenter)
                     )
                 }
             } else {
@@ -130,15 +148,12 @@ fun AppRuntimeCard(app: UiAppRuntime) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
-                // [内存优化] 这里是核心改动。我们不再直接使用Drawable，
-                // 而是让Coil通过我们自定义的AppIcon数据类和Fetcher来加载图标。
-                // 这实现了按需加载、缓存、分辨率和色深控制等所有优化。
                 painter = rememberAsyncImagePainter(
                     model = ImageRequest.Builder(LocalContext.current)
-                        .data(AppIcon(state.packageName)) // 使用自定义数据类作为请求模型
-                        .size(73) // 限制图片加载的最大尺寸为73x73像素
+                        .data(AppIcon(state.packageName))
+                        .size(73)
                         .bitmapConfig(Bitmap.Config.RGB_565)
-                        .placeholder(R.drawable.ic_launcher_foreground) // 使用一个轻量级占位符
+                        .placeholder(R.drawable.ic_launcher_foreground)
                         .error(R.drawable.ic_launcher_foreground)
                         .build()
                 ),
@@ -265,7 +280,6 @@ fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
         }
     }
 }
-
 @Composable
 fun StatusGridItem(
     label: String,
@@ -301,15 +315,57 @@ fun StatusGridItem(
         }
     }
 }
+@Composable
+fun LottieStatusIcon(assetName: String, modifier: Modifier = Modifier) {
+    val composition by rememberLottieComposition(
+        LottieCompositionSpec.Asset("lottie/$assetName")
+    )
+    LottieAnimation(
+        composition = composition,
+        iterations = LottieConstants.IterateForever,
+        modifier = modifier.size(22.dp)
+    )
+}
 
+
+// [核心修改] AppStatusIcons 完全使用 Lottie 动画
 @Composable
 fun AppStatusIcons(state: AppRuntimeState) {
-    Row {
+    Row(verticalAlignment = Alignment.CenterVertically) {
         val iconModifier = Modifier.padding(horizontal = 2.dp)
-        if (state.isForeground) Text("▶️", iconModifier)
-        if (state.isWhitelisted) Text("🛡️", iconModifier)
-        if (state.displayStatus.uppercase() == "FROZEN") {
-            Text("❄️", iconModifier)
+        
+        // 标记是否有任何特殊活动（音频、定位、网络）
+        val hasSpecialActivity = state.isPlayingAudio || state.isUsingLocation || state.hasHighNetworkUsage
+        // 检查应用是否处于非冻结的后台状态
+        val isInBackground = !state.isForeground && !state.displayStatus.uppercase().contains("FROZEN")
+
+        if (state.isForeground) {
+            LottieStatusIcon("anim_foreground.json", modifier = iconModifier)
+        }
+        
+        if (state.isPlayingAudio) {
+            LottieStatusIcon("anim_audio.json", modifier = iconModifier)
+        }
+        
+        if (state.isUsingLocation) {
+            LottieStatusIcon("anim_location.json", modifier = iconModifier)
+        }
+        
+        if (state.hasHighNetworkUsage) {
+            LottieStatusIcon("anim_network.json", modifier = iconModifier)
+        }
+        
+        // 如果在后台，且没有任何特殊活动，则显示“后台运行”动画
+        if (isInBackground && !hasSpecialActivity) {
+            LottieStatusIcon("anim_background.json", modifier = iconModifier)
+        }
+
+        if (state.isWhitelisted) {
+            LottieStatusIcon("anim_exempted.json", modifier = iconModifier)
+        }
+        
+        if (state.displayStatus.uppercase().contains("FROZEN")) {
+            Text("❄️", iconModifier) // 冻结状态依然使用静态图标，因为它是一个终止状态
         }
     }
 }
@@ -359,7 +415,7 @@ private fun formatStatus(state: AppRuntimeState): String {
             "后台观察中 (${time}s)"
         }
         status == "STOPPED" -> "未运行"
-        status == "FROZEN" -> "已冻结"
+        status.contains("FROZEN") -> "已冻结"
         status == "FOREGROUND" -> "前台运行"
         status == "EXEMPTED_BACKGROUND" -> "后台运行 (已豁免)"
         status == "BACKGROUND" -> "后台运行"

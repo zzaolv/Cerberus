@@ -27,7 +27,6 @@ android {
 
     buildTypes {
         release {
-            // [核心优化] 开启代码混淆和资源压缩，减小最终APK体积
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -78,7 +77,6 @@ android {
     }
 }
 dependencies {
-    implementation(libs.accompanist.swiperefresh)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
@@ -88,10 +86,10 @@ dependencies {
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
+    
+    implementation(libs.androidx.compose.material)
     implementation(libs.androidx.material3)
 
-    // [核心优化] 移除完整的 extended 依赖，改为依赖更小的 core 核心库
-    // implementation(libs.androidx.material.icons.extended)
     implementation(libs.androidx.material.icons.core)
 
 
@@ -101,8 +99,9 @@ dependencies {
 
     implementation(libs.gson)
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // [核心新增] 应用 Lottie 依赖
+    implementation(libs.lottie.compose)
 
-    // Xposed API 依赖保持不变
     compileOnly("de.robv.android.xposed:api:82")
     compileOnly("de.robv.android.xposed:api:82:sources")
 

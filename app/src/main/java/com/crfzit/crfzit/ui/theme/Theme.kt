@@ -47,13 +47,13 @@ fun CRFzitTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            // 【全面屏适配】将状态栏设置为透明，让Scaffold来控制颜色
-            window.statusBarColor = Color.Transparent.toArgb()
-            // 【全面屏适配】设置导航栏颜色为透明，并确保内容和导航栏图标颜色对比度
-            window.navigationBarColor = Color.Transparent.toArgb()
-            // 设置状态栏图标颜色
+            // [迁移] 移除已废弃的API调用。
+            // enableEdgeToEdge() 已经处理了透明化，Scaffold会负责颜色。
+            // window.statusBarColor = Color.Transparent.toArgb()
+            // window.navigationBarColor = Color.Transparent.toArgb()
+
+            // 下面的代码是正确的现代做法，用于控制系统栏图标的颜色（亮色/暗色）
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
-            // 设置导航栏图标颜色
             WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = !darkTheme
         }
     }
