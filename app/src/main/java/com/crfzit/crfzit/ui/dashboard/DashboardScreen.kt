@@ -46,6 +46,7 @@ import com.crfzit.crfzit.ui.icons.AppIcons
 import com.crfzit.crfzit.ui.theme.CRFzitTheme
 import java.util.*
 
+// ... (DashboardScreen 和其他大部分函数保持不变) ...
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterialApi::class)
 @Composable
 fun DashboardScreen(viewModel: DashboardViewModel) {
@@ -212,7 +213,6 @@ fun AppRuntimeCard(app: UiAppRuntime) {
         }
     }
 }
-
 @Composable
 fun GlobalStatusArea(stats: GlobalStats, speed: NetworkSpeed) {
     val memUsedPercent = if (stats.totalMemKb > 0) {
@@ -323,53 +323,63 @@ fun LottieStatusIcon(assetName: String, modifier: Modifier = Modifier) {
     LottieAnimation(
         composition = composition,
         iterations = LottieConstants.IterateForever,
-        modifier = modifier.size(22.dp)
+        modifier = modifier.size(24.dp) 
     )
 }
 
-
-// [核心修改] AppStatusIcons 完全使用 Lottie 动画
+// [核心修正] 重构 AppStatusIcons 的逻辑，确保所有状态都能正确显示
 @Composable
 fun AppStatusIcons(state: AppRuntimeState) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        val iconModifier = Modifier.padding(horizontal = 2.dp)
-        
-        // 标记是否有任何特殊活动（音频、定位、网络）
-        val hasSpecialActivity = state.isPlayingAudio || state.isUsingLocation || state.hasHighNetworkUsage
-        // 检查应用是否处于非冻结的后台状态
-        val isInBackground = !state.isForeground && !state.displayStatus.uppercase().contains("FROZEN")
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        // 添加一个最小宽度，防止在状态切换时布局跳动
+        modifier = Modifier.defaultMinSize(minHeight = 24.dp) 
+    ) {
+        val iconModifier = Modifier.padding(horizontal = 1.dp)
 
+        // 1. 最高优先级：冻结状态 (静态图标)
+        // 这个判断现在是正确的，直接检查后端传来的文本状态
+        if (state.displayStatus.uppercase().contains("FROZEN")) {
+            Text("❄️", iconModifier.size(22.dp))
+            return@Row // 一旦冻结，不再显示任何其他状态
+        }
+
+        // 2. 独立状态：前台
+        // 无论是否豁免，只要是前台就显示
         if (state.isForeground) {
             LottieStatusIcon("anim_foreground.json", modifier = iconModifier)
         }
-        
-        if (state.isPlayingAudio) {
-            LottieStatusIcon("anim_audio.json", modifier = iconModifier)
-        }
-        
-        if (state.isUsingLocation) {
-            LottieStatusIcon("anim_location.json", modifier = iconModifier)
-        }
-        
-        if (state.hasHighNetworkUsage) {
-            LottieStatusIcon("anim_network.json", modifier = iconModifier)
-        }
-        
-        // 如果在后台，且没有任何特殊活动，则显示“后台运行”动画
-        if (isInBackground && !hasSpecialActivity) {
-            LottieStatusIcon("anim_background.json", modifier = iconModifier)
-        }
 
+        // 3. 独立状态：豁免
+        // 无论前台后台，只要是豁免就显示
         if (state.isWhitelisted) {
             LottieStatusIcon("anim_exempted.json", modifier = iconModifier)
         }
+
+        // 4. 附加活动状态 (可以与其他状态共存)
+        if (state.isPlayingAudio) {
+            LottieStatusIcon("anim_audio.json", modifier = iconModifier)
+        }
+        if (state.isUsingLocation) {
+            LottieStatusIcon("anim_location.json", modifier = iconModifier)
+        }
+        if (state.hasHighNetworkUsage) {
+            LottieStatusIcon("anim_network.json", modifier = iconModifier)
+        }
+
+        // 5. 补充状态：常规后台
+        // 仅当应用处于后台、且不是豁免状态、且没有任何特殊活动时显示
+        val isBackground = !state.isForeground
+        val isNotWhitelisted = !state.isWhitelisted
+        val hasNoSpecialActivity = !state.isPlayingAudio && !state.isUsingLocation && !state.hasHighNetworkUsage
         
-        if (state.displayStatus.uppercase().contains("FROZEN")) {
-            Text("❄️", iconModifier) // 冻结状态依然使用静态图标，因为它是一个终止状态
+        if (isBackground && isNotWhitelisted && hasNoSpecialActivity) {
+            LottieStatusIcon("anim_background.json", modifier = iconModifier)
         }
     }
 }
 
+// ... (rest of the file remains the same) ...
 @Composable
 fun ConnectionLoadingIndicator() {
     Box(
