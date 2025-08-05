@@ -725,24 +725,23 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
         
-        // [核心新增] 根据唤醒类型设置不同的观察期（即重冻延迟）
-        // 观察期总时长为10秒。
         time_t now = time(nullptr);
         switch(wakeup_type) {
             case WakeupType::GENERIC_NOTIFICATION:
-                // 对于普通通知，认为应用处理时间短，设置一个短的观察期。
-                // now - 7 意味着10秒的观察期已经过去了7秒，还剩3秒。
                 app.observation_since = now - 7;
                 LOGI("Smart Unfreeze: %s gets 3s observation for generic notification.", app.package_name.c_str());
                 break;
             case WakeupType::FCM_PUSH:
-                // 对于FCM，应用可能需要联网等操作，给予更长的观察期。
-                // now + 5 意味着10秒的观察期从5秒后才开始计算，总计15秒。
                 app.observation_since = now + 5;
                 LOGI("Smart Unfreeze: %s gets 15s observation for FCM push.", app.package_name.c_str());
                 break;
+            // [新增] 为内核事件设置极短的观察期
+            case WakeupType::KERNEL_SIGNAL:
+            case WakeupType::KERNEL_BINDER:
+                app.observation_since = now - 9; // 给予1秒的反应时间
+                LOGI("Kernel-triggered Unfreeze: %s gets 1s observation for %s.", app.package_name.c_str(), reason.c_str());
+                break;
             default:
-                // 默认10秒观察期
                 app.observation_since = now;
                 LOGI("Smart Unfreeze: %s gets default 10s observation.", app.package_name.c_str());
                 break;
@@ -758,6 +757,68 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
         return false;
     }
 }
+
+// [新增] on_signal_from_rekernel 方法的实现
+void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
+    bool state_changed = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = pid_to_app_map_.find(event.dest_pid);
+        if (it != pid_to_app_map_.end()) {
+            AppRuntimeState* app = it->second;
+            // 只有当应用确实处于冻结状态时才响应
+            if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
+                std::stringstream reason_ss;
+                reason_ss << "内核信号 " << event.signal;
+
+                logger_->log(LogLevel::WARN, "内核事件", "检测到发往冻结进程 " + std::to_string(event.dest_pid) + " 的信号 " + std::to_string(event.signal) + " (来自 " + std::to_string(event.killer_pid) + ")", app->package_name, app->user_id);
+
+                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), WakeupType::KERNEL_SIGNAL)) {
+                    state_changed = true;
+                }
+            }
+        }
+    }
+
+    if (state_changed) {
+        broadcast_dashboard_update();
+        notify_probe_of_config_change();
+    }
+}
+
+// [新增] on_binder_from_rekernel 方法的实现
+void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
+    // 只关心对冻结应用的、非oneway的、非自身的Binder调用
+    if (event.is_oneway || event.from_pid == event.target_pid) {
+        return;
+    }
+    
+    bool state_changed = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        // 目标可能是进程组中的任何一个进程
+        auto it = pid_to_app_map_.find(event.target_pid);
+        if (it != pid_to_app_map_.end()) {
+            AppRuntimeState* app = it->second;
+            if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
+                std::stringstream reason_ss;
+                reason_ss << "内核Binder事务 (RPC: " << event.rpc_name << ", Code: " << event.code << ")";
+
+                logger_->log(LogLevel::INFO, "内核事件", "检测到发往冻结进程的Binder事务 (来自 " + std::to_string(event.from_pid) + ")", app->package_name, app->user_id);
+
+                // 解冻并给予一个短暂的观察期
+                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), WakeupType::KERNEL_BINDER)) {
+                    state_changed = true;
+                }
+            }
+        }
+    }
+    if (state_changed) {
+        broadcast_dashboard_update();
+        notify_probe_of_config_change();
+    }
+}
+
 
 void StateManager::on_wakeup_request_from_probe(const json& payload) {
     bool state_changed = false;

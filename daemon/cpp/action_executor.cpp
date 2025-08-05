@@ -14,14 +14,19 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <vector>
+#include <optional>
 
-#define LOG_TAG "cerberusd_action_v18_resilient_freeze" // 版本号更新
+#define LOG_TAG "cerberusd_action_v19_oom_protect" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 namespace fs = std::filesystem;
+
+// [新增] 定义OOM Score常量
+constexpr int PROTECTED_OOM_SCORE_ADJ = 201; // 一个受保护但非系统级的值
+constexpr int CACHED_OOM_SCORE_ADJ = 900;    // 恢复为典型的缓存应用值
 
 ActionExecutor::ActionExecutor() {
     initialize_binder();
@@ -35,6 +40,8 @@ ActionExecutor::~ActionExecutor() {
 int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pids) {
     if (pids.empty()) return 0;
 
+    int final_result = -1;
+
     // --- 阶段 1: Binder 冻结 ---
     int binder_result = handle_binder_freeze(pids, true);
     if (binder_result == -1) {
@@ -42,7 +49,6 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
         handle_binder_freeze(pids, false);
         return -1;
     }
-    // [核心策略调整] 即使Binder软失败（result==2），我们依然继续尝试Cgroup冻结
     if (binder_result == 2) {
         LOGW("Binder freeze for %s resisted (EAGAIN). Continuing with Cgroup freeze attempt anyway.", key.first.c_str());
     }
@@ -52,7 +58,6 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
     bool cgroup_ok = freeze_cgroup(key, pids);
 
     if (cgroup_ok) {
-        // [验证升级] 从固定等待升级为轮询验证
         bool verified = false;
         const int VERIFICATION_ATTEMPTS = 4;
         const useconds_t VERIFICATION_INTERVAL_US = 50000; // 50ms
@@ -69,30 +74,107 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
 
         if (verified) {
             LOGI("Cgroup freeze for %s succeeded and verified.", key.first.c_str());
-            return 0; // Cgroup 冻结成功
+            final_result = 0;
         } else {
              LOGW("Cgroup freeze for %s verification failed! Escalating to SIGSTOP.", key.first.c_str());
              unfreeze_cgroup(key);
              freeze_sigstop(pids);
-             return 1; // SIGSTOP 后备方案
+             final_result = 1;
         }
     } else {
         LOGW("Cgroup freeze attempt failed for %s. Falling back to SIGSTOP.", key.first.c_str());
         unfreeze_cgroup(key); 
         freeze_sigstop(pids);
-        return 1; // SIGSTOP 后备方案
+        final_result = 1;
     }
+
+    // --- [新增] 阶段 3: OOM Score 保护 ---
+    if (final_result == 0 || final_result == 1) {
+        LOGI("CPU freeze for %s successful. Applying memory protection (OOM Score).", key.first.c_str());
+        adjust_main_process_oom_score(pids, true);
+    }
+
+    return final_result;
 }
 
-
 bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
+    // --- [新增] 阶段 1: 恢复 OOM Score ---
+    // 必须在任何解冻动作之前执行，以确保即使解冻失败，OOM Score也能恢复
+    adjust_main_process_oom_score(pids, false);
+    
+    // --- 阶段 2: 解冻 CPU 活动 ---
     unfreeze_cgroup(key);
     unfreeze_sigstop(pids);
     handle_binder_freeze(pids, false);
+    
     LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
     return true;
 }
 
+// [新增] 读取指定PID的oom_score_adj
+std::optional<int> ActionExecutor::read_oom_score_adj(int pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/oom_score_adj";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    int score;
+    file >> score;
+    if (file.fail()) {
+        return std::nullopt;
+    }
+    return score;
+}
+
+// [新增] 调整主进程的OOM Score
+void ActionExecutor::adjust_main_process_oom_score(const std::vector<int>& pids, bool protect) {
+    if (pids.empty()) return;
+
+    int main_pid = -1;
+    int min_score = 1001; // 高于最大值1000
+
+    // 1. 找到主进程 (oom_score_adj 最低的那个)
+    for (int pid : pids) {
+        auto score_opt = read_oom_score_adj(pid);
+        if (score_opt) {
+            if (*score_opt < min_score) {
+                min_score = *score_opt;
+                main_pid = pid;
+            }
+        }
+    }
+
+    if (main_pid == -1) {
+        LOGW("OOM: Could not find any process with a readable oom_score_adj to adjust.");
+        return;
+    }
+
+    // 2. 根据操作类型调整 OOM Score
+    int target_score = protect ? PROTECTED_OOM_SCORE_ADJ : CACHED_OOM_SCORE_ADJ;
+    std::string action_str = protect ? "Protecting" : "Restoring";
+    
+    // 如果是保护操作，并且当前值已经很低了，就不再调整，避免干扰系统服务
+    if (protect && min_score < target_score) {
+        LOGI("OOM: Main process %d already has a low score (%d). Skipping protection.", main_pid, min_score);
+        return;
+    }
+    
+    // 如果是恢复操作，且当前值不是我们设置的保护值，也跳过，避免错误地修改AMS的正常设置
+    if (!protect && min_score != PROTECTED_OOM_SCORE_ADJ) {
+        LOGD("OOM: Main process %d score (%d) was not set by us. Skipping restore.", main_pid, min_score);
+        return;
+    }
+
+    std::string path = "/proc/" + std::to_string(main_pid) + "/oom_score_adj";
+    if (!write_to_file(path, std::to_string(target_score))) {
+        LOGW("OOM: Failed to write to %s for PID %d.", path.c_str(), main_pid);
+    } else {
+        LOGI("OOM: %s main process %d. Set oom_score_adj from %d to %d.", action_str.c_str(), main_pid, min_score, target_score);
+    }
+}
+
+
+// ... 文件中其余所有方法 (handle_binder_freeze, is_cgroup_frozen, etc.) 保持不变 ...
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;
 
@@ -303,11 +385,9 @@ bool ActionExecutor::remove_instance_cgroup(const std::string& path) {
     return true;
 }
 
-
-// [健壮性增强] 使该函数能容忍单个PID写入失败
 bool ActionExecutor::move_pids_to_cgroup(const std::vector<int>& pids, const std::string& cgroup_path) {
     if (pids.empty()) {
-        return true; // 没有PID需要移动，操作成功
+        return true;
     }
 
     std::string procs_file = cgroup_path + "/cgroup.procs";
@@ -319,13 +399,11 @@ bool ActionExecutor::move_pids_to_cgroup(const std::vector<int>& pids, const std
     for (int pid : pids) {
         ofs << pid << std::endl;
         if (ofs.fail()) {
-            // 这通常意味着PID不存在（进程已死亡），这不是一个致命错误
             LOGW("Error writing pid %d to %s. Process might have already died.", pid, procs_file.c_str());
-            // 清除错误状态，继续尝试下一个PID
             ofs.clear();
         }
     }
-    return true; // 只要文件能打开，我们就认为操作是成功的
+    return true;
 }
 
 bool ActionExecutor::move_pids_to_default_cgroup(const std::vector<int>& pids) {
@@ -336,13 +414,22 @@ bool ActionExecutor::write_to_file(const std::string& path, const std::string& v
     std::ofstream ofs(path);
     if (!ofs.is_open()) {
         if (path.find("subtree_control") == std::string::npos) {
-            LOGE("Failed to open file '%s' for writing: %s", path.c_str(), strerror(errno));
+            // 对 oom_score_adj 的写入失败需要更详细的日志
+            if (path.find("oom_score_adj") != std::string::npos) {
+                 LOGE("Failed to open OOM score file '%s': %s", path.c_str(), strerror(errno));
+            } else {
+                 LOGE("Failed to open file '%s' for writing: %s", path.c_str(), strerror(errno));
+            }
         }
         return false;
     }
     ofs << value;
     if (ofs.fail()) {
-        LOGE("Failed to write '%s' to '%s': %s", value.c_str(), path.c_str(), strerror(errno));
+        if (path.find("oom_score_adj") != std::string::npos) {
+             LOGE("Failed to write '%s' to OOM score file '%s': %s", value.c_str(), path.c_str(), strerror(errno));
+        } else {
+             LOGE("Failed to write '%s' to '%s': %s", value.c_str(), path.c_str(), strerror(errno));
+        }
         return false;
     }
     return true;

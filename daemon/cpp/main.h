@@ -8,6 +8,7 @@
 #include <variant>
 #include <string>
 #include <set>
+#include "rekernel_client.h" 
 
 // 这个 Task 结构看起来是为更高级的事件驱动模型准备的，暂时保留
 struct ConfigChangeTask { nlohmann::json payload; };

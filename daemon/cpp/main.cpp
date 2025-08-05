@@ -28,6 +28,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 std::unique_ptr<UdsServer> g_server;
+static std::unique_ptr<ReKernelClient> g_rekernel_client;
 static std::shared_ptr<StateManager> g_state_manager;
 static std::shared_ptr<SystemMonitor> g_sys_monitor;
 static std::shared_ptr<Logger> g_logger;
@@ -36,6 +37,20 @@ static std::atomic<bool> g_is_running = true;
 std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
+
+// [新增] Re-Kernel 信号事件处理函数
+void handle_rekernel_signal(const ReKernelSignalEvent& event) {
+    if (g_state_manager) {
+        g_state_manager->on_signal_from_rekernel(event);
+    }
+}
+
+// [新增] Re-Kernel Binder 事件处理函数 (未来可扩展)
+void handle_rekernel_binder(const ReKernelBinderEvent& event) {
+     if (g_state_manager) {
+        g_state_manager->on_binder_from_rekernel(event);
+    }
+}
 
 
 void handle_client_message(int client_fd, const std::string& message_str) {
@@ -170,8 +185,10 @@ void notify_probe_of_config_change() {
 void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
+
     if (g_server) g_server->stop();
     if (g_logger) g_logger->stop();
+    if (g_rekernel_client) g_rekernel_client->stop();
 }
 
 void worker_thread_func() {
@@ -276,6 +293,12 @@ int main(int argc, char *argv[]) {
     g_ts_db = TimeSeriesDatabase::get_instance();
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
 
+    // [新增] 初始化并启动 Re-Kernel 客户端
+    g_rekernel_client = std::make_unique<ReKernelClient>();
+    g_rekernel_client->set_signal_handler(handle_rekernel_signal);
+    g_rekernel_client->set_binder_handler(handle_rekernel_binder);
+    g_rekernel_client->start();
+    
     g_state_manager->initial_full_scan_and_warmup();
 
     g_logger->log(LogLevel::EVENT, "Daemon", "守护进程已启动");
@@ -295,6 +318,9 @@ int main(int argc, char *argv[]) {
 
     g_sys_monitor->stop_top_app_monitor();
     g_sys_monitor->stop_network_snapshot_thread();
+
+    // [新增] 确保 ReKernelClient 线程也已停止
+    if (g_rekernel_client) g_rekernel_client->stop();    
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;

@@ -16,6 +16,7 @@
 #include "action_executor.h"
 #include "logger.h"
 #include "time_series_database.h"
+#include "rekernel_client.h"
 
 using json = nlohmann::json;
 
@@ -24,6 +25,9 @@ enum class WakeupType {
     FCM_PUSH,             // FCM推送，重冻时间较长
     PROACTIVE_START,      // 用户主动启动
     OTHER                 // 其他类型
+    // [新增] 专门用于内核事件的唤醒类型
+    KERNEL_SIGNAL,
+    KERNEL_BINDER    
 };
 
 struct AppRuntimeState {
@@ -118,6 +122,9 @@ public:
     void on_temp_unfreeze_request_by_pid(const json& payload);
     bool perform_staggered_stats_scan();
     void on_wakeup_request_from_probe(const json& payload);
+    // [新增] 处理来自 Re-Kernel 的事件
+    void on_signal_from_rekernel(const ReKernelSignalEvent& event);
+    void on_binder_from_rekernel(const ReKernelBinderEvent& event);    
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);

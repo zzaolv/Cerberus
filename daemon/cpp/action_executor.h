@@ -53,6 +53,10 @@ private:
     bool move_pids_to_default_cgroup(const std::vector<int>& pids);
     bool write_to_file(const std::string& path, const std::string& value);
 
+    // [新增] OOM Score 调整相关
+    void adjust_main_process_oom_score(const std::vector<int>& pids, bool protect);
+    std::optional<int> read_oom_score_adj(int pid);
+
     CgroupVersion cgroup_version_ = CgroupVersion::UNKNOWN;
     std::string cgroup_root_path_;
     
