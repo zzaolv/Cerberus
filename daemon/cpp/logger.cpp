@@ -225,9 +225,9 @@ void Logger::manage_log_files() {
 void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     time_t now = time(nullptr);
     tm ltm = {};
-    localtime_r(&now, <m);
+    localtime_r(&now, &ltm);
     char date_buf[16];
-    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", <m);
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &ltm);
     std::string current_date_str(date_buf);
 
     bool needs_new_file = false;
