@@ -77,9 +77,11 @@ struct AppRuntimeState {
     long long last_foreground_timestamp_ms = 0;
     long long total_runtime_ms = 0;
 
-    // [新增] 节流阀相关字段
-    time_t last_wakeup_timestamp = 0;
-    int wakeup_count_in_window = 0;
+    // [修改] 节流阀相关字段
+    time_t last_wakeup_timestamp = 0; // 记录上一次有效唤醒尝试的时间窗口
+    int wakeup_count_in_window = 0;   // 记录在时间窗口内的唤醒次数
+    // [新增] 上次成功唤醒的时间戳，用于事件突发节流（消抖）
+    time_t last_successful_wakeup_timestamp = 0;
 };
 
 class DozeManager {

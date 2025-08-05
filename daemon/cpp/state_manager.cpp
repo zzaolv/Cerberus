@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v41_policy_engine" // 版本号更新
+#define LOG_TAG "cerberusd_state_v44_selective_binder" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -713,7 +713,6 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
     }
 }
 
-// [核心修改] 函数实现接受 WakeupPolicy
 bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupPolicy policy) {
     cancel_timed_unfreeze(app);
 
@@ -767,7 +766,6 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
-// [新增] 策略决策函数
 WakeupPolicy StateManager::decide_wakeup_policy_for_probe(WakeupPolicy event_type) {
     switch (event_type) {
         case WakeupPolicy::FROM_FCM:
@@ -781,6 +779,41 @@ WakeupPolicy StateManager::decide_wakeup_policy_for_probe(WakeupPolicy event_typ
     }
 }
 
+// [核心修改] 实现精确的、基于白名单的Binder唤醒策略
+WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event) {
+    // 1. 检查是否是发往 NotificationManager 的调用
+    if (event.rpc_name.find("android.app.INotificationManager") != std::string::npos) {
+        
+        // 2. 检查事务代码（event.code）是否在我们的白名单中
+        // 这些数字是 `INotificationManager.aidl` 中定义的 `TRANSACTION_enqueueNotificationWithTag` 等方法的ID
+        // 它们在不同Android版本中可能略有不同，但通常是稳定的。
+        // TRANSACTION_enqueueNotificationWithTag 通常是 `1` 或 `FIRST_CALL_TRANSACTION + 0`
+        // 这是一个比较常见的白名单，可以根据需要扩展
+        const std::unordered_set<int> notification_transaction_codes = {
+            1, // enqueueNotificationWithTag (most common)
+            2, // cancelNotificationWithTag
+            7  // enqueueNotificationWithTag
+        };
+
+        if (notification_transaction_codes.count(event.code)) {
+            LOGI("Policy: Whitelisted Notification Binder call (code %d) to frozen app from UID %d. Waking up.", event.code, event.from_uid);
+            // 给予一个较短的观察期，足够应用发出通知即可
+            return WakeupPolicy::SHORT_OBSERVATION;
+        }
+    }
+
+    // 3. (可选) 这里可以添加其他需要放行的Binder调用，例如与媒体会话相关的
+    // if (event.rpc_name.find("android.media.session.ISessionManager") != std::string::npos) { ... }
+
+    // 4. 对于所有其他未在白名单中的Binder调用，一律忽略
+    ignored_rpc_stats_[event.rpc_name]++; // 遥测
+    LOGD("Policy: Ignoring non-whitelisted Binder event from PID %d to %d (rpc: %s, code: %d).",
+         event.from_pid, event.target_pid, event.rpc_name.c_str(), event.code);
+         
+    return WakeupPolicy::IGNORE;
+}
+
+
 WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event) {
     if (event.signal == 9 /*SIGKILL*/) {
         LOGI("Policy: High-priority SIGKILL for PID %d. Applying standard observation.", event.dest_pid);
@@ -790,49 +823,15 @@ WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalE
         LOGI("Policy: Termination signal for PID %d. Applying short observation.", event.dest_pid);
         return WakeupPolicy::SHORT_OBSERVATION;
     }
-    return WakeupPolicy::IGNORE;
-}
-
-WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event) {
-    // 忽略所有 oneway Binder 调用
-    if (event.is_oneway) {
-        // 但对于某些特定的 oneway 调用可以破例，例如已知是系统重要通知
-        if (event.rpc_name.find("INotificationManager") != std::string::npos) {
-            // 这是个例子，可以根据需要扩展
-        } else {
-            ignored_rpc_stats_[event.rpc_name]++; // 遥测
-            return WakeupPolicy::IGNORE;
-        }
-    }
-
-    kernel_wakeup_source_stats_[event.from_uid]++; // 遥测
-
-    // 来自系统核心进程的调用
-    if (event.from_uid < 2000) {
-        if (event.rpc_name.find("IActivityManager") != std::string::npos ||
-            event.rpc_name.find("IWindowSession") != std::string::npos ||
-            event.rpc_name.find("IInputMethodManager") != std::string::npos) {
-            LOGI("Policy: Critical system Binder call (%s) to frozen app. Applying long observation.", event.rpc_name.c_str());
-            return WakeupPolicy::LONG_OBSERVATION;
-        }
-        if (event.binder_type == "free_buffer_full") {
-            LOGI("Policy: Binder async buffer full for frozen app. Applying standard observation to clear queue.");
-            return WakeupPolicy::STANDARD_OBSERVATION;
-        }
-        return WakeupPolicy::STANDARD_OBSERVATION;
-    }
-
-    // 来自其他应用的调用
-    if (event.from_uid >= 10000 && event.from_uid != event.target_uid) {
-        LOGI("Policy: Cross-app Binder call to frozen app from UID %d. Applying short observation.", event.from_uid);
+    // 其他信号如 SIGABRT, SIGQUIT 也被视为致命信号
+    if (event.signal == 6 || event.signal == 3) {
+        LOGI("Policy: Abort/Quit signal (%d) for PID %d. Applying short observation.", event.signal, event.dest_pid);
         return WakeupPolicy::SHORT_OBSERVATION;
     }
-
     return WakeupPolicy::IGNORE;
 }
 
 
-// [核心修改] on_signal_from_rekernel 使用新模型
 void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
     bool state_changed = false;
     {
@@ -841,10 +840,18 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
         if (it != pid_to_app_map_.end()) {
             AppRuntimeState* app = it->second;
             if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                // 节流阀检查
                 const time_t now = time(nullptr);
-                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
-                else app->wakeup_count_in_window++;
+                
+                WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
+                if (policy == WakeupPolicy::IGNORE) {
+                    return;
+                }
+
+                if (now - app->last_wakeup_timestamp > 60) {
+                    app->wakeup_count_in_window = 1;
+                } else {
+                    app->wakeup_count_in_window++;
+                }
                 app->last_wakeup_timestamp = now;
 
                 if (app->wakeup_count_in_window > 5) {
@@ -853,16 +860,12 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
                     return;
                 }
 
-                // 策略决策
-                WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
-                if (policy != WakeupPolicy::IGNORE) {
-                    std::stringstream reason_ss;
-                    reason_ss << "内核信号 " << event.signal << " (from PID " << event.killer_pid << ")";
-                    logger_->log(LogLevel::WARN, "内核事件", reason_ss.str(), app->package_name, app->user_id);
+                std::stringstream reason_ss;
+                reason_ss << "内核信号 " << event.signal << " (from PID " << event.killer_pid << ")";
+                logger_->log(LogLevel::WARN, "内核事件", reason_ss.str(), app->package_name, app->user_id);
 
-                    if (unfreeze_and_observe_nolock(*app, "Kernel Signal", policy)) {
-                        state_changed = true;
-                    }
+                if (unfreeze_and_observe_nolock(*app, "Kernel Signal", policy)) {
+                    state_changed = true;
                 }
             }
         }
@@ -874,7 +877,6 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
     }
 }
 
-// [核心修改] on_binder_from_rekernel 使用新模型
 void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
     bool state_changed = false;
     {
@@ -883,28 +885,39 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
         if (it != pid_to_app_map_.end()) {
             AppRuntimeState* app = it->second;
             if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                 // 节流阀检查
                 const time_t now = time(nullptr);
-                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
-                else app->wakeup_count_in_window++;
-                app->last_wakeup_timestamp = now;
 
-                if (app->wakeup_count_in_window > 5) {
-                    LOGW("Throttling: Kernel BINDER for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
-                    logger_->log(LogLevel::WARN, "节流阀", "内核Binder唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
+                if (now - app->last_successful_wakeup_timestamp <= 2) {
+                    LOGD("Debounce: Ignoring kernel BINDER for %s, likely part of recent wakeup burst.", app->package_name.c_str());
                     return;
                 }
 
-                // 策略决策
                 WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
-                if (policy != WakeupPolicy::IGNORE) {
-                    std::stringstream reason_ss;
-                    reason_ss << "内核Binder (From PID:" << event.from_pid << ", RPC:" << (event.rpc_name.empty() ? "N/A" : event.rpc_name) << ")";
-                    logger_->log(LogLevel::INFO, "内核事件", reason_ss.str(), app->package_name, app->user_id);
+                if (policy == WakeupPolicy::IGNORE) {
+                    return;
+                }
 
-                    if (unfreeze_and_observe_nolock(*app, "Kernel Binder", policy)) {
-                        state_changed = true;
-                    }
+                if (now - app->last_wakeup_timestamp > 60) {
+                    app->wakeup_count_in_window = 1;
+                } else {
+                    app->wakeup_count_in_window++;
+                }
+                app->last_wakeup_timestamp = now;
+
+                // 对于通知这类重要事件，我们可以适当放宽节流阀阈值
+                if (app->wakeup_count_in_window > 10) {
+                    LOGW("Throttling: Whitelisted Kernel BINDER for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
+                    logger_->log(LogLevel::WARN, "节流阀", "白名单Binder唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
+                    return;
+                }
+                
+                std::stringstream reason_ss;
+                reason_ss << "白名单内核Binder (RPC:" << (event.rpc_name.empty() ? "N/A" : event.rpc_name) << ", Code:" << event.code << ")";
+                logger_->log(LogLevel::INFO, "内核事件", reason_ss.str(), app->package_name, app->user_id);
+
+                if (unfreeze_and_observe_nolock(*app, "Whitelisted Kernel Binder", policy)) {
+                    app->last_successful_wakeup_timestamp = now;
+                    state_changed = true;
                 }
             }
         }
@@ -915,14 +928,12 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
     }
 }
 
-// [核心修改] on_wakeup_request_from_probe 使用新模型
 void StateManager::on_wakeup_request_from_probe(const json& payload) {
     bool state_changed = false;
     try {
         int uid = payload.value("uid", -1);
         if (uid < 0) return;
         
-        // 从 int 转换为 WakeupPolicy 事件类型
         auto event_type_int = payload.value("type_int", 3);
         WakeupPolicy event_type = WakeupPolicy::STANDARD_OBSERVATION;
         if (event_type_int == 0) event_type = WakeupPolicy::FROM_NOTIFICATION;
@@ -940,13 +951,15 @@ void StateManager::on_wakeup_request_from_probe(const json& payload) {
         }
         
         if (target_app) {
-            // 节流阀检查
             const time_t now = time(nullptr);
-            if (now - target_app->last_wakeup_timestamp > 60) target_app->wakeup_count_in_window = 1;
-            else target_app->wakeup_count_in_window++;
+            if (now - target_app->last_wakeup_timestamp > 60) {
+                target_app->wakeup_count_in_window = 1;
+            } else {
+                target_app->wakeup_count_in_window++;
+            }
             target_app->last_wakeup_timestamp = now;
 
-            if (target_app->wakeup_count_in_window > 10) { // Probe唤醒阈值可以放宽一些
+            if (target_app->wakeup_count_in_window > 10) {
                 LOGW("Throttling: Probe wakeup for %s ignored. Triggered %d times in last 60s.", target_app->package_name.c_str(), target_app->wakeup_count_in_window);
                 logger_->log(LogLevel::WARN, "节流阀", "Probe唤醒过于频繁，已临时忽略", target_app->package_name, target_app->user_id);
                 return;
@@ -1363,7 +1376,6 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
-// [新增] validate_pids_nolock 的实现
 void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     if (app.pids.empty()) return;
 
@@ -1372,9 +1384,7 @@ void StateManager::validate_pids_nolock(AppRuntimeState& app) {
         fs::path proc_path("/proc/" + std::to_string(*it));
         if (!fs::exists(proc_path)) {
             LOGI("Sync: PID %d for %s no longer exists. Removing from state.", *it, app.package_name.c_str());
-            // 从全局 map 中也移除
             pid_to_app_map_.erase(*it);
-            // 从 app.pids 向量中移除
             it = app.pids.erase(it);
         } else {
             ++it;
