@@ -49,6 +49,7 @@ struct AppRuntimeState {
     int user_id = 0;
     std::vector<int> pids;
     AppConfig config;
+    bool is_oom_protected = false;
 
     bool is_foreground = false;
     time_t background_since = 0;
@@ -146,6 +147,7 @@ private:
     bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
+    void validate_pids_nolock(AppRuntimeState& app);
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;

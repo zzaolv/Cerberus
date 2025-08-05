@@ -25,8 +25,7 @@
 
 namespace fs = std::filesystem;
 
-// [新增] 定义OOM Score调整的差值
-constexpr int OOM_SCORE_PROTECTION_DELTA = -700; 
+constexpr int PINNED_MAIN_PROC_OOM_SCORE = 200;
 
 ActionExecutor::ActionExecutor() {
     initialize_binder();
@@ -96,17 +95,22 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
     return final_result;
 }
 
-bool ActionExecutor::unfreeze(const AppInstanceKey& key, const std::vector<int>& pids) {
-    // --- [修改] 阶段 1: 恢复 OOM Score ---
+// [修改] unfreeze 现在只负责恢复状态
+bool ActionExecutor::unfreeze(const std::vector<int>& pids) {
+    // 1. 恢复 OOM Score
     adjust_oom_scores(pids, false);
     
-    // --- 阶段 2: 解冻 CPU 活动 (无变化) ---
-    unfreeze_cgroup(key);
+    // 2. 解冻 CPU
     unfreeze_sigstop(pids);
     handle_binder_freeze(pids, false);
-    
-    LOGI("Unfroze instance '%s' (user %d).", key.first.c_str(), key.second);
+
+    // 注意：cgroup 的解冻与清理分离，由 StateManager 在确认后调用
     return true;
+}
+
+// [新增] 专门的cgroup清理函数
+bool ActionExecutor::cleanup_cgroup(const AppInstanceKey& key) {
+    return unfreeze_cgroup(key);
 }
 
 std::optional<int> ActionExecutor::read_oom_score_adj(int pid) {
@@ -123,7 +127,7 @@ std::optional<int> ActionExecutor::read_oom_score_adj(int pid) {
     return score;
 }
 
-// [重构] adjust_oom_scores
+// [核心重构] adjust_oom_scores 实现分层保护
 void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protect) {
     if (pids.empty()) return;
 
@@ -131,25 +135,43 @@ void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protec
 
     if (protect) {
         // --- 保护操作 ---
+        int main_pid = -1;
+        if (!pids.empty()) {
+            main_pid = *std::min_element(pids.begin(), pids.end());
+        }
+
+        if (main_pid == -1) {
+            LOGW("OOM: Could not determine main PID for protection.");
+            return;
+        }
+
+        auto main_score_opt = read_oom_score_adj(main_pid);
+        if (!main_score_opt) {
+            LOGW("OOM: Cannot read main process (%d) oom_score_adj. Aborting protection.", main_pid);
+            return;
+        }
+        int original_main_score = *main_score_opt;
+
         for (int pid : pids) {
-            // 如果已经记录过这个PID，说明可能上次解冻失败，先跳过
-            if (original_oom_scores_.count(pid)) {
-                LOGW("OOM: PID %d already has a saved score, skipping protection to avoid conflicts.", pid);
-                continue;
-            }
+            if (original_oom_scores_.count(pid)) continue;
 
             auto score_opt = read_oom_score_adj(pid);
             if (score_opt) {
                 int original_score = *score_opt;
-                int target_score = original_score + OOM_SCORE_PROTECTION_DELTA;
+                int target_score;
 
-                // 确保调整后的值在-1000到1000的有效范围内
+                if (pid == main_pid) {
+                    target_score = PINNED_MAIN_PROC_OOM_SCORE;
+                } else {
+                    int delta = original_score - original_main_score;
+                    target_score = PINNED_MAIN_PROC_OOM_SCORE + delta;
+                }
+                
                 target_score = std::max(-1000, std::min(1000, target_score));
 
                 std::string path = "/proc/" + std::to_string(pid) + "/oom_score_adj";
                 if (write_to_file(path, std::to_string(target_score))) {
-                    LOGI("OOM: Protected PID %d. Score adjusted from %d to %d.", pid, original_score, target_score);
-                    // 记录原始值以便恢复
+                    LOGI("OOM: Protected PID %d. Score: %d -> %d.", pid, original_score, target_score);
                     original_oom_scores_[pid] = original_score;
                 } else {
                     LOGW("OOM: Failed to protect PID %d.", pid);
@@ -158,23 +180,31 @@ void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protec
         }
     } else {
         // --- 恢复操作 ---
-        for (int pid : pids) {
+        std::vector<int> pids_to_restore = pids;
+        // 如果传入的pid列表为空，则尝试恢复所有已记录的pid
+        if (pids_to_restore.empty()) {
+            for(const auto& pair : original_oom_scores_) {
+                pids_to_restore.push_back(pair.first);
+            }
+        }
+
+        for (int pid : pids_to_restore) {
             auto it = original_oom_scores_.find(pid);
             if (it != original_oom_scores_.end()) {
                 int original_score = it->second;
                 std::string path = "/proc/" + std::to_string(pid) + "/oom_score_adj";
 
-                if (write_to_file(path, std::to_string(original_score))) {
-                    LOGI("OOM: Restored PID %d to its original score of %d.", pid, original_score);
+                if (fs::exists(path) && write_to_file(path, std::to_string(original_score))) {
+                    LOGI("OOM: Restored PID %d to original score %d.", pid, original_score);
                 } else {
-                    LOGW("OOM: Failed to restore PID %d to score %d. It might have been killed.", pid, original_score);
+                    LOGW("OOM: Failed to restore PID %d (score %d). Process likely died.", pid, original_score);
                 }
-                // 无论成功与否，都从map中移除，避免下次错误地恢复
                 original_oom_scores_.erase(it);
             }
         }
     }
 }
+
 
 int ActionExecutor::handle_binder_freeze(const std::vector<int>& pids, bool freeze) {
     if (binder_state_.fd < 0) return 0;

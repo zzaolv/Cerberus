@@ -720,10 +720,16 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         std::string msg = "因 " + reason + " 而解冻";
         logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", msg, app.package_name, app.user_id);
-
-        action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
+        // 1. 恢复 OOM 和 CPU 状态
+        action_executor_->unfreeze(app.pids);
+        
+        // 2. 清理 Cgroup
+        action_executor_->cleanup_cgroup({app.package_name, app.user_id});
+        
+        // 3. 更新内部状态
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
+        app.is_oom_protected = false; // [重要] 更新OOM保护状态
         
         time_t now = time(nullptr);
         switch(wakeup_type) {
@@ -1249,6 +1255,25 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
 
+// [新增] validate_pids_nolock 的实现
+void StateManager::validate_pids_nolock(AppRuntimeState& app) {
+    if (app.pids.empty()) return;
+
+    auto it = app.pids.begin();
+    while (it != app.pids.end()) {
+        fs::path proc_path("/proc/" + std::to_string(*it));
+        if (!fs::exists(proc_path)) {
+            LOGI("Sync: PID %d for %s no longer exists. Removing from state.", *it, app.package_name.c_str());
+            // 从全局 map 中也移除
+            pid_to_app_map_.erase(*it);
+            // 从 app.pids 向量中移除
+            it = app.pids.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 bool StateManager::check_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -1302,9 +1327,21 @@ bool StateManager::check_timers() {
                 if (app.freeze_retry_count > 0) timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
 
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
+                
                     size_t total_pids = app.pids.size();
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
+
+                    // [核心修正] 在冻结前执行PID即时验证
+                    validate_pids_nolock(app);
+
+                    // 如果验证后没有存活的pid，则直接跳过冻结逻辑
+                    if (app.pids.empty()) {
+                        LOGI("Freeze skipped for %s as all its processes have died.", app.package_name.c_str());
+                        app.background_since = 0;
+                        app.freeze_retry_count = 0;
+                        continue;
+                    }
 
                     if (app.has_rogue_structure) {
                         strategy_log_msg = "检测到流氓结构，执行“斩首行动”";
@@ -1320,7 +1357,7 @@ bool StateManager::check_timers() {
                     size_t frozen_pids_count = pids_to_freeze.size();
 
                     logger_->log(LogLevel::INFO, "冻结", strategy_log_msg, app.package_name, app.user_id);
-                    int freeze_result = action_executor_->freeze(key, pids_to_freeze);
+                    int freeze_result = action_executor_->freeze(key, app.pids);
                     
                     std::stringstream log_msg_ss;
                     log_msg_ss << "[" << frozen_pids_count << "/" << total_pids << "] ";

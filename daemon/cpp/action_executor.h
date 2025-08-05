@@ -5,7 +5,8 @@
 #include <string>
 #include <vector>
 #include <utility> 
-#include <map> // [修改] 用于记录原始OOM scores
+#include <map>
+#include <mutex> // [新增]
 #include <linux/android/binder.h>
 
 using AppInstanceKey = std::pair<std::string, int>;
@@ -16,7 +17,10 @@ public:
     ~ActionExecutor();
 
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
-    bool unfreeze(const AppInstanceKey& key, const std::vector<int>& pids);
+    // [修改] unfreeze现在只负责恢复状态
+    bool unfreeze(const std::vector<int>& pids);
+    // [新增] 专门用于清理cgroup的函数
+    bool cleanup_cgroup(const AppInstanceKey& key);
 
 private:
     bool initialize_binder();
@@ -39,7 +43,7 @@ private:
     bool move_pids_to_default_cgroup(const std::vector<int>& pids);
     bool write_to_file(const std::string& path, const std::string& value);
 
-    // [修改] OOM Score 调整逻辑
+    // [重构] OOM Score 调整逻辑
     void adjust_oom_scores(const std::vector<int>& pids, bool protect);
     std::optional<int> read_oom_score_adj(int pid);
 
@@ -52,7 +56,6 @@ private:
         size_t mapSize = 128 * 1024ULL;
     } binder_state_;
 
-    // [新增] 用于存储被修改进程的原始OOM Score
     std::map<int, int> original_oom_scores_;
     std::mutex oom_scores_mutex_;
 };
