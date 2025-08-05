@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <filesystem>
 #include <charconv>
+#include <sstream> // [新增] 为了使用 stringstream
 
 #define LOG_TAG "cerberusd_rekernel"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -182,8 +183,15 @@ void ReKernelClient::parse_and_dispatch(const std::string& message) {
             event.from_uid = std::stoi(params.at("from"));
             event.target_pid = std::stoi(params.at("target_pid"));
             event.target_uid = std::stoi(params.at("target"));
-            event.rpc_name = params.value("rpc_name", "");
-            event.code = std::stoi(params.value("code", "-1"));
+
+            // [修正] 使用 C++17 兼容的 find 方法
+            auto rpc_it = params.find("rpc_name");
+            event.rpc_name = (rpc_it != params.end()) ? rpc_it->second : "";
+
+            auto code_it = params.find("code");
+            std::string code_str = (code_it != params.end()) ? code_it->second : "-1";
+            event.code = std::stoi(code_str);
+
             on_binder_received_(event);
         }
     } catch (const std::exception& e) {
