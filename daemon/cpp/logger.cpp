@@ -9,8 +9,9 @@
 #include <android/log.h>
 #include <vector>
 #include <regex>
+#include <iterator> // For std::istreambuf_iterator
 
-#define LOG_TAG "cerberusd_logger_v7_polling" // 版本号更新
+#define LOG_TAG "cerberusd_logger_v8_robust_sort" // 版本号更新
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
@@ -20,7 +21,7 @@ const int MAX_LOG_LINES_PER_FILE = 200;
 const int MAX_LOG_FILES_PER_DAY = 3;
 const int MAX_LOG_RETENTION_DAYS = 3;
 
-// --- LogEntry ---
+// --- LogEntry (无变化) ---
 json LogEntry::to_json() const {
     json j = {
         {"timestamp", timestamp_ms},
@@ -33,6 +34,7 @@ json LogEntry::to_json() const {
     return j;
 }
 
+// --- Singleton and Constructor/Destructor (无变化) ---
 std::shared_ptr<Logger> Logger::instance_ = nullptr;
 std::mutex Logger::instance_mutex_;
 
@@ -51,7 +53,6 @@ Logger::Logger(const std::string& log_dir_path)
     if (!fs::exists(log_dir_path_)) {
         fs::create_directories(log_dir_path_);
     }
-    manage_log_files(); // 初始化时就管理一下
     writer_thread_ = std::thread(&Logger::writer_thread_func, this);
 }
 Logger::~Logger() {
@@ -86,13 +87,15 @@ void Logger::log_batch(const std::vector<LogEntry>& entries) {
     }
     cv_.notify_one();
 }
+
+// [核心修正] get_log_files 必须进行降序排序
 std::vector<std::string> Logger::get_log_files() const {
     std::vector<std::string> files;
     try {
         for (const auto& entry : fs::directory_iterator(log_dir_path_)) {
             if (entry.is_regular_file()) {
                 std::string filename = entry.path().filename().string();
-                if (filename.rfind("fct_", 0) == 0 && filename.rfind(".log") == filename.length() - 4) {
+                if (filename.rfind("fct_", 0) == 0 && filename.ends_with(".log")) {
                     files.push_back(filename);
                 }
             }
@@ -100,118 +103,114 @@ std::vector<std::string> Logger::get_log_files() const {
     } catch (const fs::filesystem_error& e) {
         LOGE("Error listing log files: %s", e.what());
     }
+    // 强制进行字符串降序排序，确保 'fct_2025-08-05_2.log' 在 'fct_2025-08-05_1.log' 之前
     std::sort(files.rbegin(), files.rend());
     return files;
 }
 
-// [修改] 实现 since 和 before 的逻辑
+// [核心修正] get_logs_from_file 轮询时包含内存队列
 std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, int limit,
                                                  std::optional<long long> before_timestamp_ms,
                                                  std::optional<long long> since_timestamp_ms) const {
     std::vector<LogEntry> results;
     fs::path file_path = fs::path(log_dir_path_) / filename;
 
-    if (!fs::exists(file_path)) return results;
-
-    std::ifstream log_file(file_path);
-    if (!log_file.is_open()) return results;
-
-    // 为了 polling (since)，我们需要正向读取
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(log_file, line)) {
-        lines.push_back(line);
-    }
-
-    // 从后往前遍历，这样可以很容易地应用 limit 和 before
-    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
-        if (limit > 0 && results.size() >= limit && !since_timestamp_ms) break;
-
-        try {
-            json j = json::parse(*it);
-            long long timestamp = j.value("ts", 0LL);
-
-            if (before_timestamp_ms.has_value() && timestamp >= before_timestamp_ms.value()) {
-                continue;
+    if (!fs::exists(file_path)) {
+        LOGW("Log file not found: %s", filename.c_str());
+    } else {
+        std::ifstream log_file(file_path);
+        if (log_file.is_open()) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(log_file, line)) {
+                lines.push_back(line);
             }
-            
-            if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
-                // 如果是 polling 请求，读到比 since 旧的就停止
-                if (!before_timestamp_ms.has_value()) break; 
-                else continue;
-            }
-            
-            LogEntry entry{
-                .timestamp_ms = timestamp,
-                .level = static_cast<LogLevel>(j.value("lvl", 0)),
-                .category = j.value("cat", ""),
-                .message = j.value("msg", ""),
-                .package_name = j.value("pkg", ""),
-                .user_id = j.value("uid", -1)
-            };
-            results.push_back(entry);
-        } catch (...) { /* ignore */ }
-    }
 
-    // 如果是 polling，结果需要是时间升序的
-    if (since_timestamp_ms.has_value()) {
-        std::reverse(results.begin(), results.end());
-    }
-    
-    // Polling 也可能从内存队列获取
-    if (since_timestamp_ms) {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for(const auto& entry : log_queue_) {
-            if (entry.timestamp_ms > since_timestamp_ms.value()) {
-                results.push_back(entry);
+            for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+                if (limit > 0 && results.size() >= limit && !since_timestamp_ms) break;
+                try {
+                    json j = json::parse(*it);
+                    long long timestamp = j.value("ts", 0LL);
+                    if (before_timestamp_ms.has_value() && timestamp >= before_timestamp_ms.value()) continue;
+                    if (since_timestamp_ms.has_value() && timestamp <= since_timestamp_ms.value()) {
+                        if (!before_timestamp_ms.has_value()) break;
+                        else continue;
+                    }
+                    results.push_back({
+                        .timestamp_ms = timestamp,
+                        .level = static_cast<LogLevel>(j.value("lvl", 0)),
+                        .category = j.value("cat", ""),
+                        .message = j.value("msg", ""),
+                        .package_name = j.value("pkg", ""),
+                        .user_id = j.value("uid", -1)
+                    });
+                } catch (...) { /* ignore */ }
             }
         }
-        // 再次排序确保内存和文件的日志顺序正确
+    }
+
+    if (since_timestamp_ms.has_value()) {
+        // 如果是轮询新日志(since)，则需要合并内存中的日志
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for(const auto& entry : log_queue_) {
+                if (entry.timestamp_ms > since_timestamp_ms.value()) {
+                    results.push_back(entry);
+                }
+            }
+        }
+        // 对合并后的结果按时间戳升序排序
         std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
             return a.timestamp_ms < b.timestamp_ms;
         });
+    } else {
+        // 对于 'before' 或普通查询，结果是降序的，不用处理
     }
 
     return results;
 }
 
+// [核心修正] manage_log_files 现在基于可靠排序的列表
 void Logger::manage_log_files() {
     auto files = get_log_files(); // 已经是降序排序
     std::map<std::string, std::vector<std::string>> files_by_day;
     
-    // 分组
     for (const auto& f : files) {
         try {
+            // "fct_2025-08-05_1.log" -> "2025-08-05"
             std::string date_str = f.substr(4, 10);
             files_by_day[date_str].push_back(f);
         } catch(...) {}
     }
     
-    // 清理每天多余的文件
-    for (auto& [day, day_files] : files_by_day) {
-        // 已经是降序的了，所以 0, 1, 2 是最新的
-        if (day_files.size() > MAX_LOG_FILES_PER_DAY) {
-            for (size_t i = MAX_LOG_FILES_PER_DAY; i < day_files.size(); ++i) {
-                fs::remove(fs::path(log_dir_path_) / day_files[i]);
-                 LOGD("Cleaned up excess log file: %s", day_files[i].c_str());
+    // 1. 清理每天多余的文件
+    for (auto& pair : files_by_day) {
+        // pair.second 已经是按时间降序的了 (因为 files 是降序的)
+        if (pair.second.size() > MAX_LOG_FILES_PER_DAY) {
+            for (size_t i = MAX_LOG_FILES_PER_DAY; i < pair.second.size(); ++i) {
+                fs::remove(fs::path(log_dir_path_) / pair.second[i]);
+                LOGD("Cleaned up excess log file: %s", pair.second[i].c_str());
             }
         }
     }
     
-    // 清理过期的天数
+    // 2. 清理过期的天数
+    // map的key(日期字符串)是自动升序的
     if (files_by_day.size() > MAX_LOG_RETENTION_DAYS) {
         auto it = files_by_day.begin();
-        std::advance(it, files_by_day.size() - MAX_LOG_RETENTION_DAYS);
-        for(auto temp_it = files_by_day.begin(); temp_it != it; ++temp_it) {
-            for (const auto& f : temp_it->second) {
+        // 需要删除的迭代次数
+        size_t to_delete_count = files_by_day.size() - MAX_LOG_RETENTION_DAYS;
+        for (size_t i = 0; i < to_delete_count; ++i) {
+            for (const auto& f : it->second) {
                 fs::remove(fs::path(log_dir_path_) / f);
-                 LOGD("Cleaned up outdated log file: %s", f.c_str());
+                LOGD("Cleaned up outdated day log file: %s", f.c_str());
             }
+            it = files_by_day.erase(it);
         }
     }
 
-    // 更新当前日志文件
-    auto latest_files = get_log_files();
+    // 3. 更新当前日志文件状态
+    auto latest_files = get_log_files(); // 重新获取排序后的列表
     if (latest_files.empty()) {
         current_log_file_path_ = "";
         current_log_line_count_ = 0;
@@ -221,12 +220,14 @@ void Logger::manage_log_files() {
         current_log_line_count_ = std::count(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>(), '\n');
     }
 }
+
+// [核心修正] rotate_log_file_if_needed 基于可靠排序的列表
 void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     time_t now = time(nullptr);
     tm ltm = {};
-    localtime_r(&now, &ltm);
+    localtime_r(&now, <m);
     char date_buf[16];
-    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &ltm);
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", <m);
     std::string current_date_str(date_buf);
 
     bool needs_new_file = false;
@@ -237,26 +238,32 @@ void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     }
 
     if (needs_new_file) {
+        manage_log_files(); // 在创建新文件前，先执行一次清理
+        auto files = get_log_files(); // 获取最新的、排序后的文件列表
+
         int next_index = 1;
-        auto files = get_log_files();
         if (!files.empty() && files[0].find(current_date_str) != std::string::npos) {
             try {
-                // fct_2024-01-01_1.log -> 1
                 std::string last_file = files[0];
                 size_t underscore_pos = last_file.rfind('_');
                 size_t dot_pos = last_file.rfind('.');
                 int last_index = std::stoi(last_file.substr(underscore_pos + 1, dot_pos - underscore_pos - 1));
                 next_index = last_index + 1;
-            } catch (...) {}
+            } catch (...) {
+                next_index = 1; // 解析失败则重置为1
+            }
         }
         std::string new_filename = "fct_" + current_date_str + "_" + std::to_string(next_index) + ".log";
         current_log_file_path_ = fs::path(log_dir_path_) / new_filename;
         current_log_line_count_ = 0;
-        cleanup_old_files();
+        LOGI("Rotating to new log file: %s", new_filename.c_str());
     }
 }
-void Logger::cleanup_old_files() {}
+
 void Logger::writer_thread_func() {
+    // 首次运行时执行一次清理和状态更新
+    manage_log_files();
+
     while (is_running_) {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         cv_.wait(lock, [this]{ return !log_queue_.empty() || !is_running_; });
@@ -279,10 +286,8 @@ void Logger::writer_thread_func() {
 
         for (const auto& entry : temp_queue) {
             json file_json = {
-                {"ts", entry.timestamp_ms},
-                {"lvl", static_cast<int>(entry.level)},
-                {"cat", entry.category},
-                {"msg", entry.message}
+                {"ts", entry.timestamp_ms}, {"lvl", static_cast<int>(entry.level)},
+                {"cat", entry.category}, {"msg", entry.message}
             };
             if (!entry.package_name.empty()) file_json["pkg"] = entry.package_name;
             if (entry.user_id != -1) file_json["uid"] = entry.user_id;

@@ -57,7 +57,6 @@ public:
     
     void log_batch(const std::vector<LogEntry>& entries);
 
-    // [修改] get_logs_from_file 现在支持 since 和 before
     std::vector<LogEntry> get_logs_from_file(const std::string& filename, int limit,
                                              std::optional<long long> before_timestamp_ms,
                                              std::optional<long long> since_timestamp_ms) const;
@@ -70,7 +69,6 @@ private:
     void writer_thread_func();
     void manage_log_files();
     void rotate_log_file_if_needed(size_t new_entries_count);
-    void cleanup_old_files();
     
     static std::shared_ptr<Logger> instance_;
     static std::mutex instance_mutex_;
