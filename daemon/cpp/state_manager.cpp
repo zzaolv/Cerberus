@@ -12,7 +12,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v40_report_top7" // 版本号更新
+#define LOG_TAG "cerberusd_state_v41_policy_engine" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -140,49 +140,49 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         master_config_.standard_timeout_sec, master_config_.is_timed_unfreeze_enabled, master_config_.timed_unfreeze_interval_sec);
 
     critical_system_apps_ = {
-        "com.google.android.inputmethod.latin",
-        "com.baidu.input",
-        "com.sohu.inputmethod.sogou",
-        "com.iflytek.inputmethod",
-        "com.tencent.qqpinyin",
-        "com.xiaomi.mibrain.speech",
-        "com.xiaomi.scanner",
+//        "com.google.android.inputmethod.latin",
+//        "com.baidu.input",
+//        "com.sohu.inputmethod.sogou",
+//        "com.iflytek.inputmethod",
+//        "com.tencent.qqpinyin",
+//        "com.xiaomi.mibrain.speech",
+//        "com.xiaomi.scanner",
         "zygote",
         "zygote64",
         "com.xiaomi.xmsf",
         "com.xiaomi.xmsfkeeper",
-        "com.xiaomi.misettings",
-        "com.xiaomi.barrage",
-        "com xiaomi.aireco",
-        "com.xiaomi.account",
-        "com.miui.notes",
-        "com.miui.calculator",
-        "com.miui.compass",
-        "com.miui.mediaeditor",
-        "com.miui.personalassistant",
-        "com.miui.vipservice",
-        "com.miui.systemAdSolution",
+//        "com.xiaomi.misettings",
+//        "com.xiaomi.barrage",
+//        "com xiaomi.aireco",
+//        "com.xiaomi.account",
+//        "com.miui.notes",
+//        "com.miui.calculator",
+//        "com.miui.compass",
+//        "com.miui.mediaeditor",
+//        "com.miui.personalassistant",
+//        "com.miui.vipservice",
+//        "com.miui.systemAdSolution",
         "com.miui.home",
-        "com.miui.carlink",
+//        "com.miui.carlink",
         "com.miui.packageinstaller",
-        "com.miui.accessibility",
+//        "com.miui.accessibility",
         "com.miui.core",
-        "com.miui.privacycomputing",
-        "com.miui.securityadd",
-        "com.miui.securityinputmethod",
-        "com.miui.system",
-        "com.miui.vpnsdkmanager",
-        "com.mfashiongallery.emag",
-        "com.huawei.hwid",
-        "cn.litiaotiao.app",
-        "com.litiaotiao.app",
-        "hello.litiaotiao.app",
-        "com.zfdang.touchhelper",
-        "com.giftedcat.adskiphelper",
-        "com.merxury.blocker",
-        "com.wpengapp.lightstart",
-        "li.songe.gkd",
-        "com.sevtinge.hyperceiler",
+//        "com.miui.privacycomputing",
+//        "com.miui.securityadd",
+//        "com.miui.securityinputmethod",
+//        "com.miui.system",
+//        "com.miui.vpnsdkmanager",
+//        "com.mfashiongallery.emag",
+//        "com.huawei.hwid",
+//        "cn.litiaotiao.app",
+//       "com.litiaotiao.app",
+//        "hello.litiaotiao.app",
+//        "com.zfdang.touchhelper",
+//        "com.giftedcat.adskiphelper",
+//        "com.merxury.blocker",
+//        "com.wpengapp.lightstart",
+//        "li.songe.gkd",
+//        "com.sevtinge.hyperceiler",
         "com.topjohnwu.magisk",
         "org.lsposed.manager",
         "name.monwf.customiuizer",
@@ -190,15 +190,15 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.android.vending",
         "org.meowcat.xposed.mipush",
         "top.trumeet.mipush",
-        "one.yufz.hmspush",
+//        "one.yufz.hmspush",
         "app.lawnchair",
         "com.microsoft.launcher",
-        "com.teslacoilsw.launcher",
+//        "com.teslacoilsw.launcher",
         "com.hola.launcher",
         "com.transsion.XOSLauncher",
         "com.mi.android.globallauncher",
-        "com.gau.go.launcherex",
-        "bitpit.launcher",
+//        "com.gau.go.launcherex",
+//        "bitpit.launcher",
         "com.oppo.launcher",
         "me.weishu.kernelsu",
         "top.canyie.dreamland.manager",
@@ -207,37 +207,37 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.iqoo.packageinstaller",
         "com.vivo.packageinstaller",
         "com.google.android.packageinstaller",
-        "com.baidu.input_huawei",
-        "com.baidu.input_oppo",
-        "com.baidu.input_vivo",
-        "com.baidu.input_yijia",
-        "com.sohu.inputmethod.sogou.xiaomi",
-        "com.sohu.inputmethod.sogou.meizu",
-        "com.sohu.inputmethod.sogou.nubia",
-        "com.sohu.inputmethod.sogou.chuizi",
-        "com.sohu.inputmethod.sogou.moto",
-        "com.sohu.inputmethod.sogou.zte",
-        "com.sohu.inputmethod.sogou.samsung",
-        "com.sohu.input_yijia",
-        "com.iflytek.inputmethod.miui",
-        "com.iflytek.inputmethod.googleplay",
-        "com.iflytek.inputmethod.smartisan",
-        "com.iflytek.inputmethod.oppo",
-        "com.iflytek.inputmethod.oem",
-        "com.iflytek.inputmethod.custom",
-        "com.iflytek.inputmethod.blackshark",
-        "com.iflytek.inputmethod.zte",
-        "com.touchtype.swiftkey",
-        "com.touchtype.swiftkey.beta",
-        "im.weshine.keyboard",
+//        "com.baidu.input_huawei",
+//        "com.baidu.input_oppo",
+//        "com.baidu.input_vivo",
+//        "com.baidu.input_yijia",
+//        "com.sohu.inputmethod.sogou.xiaomi",
+//        "com.sohu.inputmethod.sogou.meizu",
+//        "com.sohu.inputmethod.sogou.nubia",
+//        "com.sohu.inputmethod.sogou.chuizi",
+//        "com.sohu.inputmethod.sogou.moto",
+//        "com.sohu.inputmethod.sogou.zte",
+//        "com.sohu.inputmethod.sogou.samsung",
+//        "com.sohu.input_yijia",
+//        "com.iflytek.inputmethod.miui",
+//        "com.iflytek.inputmethod.googleplay",
+//        "com.iflytek.inputmethod.smartisan",
+//        "com.iflytek.inputmethod.oppo",
+//        "com.iflytek.inputmethod.oem",
+//        "com.iflytek.inputmethod.custom",
+//        "com.iflytek.inputmethod.blackshark",
+//        "com.iflytek.inputmethod.zte",
+//        "com.touchtype.swiftkey",
+//        "com.touchtype.swiftkey.beta",
+//        "im.weshine.keyboard",
         "com.komoxo.octopusime",
-        "com.qujianpan.duoduo",
-        "com.lxlm.lhl.softkeyboard",
-        "com.jinkey.unfoldedime",
-        "com.iflytek.inputmethods.DungkarIME",
-        "com.oyun.qingcheng",
-        "com.ziipin.softkeyboard",
-        "com.kongzue.secretinput",
+//        "com.qujianpan.duoduo",
+//        "com.lxlm.lhl.softkeyboard",
+//        "com.jinkey.unfoldedime",
+//        "com.iflytek.inputmethods.DungkarIME",
+//        "com.oyun.qingcheng",
+//        "com.ziipin.softkeyboard",
+//        "com.kongzue.secretinput",
         "com.google.android.ext.services",
         "com.google.android.ext.shared",
         "com.google.android.gms",
@@ -352,7 +352,7 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
         "com.mediatek.op09clib.phone.plugin",
         "com.mediatek.op09clib.telecom",
         "com.mediatek.ygps",
-        "com.tencent.soter.soterserver",
+//        "com.tencent.soter.soterserver",
         "com.unionpay.tsmservice.mi",
         "android.ext.services",
         "android.ext.shared",
@@ -644,7 +644,6 @@ void StateManager::generate_doze_exit_report() {
     std::sort(sorted_apps.begin(), sorted_apps.end(),
               [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
 
-    // [核心修改] 只取前7个
     const int REPORT_LIMIT = 7;
     int count = 0;
     for (const auto& summary : sorted_apps) {
@@ -714,45 +713,49 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
     }
 }
 
-bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupType wakeup_type) {
+// [核心修改] 函数实现接受 WakeupPolicy
+bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupPolicy policy) {
     cancel_timed_unfreeze(app);
 
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         std::string msg = "因 " + reason + " 而解冻";
         logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", msg, app.package_name, app.user_id);
-        // 1. 恢复 OOM 和 CPU 状态
         action_executor_->unfreeze(app.pids);
-        
-        // 2. 清理 Cgroup
         action_executor_->cleanup_cgroup({app.package_name, app.user_id});
         
-        // 3. 更新内部状态
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
-        app.is_oom_protected = false; // [重要] 更新OOM保护状态
+        app.is_oom_protected = false;
         
         time_t now = time(nullptr);
-        switch(wakeup_type) {
-            case WakeupType::GENERIC_NOTIFICATION:
-                app.observation_since = now - 7;
-                LOGI("Smart Unfreeze: %s gets 3s observation for generic notification.", app.package_name.c_str());
+        int observation_seconds = 0;
+        switch(policy) {
+            case WakeupPolicy::SHORT_OBSERVATION:
+                observation_seconds = 3;
                 break;
-            case WakeupType::FCM_PUSH:
-                app.observation_since = now + 5;
-                LOGI("Smart Unfreeze: %s gets 15s observation for FCM push.", app.package_name.c_str());
+            case WakeupPolicy::STANDARD_OBSERVATION:
+                observation_seconds = 10;
                 break;
-            // [新增] 为内核事件设置极短的观察期
-            case WakeupType::KERNEL_SIGNAL:
-            case WakeupType::KERNEL_BINDER:
-                app.observation_since = now - 9; // 给予1秒的反应时间
-                LOGI("Kernel-triggered Unfreeze: %s gets 1s observation for %s.", app.package_name.c_str(), reason.c_str());
+            case WakeupPolicy::LONG_OBSERVATION:
+                observation_seconds = 20;
                 break;
-            default:
-                app.observation_since = now;
-                LOGI("Smart Unfreeze: %s gets default 10s observation.", app.package_name.c_str());
+            case WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND:
+                app.observation_since = 0;
+                app.background_since = 0;
+                LOGI("Smart Unfreeze: %s un-frozen by policy until next background event.", app.package_name.c_str());
+                return true;
+            default: // IGNORE, FROM_*
+                // 默认对于事件源也给一个标准观察期
+                observation_seconds = 10;
                 break;
         }
-        
+
+        if (observation_seconds > 0) {
+            // 通过调整过去的时间点来控制未来的时长, 假设标准观察期是10s
+            app.observation_since = now - (10 - observation_seconds);
+            LOGI("Smart Unfreeze: %s gets %ds observation for %s.", app.package_name.c_str(), observation_seconds, reason.c_str());
+        }
+
         app.background_since = 0;
         app.freeze_retry_count = 0;
 
@@ -764,7 +767,72 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
     }
 }
 
-// [新增] on_signal_from_rekernel 方法的实现
+// [新增] 策略决策函数
+WakeupPolicy StateManager::decide_wakeup_policy_for_probe(WakeupPolicy event_type) {
+    switch (event_type) {
+        case WakeupPolicy::FROM_FCM:
+            return WakeupPolicy::LONG_OBSERVATION; // FCM可能需要后台同步，给更长时间
+        case WakeupPolicy::FROM_NOTIFICATION:
+            return WakeupPolicy::SHORT_OBSERVATION; // 普通通知通常不需要长时间后台
+        case WakeupPolicy::FROM_PROBE_START:
+            return WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND; // 用户主动启动，应该保持运行
+        default:
+            return WakeupPolicy::STANDARD_OBSERVATION; // 其他情况给标准时间
+    }
+}
+
+WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event) {
+    if (event.signal == 9 /*SIGKILL*/) {
+        LOGI("Policy: High-priority SIGKILL for PID %d. Applying standard observation.", event.dest_pid);
+        return WakeupPolicy::STANDARD_OBSERVATION;
+    }
+    if (event.signal == 15 /*SIGTERM*/) {
+        LOGI("Policy: Termination signal for PID %d. Applying short observation.", event.dest_pid);
+        return WakeupPolicy::SHORT_OBSERVATION;
+    }
+    return WakeupPolicy::IGNORE;
+}
+
+WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event) {
+    // 忽略所有 oneway Binder 调用
+    if (event.is_oneway) {
+        // 但对于某些特定的 oneway 调用可以破例，例如已知是系统重要通知
+        if (event.rpc_name.find("INotificationManager") != std::string::npos) {
+            // 这是个例子，可以根据需要扩展
+        } else {
+            ignored_rpc_stats_[event.rpc_name]++; // 遥测
+            return WakeupPolicy::IGNORE;
+        }
+    }
+
+    kernel_wakeup_source_stats_[event.from_uid]++; // 遥测
+
+    // 来自系统核心进程的调用
+    if (event.from_uid < 2000) {
+        if (event.rpc_name.find("IActivityManager") != std::string::npos ||
+            event.rpc_name.find("IWindowSession") != std::string::npos ||
+            event.rpc_name.find("IInputMethodManager") != std::string::npos) {
+            LOGI("Policy: Critical system Binder call (%s) to frozen app. Applying long observation.", event.rpc_name.c_str());
+            return WakeupPolicy::LONG_OBSERVATION;
+        }
+        if (event.binder_type == "free_buffer_full") {
+            LOGI("Policy: Binder async buffer full for frozen app. Applying standard observation to clear queue.");
+            return WakeupPolicy::STANDARD_OBSERVATION;
+        }
+        return WakeupPolicy::STANDARD_OBSERVATION;
+    }
+
+    // 来自其他应用的调用
+    if (event.from_uid >= 10000 && event.from_uid != event.target_uid) {
+        LOGI("Policy: Cross-app Binder call to frozen app from UID %d. Applying short observation.", event.from_uid);
+        return WakeupPolicy::SHORT_OBSERVATION;
+    }
+
+    return WakeupPolicy::IGNORE;
+}
+
+
+// [核心修改] on_signal_from_rekernel 使用新模型
 void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
     bool state_changed = false;
     {
@@ -772,15 +840,29 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
         auto it = pid_to_app_map_.find(event.dest_pid);
         if (it != pid_to_app_map_.end()) {
             AppRuntimeState* app = it->second;
-            // 只有当应用确实处于冻结状态时才响应
             if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                std::stringstream reason_ss;
-                reason_ss << "内核信号 " << event.signal;
+                // 节流阀检查
+                const time_t now = time(nullptr);
+                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
+                else app->wakeup_count_in_window++;
+                app->last_wakeup_timestamp = now;
 
-                logger_->log(LogLevel::WARN, "内核事件", "检测到发往冻结进程 " + std::to_string(event.dest_pid) + " 的信号 " + std::to_string(event.signal) + " (来自 " + std::to_string(event.killer_pid) + ")", app->package_name, app->user_id);
+                if (app->wakeup_count_in_window > 5) {
+                    LOGW("Throttling: Kernel SIGNAL for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
+                    logger_->log(LogLevel::WARN, "节流阀", "内核信号唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
+                    return;
+                }
 
-                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), WakeupType::KERNEL_SIGNAL)) {
-                    state_changed = true;
+                // 策略决策
+                WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
+                if (policy != WakeupPolicy::IGNORE) {
+                    std::stringstream reason_ss;
+                    reason_ss << "内核信号 " << event.signal << " (from PID " << event.killer_pid << ")";
+                    logger_->log(LogLevel::WARN, "内核事件", reason_ss.str(), app->package_name, app->user_id);
+
+                    if (unfreeze_and_observe_nolock(*app, "Kernel Signal", policy)) {
+                        state_changed = true;
+                    }
                 }
             }
         }
@@ -792,29 +874,37 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
     }
 }
 
-// [新增] on_binder_from_rekernel 方法的实现
+// [核心修改] on_binder_from_rekernel 使用新模型
 void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
-    // 只关心对冻结应用的、非oneway的、非自身的Binder调用
-    if (event.is_oneway || event.from_pid == event.target_pid) {
-        return;
-    }
-    
     bool state_changed = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        // 目标可能是进程组中的任何一个进程
         auto it = pid_to_app_map_.find(event.target_pid);
         if (it != pid_to_app_map_.end()) {
             AppRuntimeState* app = it->second;
             if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                std::stringstream reason_ss;
-                reason_ss << "内核Binder事务 (RPC: " << event.rpc_name << ", Code: " << event.code << ")";
+                 // 节流阀检查
+                const time_t now = time(nullptr);
+                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
+                else app->wakeup_count_in_window++;
+                app->last_wakeup_timestamp = now;
 
-                logger_->log(LogLevel::INFO, "内核事件", "检测到发往冻结进程的Binder事务 (来自 " + std::to_string(event.from_pid) + ")", app->package_name, app->user_id);
+                if (app->wakeup_count_in_window > 5) {
+                    LOGW("Throttling: Kernel BINDER for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
+                    logger_->log(LogLevel::WARN, "节流阀", "内核Binder唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
+                    return;
+                }
 
-                // 解冻并给予一个短暂的观察期
-                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), WakeupType::KERNEL_BINDER)) {
-                    state_changed = true;
+                // 策略决策
+                WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
+                if (policy != WakeupPolicy::IGNORE) {
+                    std::stringstream reason_ss;
+                    reason_ss << "内核Binder (From PID:" << event.from_pid << ", RPC:" << (event.rpc_name.empty() ? "N/A" : event.rpc_name) << ")";
+                    logger_->log(LogLevel::INFO, "内核事件", reason_ss.str(), app->package_name, app->user_id);
+
+                    if (unfreeze_and_observe_nolock(*app, "Kernel Binder", policy)) {
+                        state_changed = true;
+                    }
                 }
             }
         }
@@ -825,31 +915,48 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
     }
 }
 
-
+// [核心修改] on_wakeup_request_from_probe 使用新模型
 void StateManager::on_wakeup_request_from_probe(const json& payload) {
     bool state_changed = false;
     try {
         int uid = payload.value("uid", -1);
-        int type_int = payload.value("type_int", static_cast<int>(WakeupType::OTHER));
-        auto wakeup_type = static_cast<WakeupType>(type_int);
-        
         if (uid < 0) return;
-
-        std::string reason = (wakeup_type == WakeupType::FCM_PUSH) ? "FCM" : "Notification";
-        LOGD("Received wakeup request for UID: %d, Reason: %s", uid, reason.c_str());
+        
+        // 从 int 转换为 WakeupPolicy 事件类型
+        auto event_type_int = payload.value("type_int", 3);
+        WakeupPolicy event_type = WakeupPolicy::STANDARD_OBSERVATION;
+        if (event_type_int == 0) event_type = WakeupPolicy::FROM_NOTIFICATION;
+        else if (event_type_int == 1) event_type = WakeupPolicy::FROM_FCM;
+        
+        LOGD("Received wakeup request from probe for UID: %d, Type: %d", uid, event_type_int);
 
         std::lock_guard<std::mutex> lock(state_mutex_);
-        bool app_found = false;
+        AppRuntimeState* target_app = nullptr;
         for (auto& [key, app] : managed_apps_) {
             if (app.uid == uid) {
-                app_found = true;
-                if (unfreeze_and_observe_nolock(app, reason, wakeup_type)) {
-                    state_changed = true;
-                }
-                break; // 假设一个UID只对应一个应用实例
+                target_app = &app;
+                break;
             }
         }
-        if (!app_found) {
+        
+        if (target_app) {
+            // 节流阀检查
+            const time_t now = time(nullptr);
+            if (now - target_app->last_wakeup_timestamp > 60) target_app->wakeup_count_in_window = 1;
+            else target_app->wakeup_count_in_window++;
+            target_app->last_wakeup_timestamp = now;
+
+            if (target_app->wakeup_count_in_window > 10) { // Probe唤醒阈值可以放宽一些
+                LOGW("Throttling: Probe wakeup for %s ignored. Triggered %d times in last 60s.", target_app->package_name.c_str(), target_app->wakeup_count_in_window);
+                logger_->log(LogLevel::WARN, "节流阀", "Probe唤醒过于频繁，已临时忽略", target_app->package_name, target_app->user_id);
+                return;
+            }
+
+            WakeupPolicy policy = decide_wakeup_policy_for_probe(event_type);
+            if (unfreeze_and_observe_nolock(*target_app, "Probe Request", policy)) {
+                state_changed = true;
+            }
+        } else {
             LOGW("Wakeup request for unknown UID: %d", uid);
         }
     } catch (const json::exception& e) {
@@ -937,7 +1044,7 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
                          logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开 (权威)", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     }
-                    if (unfreeze_and_observe_nolock(app, "切换至前台(权威)")) {
+                    if (unfreeze_and_observe_nolock(app, "切换至前台(权威)", WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND)) {
                         probe_config_needs_update = true;
                     }
                     app.observation_since = 0;
@@ -1034,7 +1141,7 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
                          logger_->log(LogLevel::ACTION_OPEN, "打开", "已打开 (快速)", app.package_name, app.user_id);
                          app.last_foreground_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                     }
-                    if (unfreeze_and_observe_nolock(app, "切换至前台(快速)")) {
+                    if (unfreeze_and_observe_nolock(app, "切换至前台(快速)", WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND)) {
                         probe_config_needs_update = true;
                     }
                     app.observation_since = 0;
@@ -1108,7 +1215,7 @@ void StateManager::on_proactive_unfreeze_request(const json& payload) {
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
             if (it->second.current_status == AppRuntimeState::Status::FROZEN) {
-                 if(unfreeze_and_observe_nolock(it->second, "PROACTIVE_START", WakeupType::PROACTIVE_START)) {
+                 if(unfreeze_and_observe_nolock(it->second, "PROACTIVE_START", WakeupPolicy::FROM_PROBE_START)) {
                     broadcast_dashboard_update();
                     notify_probe_of_config_change();
                  }
@@ -1132,7 +1239,8 @@ void StateManager::on_wakeup_request(const json& payload) {
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
-            state_changed = unfreeze_and_observe_nolock(it->second, "WAKEUP_REQUEST");
+            // 旧接口统一使用标准观察期
+            state_changed = unfreeze_and_observe_nolock(it->second, "WAKEUP_REQUEST (Legacy)", WakeupPolicy::STANDARD_OBSERVATION);
         } else {
             LOGW("Wakeup request for unknown app: %s", package_name.c_str());
         }
@@ -1159,7 +1267,7 @@ void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
         for (auto& [key, app] : managed_apps_) {
             if (key.first == package_name) {
                 app_found = true;
-                if (unfreeze_and_observe_nolock(app, "FCM")) {
+                if (unfreeze_and_observe_nolock(app, "FCM", WakeupPolicy::FROM_FCM)) {
                     state_changed = true;
                 }
             }
@@ -1190,7 +1298,7 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
         for (auto& [key, app] : managed_apps_) {
             if (app.uid == uid) {
                 app_found = true;
-                if (unfreeze_and_observe_nolock(app, "AUDIO_FOCUS", WakeupType::OTHER)) {
+                if (unfreeze_and_observe_nolock(app, "AUDIO_FOCUS", WakeupPolicy::STANDARD_OBSERVATION)) {
                     state_changed = true;
                 }
                 break;
@@ -1220,7 +1328,7 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = pid_to_app_map_.find(pid);
         if (it != pid_to_app_map_.end()) {
-            if (unfreeze_and_observe_nolock(*(it->second), "SIGKILL_PROTECT")) {
+            if (unfreeze_and_observe_nolock(*(it->second), "SIGKILL_PROTECT", WakeupPolicy::STANDARD_OBSERVATION)) {
                 state_changed = true;
             }
         } else {
@@ -1332,10 +1440,8 @@ bool StateManager::check_timers() {
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
 
-                    // [核心修正] 在冻结前执行PID即时验证
                     validate_pids_nolock(app);
 
-                    // 如果验证后没有存活的pid，则直接跳过冻结逻辑
                     if (app.pids.empty()) {
                         LOGI("Freeze skipped for %s as all its processes have died.", app.package_name.c_str());
                         app.background_since = 0;
@@ -1459,7 +1565,7 @@ bool StateManager::check_timed_unfreeze() {
                 if (app.current_status == AppRuntimeState::Status::FROZEN && !app.is_foreground) {
                     LOGI("TIMELINE: Executing timed unfreeze for %s.", app.package_name.c_str());
                     logger_->log(LogLevel::TIMER, "定时器", "执行定时解冻", app.package_name, app.user_id);
-                    if(unfreeze_and_observe_nolock(app, "定时器唤醒")) {
+                    if(unfreeze_and_observe_nolock(app, "定时器唤醒", WakeupPolicy::STANDARD_OBSERVATION)) {
                        state_changed = true;
                     }
                 }
@@ -1538,7 +1644,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
                 app->config = new_config;
 
                 if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
-                     if (unfreeze_and_observe_nolock(*app, "策略变更", WakeupType::OTHER)) {
+                     if (unfreeze_and_observe_nolock(*app, "策略变更", WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND)) {
                          probe_config_needs_update = true;
                      }
                 }

@@ -1,5 +1,6 @@
 // daemon/cpp/action_executor.cpp
 #include "action_executor.h"
+#include "system_monitor.h" // [新增] 引入头文件
 #include <android/log.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -17,7 +18,7 @@
 #include <optional>
 #include <mutex>
 
-#define LOG_TAG "cerberusd_action_v20_dynamic_oom" // 版本号更新
+#define LOG_TAG "cerberusd_action_v21_robust_oom" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -27,7 +28,8 @@ namespace fs = std::filesystem;
 
 constexpr int PINNED_MAIN_PROC_OOM_SCORE = 200;
 
-ActionExecutor::ActionExecutor() {
+// [修改] 构造函数实现
+ActionExecutor::ActionExecutor(std::shared_ptr<SystemMonitor> sys_monitor) : sys_monitor_(std::move(sys_monitor)) {
     initialize_binder();
     initialize_cgroup();
 }
@@ -81,11 +83,11 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
         }
     } else {
         LOGW("Cgroup freeze attempt failed for %s. Falling back to SIGSTOP.", key.first.c_str());
-        unfreeze_cgroup(key); 
+        unfreeze_cgroup(key);
         freeze_sigstop(pids);
         final_result = 1;
     }
-    
+
     // --- [修改] 阶段 3: OOM Score 保护 ---
     if (final_result == 0 || final_result == 1) {
         LOGI("CPU freeze for %s successful. Applying memory protection (OOM Score).", key.first.c_str());
@@ -99,7 +101,7 @@ int ActionExecutor::freeze(const AppInstanceKey& key, const std::vector<int>& pi
 bool ActionExecutor::unfreeze(const std::vector<int>& pids) {
     // 1. 恢复 OOM Score
     adjust_oom_scores(pids, false);
-    
+
     // 2. 解冻 CPU
     unfreeze_sigstop(pids);
     handle_binder_freeze(pids, false);
@@ -127,6 +129,28 @@ std::optional<int> ActionExecutor::read_oom_score_adj(int pid) {
     return score;
 }
 
+// [新增] 真正可靠地查找主进程PID
+int ActionExecutor::find_main_pid(const std::vector<int>& pids) const {
+    if (pids.empty()) {
+        return -1;
+    }
+
+    // 优先策略：查找进程名不含':'的进程
+    for (int pid : pids) {
+        // 使用注入的 sys_monitor_ 来获取进程名 (cmdline)
+        std::string cmdline = sys_monitor_->get_app_name_from_pid(pid);
+        if (!cmdline.empty() && cmdline.find(':') == std::string::npos) {
+            LOGD("OOM: Found main process %d by cmdline '%s'", pid, cmdline.c_str());
+            return pid;
+        }
+    }
+
+    // 回退策略：使用最小PID
+    int fallback_pid = *std::min_element(pids.begin(), pids.end());
+    LOGW("OOM: Could not find main process by cmdline, falling back to min_pid heuristic: %d", fallback_pid);
+    return fallback_pid;
+}
+
 // [核心重构] adjust_oom_scores 实现分层保护
 void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protect) {
     if (pids.empty()) return;
@@ -134,12 +158,8 @@ void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protec
     std::lock_guard<std::mutex> lock(oom_scores_mutex_);
 
     if (protect) {
-        // --- 保护操作 ---
-        int main_pid = -1;
-        if (!pids.empty()) {
-            main_pid = *std::min_element(pids.begin(), pids.end());
-        }
-
+        // --- 保护操作 (使用新的查找逻辑) ---
+        int main_pid = find_main_pid(pids);
         if (main_pid == -1) {
             LOGW("OOM: Could not determine main PID for protection.");
             return;
@@ -166,7 +186,7 @@ void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protec
                     int delta = original_score - original_main_score;
                     target_score = PINNED_MAIN_PROC_OOM_SCORE + delta;
                 }
-                
+
                 target_score = std::max(-1000, std::min(1000, target_score));
 
                 std::string path = "/proc/" + std::to_string(pid) + "/oom_score_adj";
@@ -260,7 +280,7 @@ bool ActionExecutor::is_cgroup_frozen(const AppInstanceKey& key) {
 
     std::ifstream freeze_file(freeze_path);
     if (!freeze_file.is_open()) {
-        return false; 
+        return false;
     }
     char state = '0';
     freeze_file >> state;
@@ -363,19 +383,19 @@ bool ActionExecutor::unfreeze_cgroup(const AppInstanceKey& key) {
     if (cgroup_version_ != CgroupVersion::V2) return true;
     std::string instance_path = get_instance_cgroup_path(key);
     if (!fs::exists(instance_path)) return true;
-    
+
     write_to_file(instance_path + "/cgroup.freeze", "0");
-    
+
     std::string procs_file = instance_path + "/cgroup.procs";
     std::vector<int> pids_to_move;
     std::ifstream ifs(procs_file);
     int pid;
     while(ifs >> pid) { pids_to_move.push_back(pid); }
-    if (!pids_to_move.empty()) { 
-        move_pids_to_default_cgroup(pids_to_move); 
+    if (!pids_to_move.empty()) {
+        move_pids_to_default_cgroup(pids_to_move);
     }
-    
-    usleep(50000); 
+
+    usleep(50000);
 
     remove_instance_cgroup(instance_path);
     return true;

@@ -4,16 +4,21 @@
 
 #include <string>
 #include <vector>
-#include <utility> 
+#include <utility>
 #include <map>
-#include <mutex> // [新增]
+#include <mutex>
+#include <memory> // [新增]
 #include <linux/android/binder.h>
 
 using AppInstanceKey = std::pair<std::string, int>;
 
+// [新增] 前向声明 SystemMonitor
+class SystemMonitor;
+
 class ActionExecutor {
 public:
-    ActionExecutor();
+    // [修改] 构造函数接受 SystemMonitor
+    explicit ActionExecutor(std::shared_ptr<SystemMonitor> sys_monitor);
     ~ActionExecutor();
 
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
@@ -44,12 +49,14 @@ private:
     bool write_to_file(const std::string& path, const std::string& value);
 
     // [重构] OOM Score 调整逻辑
+    // [新增] 查找主进程的辅助函数
+    int find_main_pid(const std::vector<int>& pids) const;
     void adjust_oom_scores(const std::vector<int>& pids, bool protect);
     std::optional<int> read_oom_score_adj(int pid);
 
     CgroupVersion cgroup_version_ = CgroupVersion::UNKNOWN;
     std::string cgroup_root_path_;
-    
+
     struct BinderState {
         int fd = -1;
         void* mapped = nullptr;
@@ -58,6 +65,9 @@ private:
 
     std::map<int, int> original_oom_scores_;
     std::mutex oom_scores_mutex_;
+
+    // [新增] 持有 SystemMonitor 的指针
+    std::shared_ptr<SystemMonitor> sys_monitor_;
 };
 
 #endif //CERBERUS_ACTION_EXECUTOR_H

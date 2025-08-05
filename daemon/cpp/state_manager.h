@@ -20,14 +20,20 @@
 
 using json = nlohmann::json;
 
-enum class WakeupType {
-    GENERIC_NOTIFICATION, // 普通通知，重冻时间较短
-    FCM_PUSH,             // FCM推送，重冻时间较长
-    PROACTIVE_START,      // 用户主动启动
-    OTHER,                // 其他类型
-    // [新增] 专门用于内核事件的唤醒类型
-    KERNEL_SIGNAL,
-    KERNEL_BINDER    
+// [核心修改] WakeupType 替换为更通用的 WakeupPolicy
+enum class WakeupPolicy {
+    // 决策结果
+    IGNORE,                       // 忽略事件, 不解冻
+    SHORT_OBSERVATION,            // 解冻并给予短观察期 (e.g., 3s)
+    STANDARD_OBSERVATION,         // 解冻并给予标准观察期 (e.g., 10s)
+    LONG_OBSERVATION,             // 解冻并给予长观察期 (e.g., 20s)
+    UNFREEZE_UNTIL_BACKGROUND,    // 解冻, 直到下次被判定为后台
+
+    // 事件类型 (用于传递信息)
+    FROM_NOTIFICATION,            // 来自普通通知
+    FROM_FCM,                     // 来自FCM推送
+    FROM_PROBE_START,             // 来自Probe探测到的应用启动
+    FROM_KERNEL                   // 来自内核事件 (统一归类)
 };
 
 struct AppRuntimeState {
@@ -70,6 +76,10 @@ struct AppRuntimeState {
     long swap_usage_kb = 0;
     long long last_foreground_timestamp_ms = 0;
     long long total_runtime_ms = 0;
+
+    // [新增] 节流阀相关字段
+    time_t last_wakeup_timestamp = 0;
+    int wakeup_count_in_window = 0;
 };
 
 class DozeManager {
@@ -125,13 +135,13 @@ public:
     void on_wakeup_request_from_probe(const json& payload);
     // [新增] 处理来自 Re-Kernel 的事件
     void on_signal_from_rekernel(const ReKernelSignalEvent& event);
-    void on_binder_from_rekernel(const ReKernelBinderEvent& event);    
+    void on_binder_from_rekernel(const ReKernelBinderEvent& event);
 
 private:
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
-    bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupType wakeup_type = WakeupType::OTHER);
+    bool unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupPolicy policy);
     bool reconcile_process_state_full();
     void load_all_configs();
     std::string get_package_name_from_pid(int pid, int& uid, int& user_id);
@@ -140,6 +150,10 @@ private:
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
     bool is_app_playing_audio(const AppRuntimeState& app);
+    // [新增] 决策函数
+    WakeupPolicy decide_wakeup_policy_for_probe(WakeupPolicy event_type);
+    WakeupPolicy decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event);
+    WakeupPolicy decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event);
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
@@ -163,7 +177,11 @@ private:
     std::optional<std::pair<int, long long>> last_battery_level_info_;
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
-    
+
+    // [新增] 遥测统计
+    std::map<int, int> kernel_wakeup_source_stats_; // key: source_uid, value: count
+    std::map<std::string, int> ignored_rpc_stats_;   // key: rpc_name, value: count
+
     // [核心重构] 修改Doze数据结构，以PID为key
     std::map<int, DozeProcessRecord> doze_start_process_info_;
 

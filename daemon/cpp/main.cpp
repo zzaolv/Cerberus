@@ -76,7 +76,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
 
             std::vector<LogEntry> logs;
             if (!filename.empty()) {
-                logs = g_logger->get_logs_from_file(filename, limit, 
+                logs = g_logger->get_logs_from_file(filename, limit,
                     before_ts > 0 ? std::optional(before_ts) : std::nullopt,
                     since_ts > 0 ? std::optional(since_ts) : std::nullopt);
             }
@@ -91,7 +91,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             }.dump());
             return;
         }
-        
+
         if (type == "query.get_log_files") {
             auto files = g_logger->get_log_files();
             g_server->send_message(client_fd, json{
@@ -287,8 +287,9 @@ int main(int argc, char *argv[]) {
     }
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
-    auto action_executor = std::make_shared<ActionExecutor>();
+    // [修改] 先创建 g_sys_monitor，再注入到 ActionExecutor
     g_sys_monitor = std::make_shared<SystemMonitor>();
+    auto action_executor = std::make_shared<ActionExecutor>(g_sys_monitor);
     g_logger = Logger::get_instance(LOG_DIR);
     g_ts_db = TimeSeriesDatabase::get_instance();
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
@@ -298,7 +299,7 @@ int main(int argc, char *argv[]) {
     g_rekernel_client->set_signal_handler(handle_rekernel_signal);
     g_rekernel_client->set_binder_handler(handle_rekernel_binder);
     g_rekernel_client->start();
-    
+
     g_state_manager->initial_full_scan_and_warmup();
 
     g_logger->log(LogLevel::EVENT, "Daemon", "守护进程已启动");
@@ -320,7 +321,7 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->stop_network_snapshot_thread();
 
     // [新增] 确保 ReKernelClient 线程也已停止
-    if (g_rekernel_client) g_rekernel_client->stop();    
+    if (g_rekernel_client) g_rekernel_client->stop();
 
     LOGI("Cerberus Daemon has shut down cleanly.");
     return 0;
