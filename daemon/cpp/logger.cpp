@@ -9,9 +9,11 @@
 #include <android/log.h>
 #include <vector>
 #include <regex>
-#include <iterator> // For std::istreambuf_iterator
+#include <iterator>
 
-#define LOG_TAG "cerberusd_logger_v8_robust_sort" // 版本号更新
+#define LOG_TAG "cerberusd_logger_v8_robust_sort"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)   // [修正] 补全 LOGI 定义
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)   // [修正] 补全 LOGW 定义
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
@@ -88,14 +90,14 @@ void Logger::log_batch(const std::vector<LogEntry>& entries) {
     cv_.notify_one();
 }
 
-// [核心修正] get_log_files 必须进行降序排序
 std::vector<std::string> Logger::get_log_files() const {
     std::vector<std::string> files;
     try {
         for (const auto& entry : fs::directory_iterator(log_dir_path_)) {
             if (entry.is_regular_file()) {
                 std::string filename = entry.path().filename().string();
-                if (filename.rfind("fct_", 0) == 0 && filename.ends_with(".log")) {
+                // [修正] 使用 C++17 兼容的 rfind 方法替代 ends_with
+                if (filename.rfind("fct_", 0) == 0 && (filename.length() >= 4 && filename.rfind(".log") == filename.length() - 4)) {
                     files.push_back(filename);
                 }
             }
@@ -103,12 +105,10 @@ std::vector<std::string> Logger::get_log_files() const {
     } catch (const fs::filesystem_error& e) {
         LOGE("Error listing log files: %s", e.what());
     }
-    // 强制进行字符串降序排序，确保 'fct_2025-08-05_2.log' 在 'fct_2025-08-05_1.log' 之前
     std::sort(files.rbegin(), files.rend());
     return files;
 }
 
-// [核心修正] get_logs_from_file 轮询时包含内存队列
 std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, int limit,
                                                  std::optional<long long> before_timestamp_ms,
                                                  std::optional<long long> since_timestamp_ms) const {
@@ -150,7 +150,6 @@ std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, in
     }
 
     if (since_timestamp_ms.has_value()) {
-        // 如果是轮询新日志(since)，则需要合并内存中的日志
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             for(const auto& entry : log_queue_) {
@@ -159,33 +158,26 @@ std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, in
                 }
             }
         }
-        // 对合并后的结果按时间戳升序排序
         std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
             return a.timestamp_ms < b.timestamp_ms;
         });
-    } else {
-        // 对于 'before' 或普通查询，结果是降序的，不用处理
     }
 
     return results;
 }
 
-// [核心修正] manage_log_files 现在基于可靠排序的列表
 void Logger::manage_log_files() {
-    auto files = get_log_files(); // 已经是降序排序
+    auto files = get_log_files();
     std::map<std::string, std::vector<std::string>> files_by_day;
     
     for (const auto& f : files) {
         try {
-            // "fct_2025-08-05_1.log" -> "2025-08-05"
             std::string date_str = f.substr(4, 10);
             files_by_day[date_str].push_back(f);
         } catch(...) {}
     }
     
-    // 1. 清理每天多余的文件
     for (auto& pair : files_by_day) {
-        // pair.second 已经是按时间降序的了 (因为 files 是降序的)
         if (pair.second.size() > MAX_LOG_FILES_PER_DAY) {
             for (size_t i = MAX_LOG_FILES_PER_DAY; i < pair.second.size(); ++i) {
                 fs::remove(fs::path(log_dir_path_) / pair.second[i]);
@@ -194,11 +186,8 @@ void Logger::manage_log_files() {
         }
     }
     
-    // 2. 清理过期的天数
-    // map的key(日期字符串)是自动升序的
     if (files_by_day.size() > MAX_LOG_RETENTION_DAYS) {
         auto it = files_by_day.begin();
-        // 需要删除的迭代次数
         size_t to_delete_count = files_by_day.size() - MAX_LOG_RETENTION_DAYS;
         for (size_t i = 0; i < to_delete_count; ++i) {
             for (const auto& f : it->second) {
@@ -209,8 +198,7 @@ void Logger::manage_log_files() {
         }
     }
 
-    // 3. 更新当前日志文件状态
-    auto latest_files = get_log_files(); // 重新获取排序后的列表
+    auto latest_files = get_log_files();
     if (latest_files.empty()) {
         current_log_file_path_ = "";
         current_log_line_count_ = 0;
@@ -221,7 +209,6 @@ void Logger::manage_log_files() {
     }
 }
 
-// [核心修正] rotate_log_file_if_needed 基于可靠排序的列表
 void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     time_t now = time(nullptr);
     tm ltm = {};
@@ -238,8 +225,8 @@ void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
     }
 
     if (needs_new_file) {
-        manage_log_files(); // 在创建新文件前，先执行一次清理
-        auto files = get_log_files(); // 获取最新的、排序后的文件列表
+        manage_log_files();
+        auto files = get_log_files();
 
         int next_index = 1;
         if (!files.empty() && files[0].find(current_date_str) != std::string::npos) {
@@ -250,7 +237,7 @@ void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
                 int last_index = std::stoi(last_file.substr(underscore_pos + 1, dot_pos - underscore_pos - 1));
                 next_index = last_index + 1;
             } catch (...) {
-                next_index = 1; // 解析失败则重置为1
+                next_index = 1;
             }
         }
         std::string new_filename = "fct_" + current_date_str + "_" + std::to_string(next_index) + ".log";
@@ -261,7 +248,6 @@ void Logger::rotate_log_file_if_needed(size_t new_entries_count) {
 }
 
 void Logger::writer_thread_func() {
-    // 首次运行时执行一次清理和状态更新
     manage_log_files();
 
     while (is_running_) {
