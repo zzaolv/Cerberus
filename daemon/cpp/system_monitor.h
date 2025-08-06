@@ -74,6 +74,11 @@ public:
     void stop_network_snapshot_thread();
     NetworkSpeed get_cached_network_speed(int uid);
 
+    // [核心新增] 获取 /data/app 下所有应用包名
+    std::vector<std::string> get_data_app_packages();
+    // [核心新增] 公开 read_file_once 以便在 main.cpp 中使用
+    static std::string read_file_once(const std::string& path, size_t max_size = 4096);
+
 private:
     class ProcFileReader {
     public:
@@ -88,9 +93,7 @@ private:
     };
 
     std::string exec_shell_pipe_efficient(const std::vector<std::string>& args);
-    static std::string read_file_once(const std::string& path, size_t max_size = 4096);
-
-    // [核心修改] update_cpu_usage 现在填充 MetricsRecord
+    
     void update_cpu_usage(MetricsRecord& record);
     void update_mem_info(long& total, long& available, long& swap_total, long& swap_free);
     bool get_screen_state();
@@ -108,7 +111,6 @@ private:
     };
 
     mutable std::mutex data_mutex_;
-    // [核心修改] 存储上一次总CPU和每个核心的CPU时间
     TotalCpuTimes prev_total_cpu_times_;
     std::vector<TotalCpuTimes> prev_per_core_cpu_times_;
     std::map<int, CpuTimeSlice> app_cpu_times_;

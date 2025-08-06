@@ -98,6 +98,46 @@ static std::optional<long> read_long_from_file_str(const std::string& content) {
     }
 }
 
+// [核心新增] 实现 get_data_app_packages 函数
+std::vector<std::string> SystemMonitor::get_data_app_packages() {
+    std::set<std::string> packages; // 使用set自动去重
+    const std::string data_app_path = "/data/app";
+
+    if (!fs::exists(data_app_path) || !fs::is_directory(data_app_path)) {
+        LOGW("Path /data/app does not exist or is not a directory.");
+        return {};
+    }
+
+    try {
+        for (const auto& top_level_entry : fs::directory_iterator(data_app_path)) {
+            if (!top_level_entry.is_directory()) continue;
+            
+            // top_level_entry.path() 是 /data/app/~~...
+            for (const auto& pkg_level_entry : fs::directory_iterator(top_level_entry.path())) {
+                if (!pkg_level_entry.is_directory()) continue;
+                
+                // pkg_level_entry.path().filename() 是 com.package.name-XXXX==
+                std::string dirname = pkg_level_entry.path().filename().string();
+                
+                // 从目录名中提取包名 (从开头到第一个'-')
+                size_t dash_pos = dirname.find('-');
+                if (dash_pos != std::string::npos) {
+                    std::string pkg_name = dirname.substr(0, dash_pos);
+                    // 基础校验，包名必须包含'.'
+                    if (pkg_name.find('.') != std::string::npos) {
+                        packages.insert(pkg_name);
+                    }
+                }
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        LOGE("Error iterating /data/app: %s", e.what());
+    }
+
+    LOGI("Scanned /data/app and found %zu unique packages.", packages.size());
+    return {packages.begin(), packages.end()};
+}
+
 std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::string>& args) {
     if (args.empty()) return "";
 

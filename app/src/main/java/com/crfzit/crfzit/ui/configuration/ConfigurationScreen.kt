@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -26,7 +27,9 @@ import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppInfo
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.AppPolicyPayload
+import com.crfzit.crfzit.navigation.Screen // 引入Screen
 
+// --- Policy enum 和 AppPolicyItem 保持不变 ---
 enum class Policy(val value: Int, val displayName: String) {
     EXEMPTED(0, "豁免"),
     STANDARD(2, "智能"),
@@ -50,13 +53,25 @@ fun ConfigurationScreen(
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("应用配置") }) }
+        topBar = {
+            TopAppBar(
+                title = { Text("应用配置") },
+                // [核心新增] 添加右上角操作按钮
+                actions = {
+                    IconButton(onClick = { navController.navigate(Screen.MoreSettings.route) }) {
+                        Icon(Screen.MoreSettings.icon, contentDescription = Screen.MoreSettings.label)
+                    }
+                }
+            )
+        }
     ) { padding ->
         Column(Modifier.padding(padding)) {
             OutlinedTextField(
                 value = uiState.searchQuery,
                 onValueChange = viewModel::onSearchQueryChanged,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
                 label = { Text("搜索应用或包名") },
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 singleLine = true
@@ -112,7 +127,6 @@ fun AppPolicyItem(
 ) {
     var showMenu by remember { mutableStateOf(false) }
     val itemAlpha = if (policy == Policy.EXEMPTED) 0.7f else 1.0f
-
     Card(modifier = Modifier.fillMaxWidth().alpha(itemAlpha)) {
         Row(
             modifier = Modifier
@@ -121,7 +135,6 @@ fun AppPolicyItem(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Image(
-                // [内存优化] 与DashboardScreen同样的核心改动，使用Coil按需加载
                 painter = rememberAsyncImagePainter(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(AppIcon(appInfo.packageName))
@@ -149,7 +162,6 @@ fun AppPolicyItem(
                 }
                 Text(appInfo.packageName, style = MaterialTheme.typography.bodySmall)
             }
-
             Box {
                 val (label, icon) = getPolicyLabelAndIcon(policy)
                 Text(
@@ -157,7 +169,6 @@ fun AppPolicyItem(
                     color = if (policy == Policy.EXEMPTED) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Bold
                 )
-
                 DropdownMenu(
                     expanded = showMenu,
                     onDismissRequest = { showMenu = false }
@@ -179,7 +190,6 @@ fun AppPolicyItem(
         }
     }
 }
-
 @Composable
 private fun getPolicyLabelAndIcon(policy: Policy): Pair<String, String> {
     return when (policy) {

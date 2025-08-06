@@ -21,6 +21,10 @@ import com.crfzit.crfzit.ui.dashboard.DashboardViewModel
 import com.crfzit.crfzit.ui.logs.LogsScreen
 import com.crfzit.crfzit.ui.settings.SettingsScreen
 import com.crfzit.crfzit.ui.settings.SettingsViewModel
+// [核心新增] 引入新页面的Composable
+import com.crfzit.crfzit.ui.settings.more.MoreSettingsScreen
+import com.crfzit.crfzit.ui.settings.more.MoreSettingsViewModel
+
 
 @Composable
 fun MainScreen() {
@@ -63,7 +67,6 @@ fun MainScreen() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Dashboard.route) {
-                // ViewModel 在此级别创建，可以实现跨屏幕共享
                 val dashboardViewModel: DashboardViewModel = viewModel()
                 DashboardScreen(viewModel = dashboardViewModel)
             }
@@ -75,8 +78,15 @@ fun MainScreen() {
             composable(Screen.Settings.route) { 
                 val settingsViewModel: SettingsViewModel = viewModel()
                 SettingsScreen(viewModel = settingsViewModel)
-             }
-            // composable(Screen.ProfileManagement.route) { ... } // 未来实现
+            }
+            // [核心新增] 添加新页面的导航 composable
+            composable(Screen.MoreSettings.route) {
+                val moreSettingsViewModel: MoreSettingsViewModel = viewModel()
+                MoreSettingsScreen(
+                    viewModel = moreSettingsViewModel,
+                    onNavigateBack = { navController.popBackStack() }
+                )
+            }
         }
     }
 }

@@ -20,7 +20,7 @@
 #include <mutex>
 #include <unistd.h>
 
-#define LOG_TAG "cerberusd_main_v34_wakeup" // 版本号更新
+#define LOG_TAG "cerberusd_main_v35_more_settings" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -29,6 +29,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+// --- 全局变量声明保持不变 ---
 std::unique_ptr<UdsServer> g_server;
 static std::unique_ptr<ReKernelClient> g_rekernel_client;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -39,15 +40,12 @@ static std::atomic<bool> g_is_running = true;
 std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
-
-// [新增] Re-Kernel 信号事件处理函数
+// --- Re-Kernel 相关函数保持不变 ---
 void handle_rekernel_signal(const ReKernelSignalEvent& event) {
     if (g_state_manager) {
         g_state_manager->on_signal_from_rekernel(event);
     }
 }
-
-// [新增] Re-Kernel Binder 事件处理函数 (未来可扩展)
 void handle_rekernel_binder(const ReKernelBinderEvent& event) {
      if (g_state_manager) {
         g_state_manager->on_binder_from_rekernel(event);
@@ -69,6 +67,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
+        // --- query.get_logs 和 query.get_log_files 逻辑保持不变 ---
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
             std::string filename = payload_json.value("filename", "");
@@ -112,9 +111,32 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
+        // [核心新增] 处理获取OOM策略文件内容的请求
+        if (type == "query.get_adj_rules_content") {
+            std::string content = SystemMonitor::read_file_once("/data/adb/cerberus/adj_rules.json", 16 * 1024); // 限制最大16KB
+            g_server->send_message(client_fd, json{
+                {"type", "resp.adj_rules_content"},
+                {"req_id", msg.value("req_id", "")},
+                {"payload", {{"content", content}}}
+            }.dump());
+            return;
+        }
+
+        // [核心新增] 处理获取/data/app下所有包名的请求
+        if (type == "query.get_data_app_packages") {
+            auto packages = g_sys_monitor->get_data_app_packages();
+            g_server->send_message(client_fd, json{
+                {"type", "resp.data_app_packages"},
+                {"req_id", msg.value("req_id", "")},
+                {"payload", packages}
+            }.dump());
+            return;
+        }
+
+
         if (!g_state_manager) return;
 
-        // [核心新增] 添加对新唤醒事件的处理路由
+        // --- 其余事件和命令处理逻辑保持不变 ---
         if (type == "event.app_wakeup_request_v2") {
             g_state_manager->on_wakeup_request_from_probe(msg.at("payload"));
         } else if (type == "cmd.proactive_unfreeze") {
@@ -154,7 +176,9 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         } else if (type == "query.get_all_policies") {
             json payload = g_state_manager->get_full_config_for_ui();
             g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
-        } else if (type == "cmd.reload_adj_rules") { // [新增]
+        } 
+        // [核心新增] 处理OOM策略热重载命令
+        else if (type == "cmd.reload_adj_rules") { 
             if (g_state_manager) g_state_manager->reload_adj_rules();
         } else if (type == "event.probe_hello") {
             g_probe_fd = client_fd;
@@ -169,7 +193,6 @@ void handle_client_disconnect(int client_fd) {
         g_probe_fd = -1;
     }
 }
-
 void broadcast_dashboard_update() {
     if (g_server && g_server->has_clients() && g_state_manager) {
         LOGD("Broadcasting dashboard update...");
@@ -177,7 +200,6 @@ void broadcast_dashboard_update() {
         g_server->broadcast_message_except(json{{"type", "stream.dashboard_update"}, {"payload", payload}}.dump(), g_probe_fd.load());
     }
 }
-
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
@@ -185,7 +207,6 @@ void notify_probe_of_config_change() {
         g_server->send_message(probe_fd, json{{"type", "stream.probe_config_update"}, {"payload", payload}}.dump());
     }
 }
-
 void signal_handler(int signum) {
     LOGW("Signal %d received, shutting down...", signum);
     g_is_running = false;
@@ -194,7 +215,6 @@ void signal_handler(int signum) {
     if (g_logger) g_logger->stop();
     if (g_rekernel_client) g_rekernel_client->stop();
 }
-
 void worker_thread_func() {
     LOGI("Worker thread started.");
     g_top_app_refresh_tickets = 2;
@@ -251,10 +271,9 @@ void worker_thread_func() {
             g_sys_monitor->update_location_state();
             location_scan_countdown = 15;
         }
-        // [新增] 内存管家调度
         if (--butler_countdown <= 0) {
             g_state_manager->run_memory_butler_tasks();
-            butler_countdown = 60; // 每120秒运行一次
+            butler_countdown = 60; 
         }
 
         if (--heartbeat_countdown <= 0) {
@@ -276,8 +295,6 @@ void worker_thread_func() {
     }
     LOGI("Worker thread finished.");
 }
-
-
 int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
@@ -286,7 +303,7 @@ int main(int argc, char *argv[]) {
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
-    const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; // [新增]    
+    const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; 
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
 
     try {
@@ -298,7 +315,6 @@ int main(int argc, char *argv[]) {
     }
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
-    // [修改] 更新初始化顺序
     g_sys_monitor = std::make_shared<SystemMonitor>();
     auto adj_mapper = std::make_shared<AdjMapper>(ADJ_RULES_PATH);
     auto action_executor = std::make_shared<ActionExecutor>(g_sys_monitor, adj_mapper);
@@ -306,10 +322,8 @@ int main(int argc, char *argv[]) {
 
     g_logger = Logger::get_instance(LOG_DIR);
     g_ts_db = TimeSeriesDatabase::get_instance();
-    // [修改] 向 StateManager 注入新组件
     g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db, adj_mapper, memory_butler);
 
-    // [新增] 初始化并启动 Re-Kernel 客户端
     g_rekernel_client = std::make_unique<ReKernelClient>();
     g_rekernel_client->set_signal_handler(handle_rekernel_signal);
     g_rekernel_client->set_binder_handler(handle_rekernel_binder);
@@ -335,7 +349,6 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->stop_top_app_monitor();
     g_sys_monitor->stop_network_snapshot_thread();
 
-    // [新增] 确保 ReKernelClient 线程也已停止
     if (g_rekernel_client) g_rekernel_client->stop();
 
     LOGI("Cerberus Daemon has shut down cleanly.");

@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.*
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
+// --- 现有数据类保持不变 ---
 data class GetLogFilesPayload(val placeholder: Int = 0)
 data class GetLogsByFilePayload(
     val filename: String?,
@@ -33,9 +34,11 @@ class DaemonRepository private constructor(
         scope.launch(Dispatchers.IO) {
             tcpClient.incomingMessages.collect { jsonLine ->
                 try {
-                    val baseMsg = gson.fromJson(jsonLine, BaseMessage::class.java)
-                    if ((baseMsg.type.startsWith("resp.") || baseMsg.type.startsWith("error.")) && baseMsg.requestId != null) {
-                        pendingRequests.remove(baseMsg.requestId)?.complete(jsonLine)
+                    // [核心新增] 处理新请求的响应
+                    val type = gson.fromJson(jsonLine, BaseMessage::class.java).type
+                    val reqId = gson.fromJson(jsonLine, BaseMessage::class.java).requestId
+                    if ((type.startsWith("resp.") || type.startsWith("error.")) && reqId != null) {
+                        pendingRequests.remove(reqId)?.complete(jsonLine)
                     }
                 } catch (e: JsonSyntaxException) {
                     // Ignore, not a response message
@@ -43,12 +46,46 @@ class DaemonRepository private constructor(
             }
         }
     }
+    
+    // [核心新增] 热重载OOM策略
+    fun reloadAdjRules() {
+        val message = CerberusMessage(type = "cmd.reload_adj_rules", payload = EmptyPayload)
+        tcpClient.sendMessage(gson.toJson(message))
+    }
+
+    // [核心新增] 获取OOM策略文件内容
+    suspend fun getAdjRulesContent(): String? {
+        return query("query.get_adj_rules_content", EmptyPayload) { responseJson ->
+            val type = object : TypeToken<CerberusMessage<Map<String, String>>>() {}.type
+            val message = gson.fromJson<CerberusMessage<Map<String, String>>>(responseJson, type)
+            if (message?.type == "resp.adj_rules_content") {
+                message.payload["content"]
+            } else {
+                Log.e("DaemonRepository", "Query 'get_adj_rules_content' failed with response type '${message?.type}'")
+                null
+            }
+        }
+    }
+    
+    // [核心新增] 获取 /data/app 下的包名
+    suspend fun getDataAppPackages(): List<String>? {
+        return query("query.get_data_app_packages", EmptyPayload) { responseJson ->
+            val type = object : TypeToken<CerberusMessage<List<String>>>() {}.type
+            val message = gson.fromJson<CerberusMessage<List<String>>>(responseJson, type)
+            if (message?.type == "resp.data_app_packages") {
+                message.payload
+            } else {
+                Log.e("DaemonRepository", "Query 'get_data_app_packages' failed with response type '${message?.type}'")
+                null
+            }
+        }
+    }
 
     private fun mapPayloadToMetricsRecord(p: MetricsRecordPayload): MetricsRecord {
         return MetricsRecord(
             timestamp = p.timestamp,
-            totalCpuUsagePercent = p.totalCpuUsagePercent, // [核心修改]
-            perCoreCpuUsagePercent = p.perCoreCpuUsagePercent ?: emptyList(), // [核心新增]
+            totalCpuUsagePercent = p.totalCpuUsagePercent,
+            perCoreCpuUsagePercent = p.perCoreCpuUsagePercent ?: emptyList(),
             memTotalKb = p.memTotalKb,
             memAvailableKb = p.memAvailableKb,
             swapTotalKb = p.swapTotalKb,
@@ -62,7 +99,6 @@ class DaemonRepository private constructor(
             isLocationActive = p.isLocationActive
         )
     }
-
     fun getDashboardStream(): Flow<DashboardPayload> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
@@ -74,7 +110,6 @@ class DaemonRepository private constructor(
                 null
             }
         }
-
     suspend fun getLogFiles(): List<String>? {
         return query("query.get_log_files", GetLogFilesPayload()) { responseJson ->
             val responseType = object : TypeToken<CerberusMessage<List<String>>>() {}.type
@@ -86,7 +121,6 @@ class DaemonRepository private constructor(
             }
         }
     }
-
     suspend fun getLogs(
         filename: String,
         before: Long? = null,
@@ -107,31 +141,28 @@ class DaemonRepository private constructor(
             }
         }
     }
-
     fun getStatsStream(): Flow<MetricsRecord> = tcpClient.incomingMessages
         .mapNotNull { jsonLine ->
             try {
                 val type = object : TypeToken<CerberusMessage<MetricsRecordPayload>>() {}.type
                 val msg = gson.fromJson<CerberusMessage<MetricsRecordPayload>>(jsonLine, type)
                 if (msg?.type == "stream.new_stats_record") {
-                    msg.payload?.let { mapPayloadToMetricsRecord(it) } // [核心修改]
+                    msg.payload?.let { mapPayloadToMetricsRecord(it) } 
                 } else null
             } catch (e: Exception) {
                 Log.w("DaemonRepository", "Failed to parse MetricsRecordPayload: ${e.message}")
                 null
             }
         }
-
     suspend fun getHistoryStats(): List<MetricsRecord>? = query("query.get_history_stats", EmptyPayload) { responseJson ->
         val type = object : TypeToken<CerberusMessage<List<MetricsRecordPayload>>>() {}.type
         val message = gson.fromJson<CerberusMessage<List<MetricsRecordPayload>>>(responseJson, type)
         if (message?.type == "resp.history_stats") {
-            message.payload.map { mapPayloadToMetricsRecord(it) } // [核心修改]
+            message.payload.map { mapPayloadToMetricsRecord(it) }
         } else {
             null
         }
     }
-
     private suspend fun <ReqT, RespT> query(
         queryType: String,
         payload: ReqT,
@@ -150,12 +181,10 @@ class DaemonRepository private constructor(
             null
         }
     }
-
     fun setPolicy(config: FullConfigPayload) {
         val message = CerberusMessage(type = "cmd.set_policy", payload = config)
         tcpClient.sendMessage(gson.toJson(message))
     }
-
     suspend fun getAllPolicies(): FullConfigPayload? {
         return query("query.get_all_policies", EmptyPayload) { responseJson ->
             val type = object : TypeToken<CerberusMessage<FullConfigPayload>>() {}.type
@@ -163,26 +192,21 @@ class DaemonRepository private constructor(
             if (message?.type == "resp.all_policies") message.payload else null
         }
     }
-
     fun requestDashboardRefresh() {
         val message = CerberusMessage(type = "query.refresh_dashboard", payload = EmptyPayload)
         tcpClient.sendMessage(gson.toJson(message))
     }
-
     fun stop() {
         tcpClient.stop()
         pendingRequests.values.forEach { it.cancel("Repository is stopping.") }
         pendingRequests.clear()
     }
-
     fun setMasterConfig(payload: Map<String, Any>) {
         val message = CerberusMessage(type = "cmd.set_master_config", payload = payload)
         tcpClient.sendMessage(gson.toJson(message))
     }
-
     private data class BaseMessage(val type: String, @SerializedName("req_id") val requestId: String?)
     private object EmptyPayload
-
     companion object {
         @Volatile private var INSTANCE: DaemonRepository? = null
         fun getInstance(scope: CoroutineScope? = null): DaemonRepository {

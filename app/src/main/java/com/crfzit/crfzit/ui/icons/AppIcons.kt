@@ -106,5 +106,37 @@ object AppIcons {
             curveTo(22f, 6.48f, 17.52f, 2f, 12f, 2f)
             close()
         }
+    // [核心新增] 为“更多设置”页面添加图标
+    val SettingsApplications: ImageVector by lazy { materialIcon(name = "Filled.SettingsApplications") {
+        materialPath {
+            moveTo(19.0f, 3.0f)
+            lineTo(5.0f, 3.0f)
+            curveTo(3.9f, 3.0f, 3.0f, 3.9f, 3.0f, 5.0f)
+            verticalLineToRelative(14.0f)
+            curveToRelative(0.0f, 1.1f, 0.9f, 2.0f, 2.0f, 2.0f)
+            horizontalLineToRelative(14.0f)
+            curveToRelative(1.1f, 0.0f, 2.0f, -0.9f, 2.0f, -2.0f)
+            lineTo(21.0f, 5.0f)
+            curveTo(21.0f, 3.9f, 20.1f, 3.0f, 19.0f, 3.0f)
+            close()
+            moveTo(12.0f, 12.0f)
+            curveToRelative(-1.66f, 0.0f, -3.0f, -1.34f, -3.0f, -3.0f)
+            reflectiveCurveToRelative(1.34f, -3.0f, 3.0f, -3.0f)
+            reflectiveCurveToRelative(3.0f, 1.34f, 3.0f, 3.0f)
+            reflectiveCurveTo(13.66f, 12.0f, 12.0f, 12.0f)
+            close()
+            moveTo(7.0f, 18.0f)
+            curveToRelative(0.0f, -1.67f, 3.33f, -2.5f, 5.0f, -2.5f)
+            reflectiveCurveToRelative(5.0f, 0.83f, 5.0f, 2.5f)
+            lineTo(17.0f, 18.0f)
+            lineTo(7.0f, 18.0f)
+            close()
+        }
+        materialPath {
+            moveTo(12.0f, 12.0f)
+            moveToRelative(-3.0f, 0.0f)
+            arcTo(3.0f, 3.0f, 0.0f, true, true, 18.0f, 12.0f)
+            arcTo(3.0f, 3.0f, 0.0f, true, true, 12.0f, 12.0f)
+        }
     } }
 }
