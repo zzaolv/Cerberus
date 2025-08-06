@@ -2,8 +2,7 @@
 #include "state_manager.h"
 #include "adj_mapper.h"
 #include "memory_butler.h"
-#include "state_manager.h"
-#include "main.h"
+#include "main.h" // 修正：包含 main.h 以使用全局函数
 #include <android/log.h>
 #include <filesystem>
 #include <fstream>
@@ -15,7 +14,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v44_selective_binder" // 版本号更新
+#define LOG_TAG "cerberusd_state_v45_audit_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -130,7 +129,6 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
     return DozeEvent::NONE;
 }
 
-// [修改] 构造函数实现
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
                            std::shared_ptr<SystemMonitor> sys,
                            std::shared_ptr<ActionExecutor> act,
@@ -149,13 +147,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
         master_config_.standard_timeout_sec, master_config_.is_timed_unfreeze_enabled, master_config_.timed_unfreeze_interval_sec);
 
     critical_system_apps_ = {
-//        "com.google.android.inputmethod.latin",
-//        "com.baidu.input",
-//        "com.sohu.inputmethod.sogou",
-//        "com.iflytek.inputmethod",
-//        "com.tencent.qqpinyin",
-//        "com.xiaomi.mibrain.speech",
-//        "com.xiaomi.scanner",
         "zygote",
         "zygote64",
         "com.xiaomi.xmsf",
@@ -498,7 +489,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
     LOGI("StateManager Initialized. Ready for warmup.");
 }
 
-// [新增] 热重载 OOM 策略的实现
 void StateManager::reload_adj_rules() {
     LOGI("Reloading adj_rules.json by request...");
     if (adj_mapper_) {
@@ -560,11 +550,10 @@ bool StateManager::evaluate_and_execute_strategy() {
     // 步骤1：更新前后台状态
     state_has_changed |= update_foreground_state(visible_app_keys);
 
-    // [核心修改] 步骤2：对后台应用进行策略审计，确保它们都在监管中
+    // 步骤2：对后台应用进行策略审计，确保它们都在监管中
     audit_background_apps();
 
     // 步骤3：对应用内部的进程结构进行审计（例如“斩首行动”）
-    // 注意：这个检查只有在状态变化后执行可能不够频繁，但为了减少开销，暂时维持原样
     if (state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
@@ -578,9 +567,8 @@ bool StateManager::handle_top_app_change_fast() {
     return update_foreground_state_from_pids(top_pids);
 }
 
-// [修改] process_new_metrics 添加内存健康评估
 void StateManager::process_new_metrics(const MetricsRecord& record) {
-    update_memory_health(record); // [新增]
+    update_memory_health(record);
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     auto doze_event = doze_manager_->process_metrics(record);
@@ -610,7 +598,6 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     last_metrics_record_ = record;
 }
 
-// [新增] 内存健康状态评估函数
 void StateManager::update_memory_health(const MetricsRecord& record) {
     if (record.mem_total_kb <= 0) return;
 
@@ -635,7 +622,6 @@ void StateManager::update_memory_health(const MetricsRecord& record) {
     }
 }
 
-// [新增] 内存管家任务调度函数
 void StateManager::run_memory_butler_tasks() {
     if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ == MemoryHealth::HEALTHY) {
         return;
@@ -654,7 +640,7 @@ void StateManager::run_memory_butler_tasks() {
             }
         }
     }
-    // 按内存使用量降序排序
+    
     std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
         return a.second > b.second;
     });
@@ -838,14 +824,12 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
                 app.background_since = 0;
                 LOGI("Smart Unfreeze: %s un-frozen by policy until next background event.", app.package_name.c_str());
                 return true;
-            default: // IGNORE, FROM_*
-                // 默认对于事件源也给一个标准观察期
+            default:
                 observation_seconds = 10;
                 break;
         }
 
         if (observation_seconds > 0) {
-            // 通过调整过去的时间点来控制未来的时长, 假设标准观察期是10s
             app.observation_since = now - (10 - observation_seconds);
             LOGI("Smart Unfreeze: %s gets %ds observation for %s.", app.package_name.c_str(), observation_seconds, reason.c_str());
         }
@@ -864,44 +848,26 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
 WakeupPolicy StateManager::decide_wakeup_policy_for_probe(WakeupPolicy event_type) {
     switch (event_type) {
         case WakeupPolicy::FROM_FCM:
-            return WakeupPolicy::LONG_OBSERVATION; // FCM可能需要后台同步，给更长时间
+            return WakeupPolicy::LONG_OBSERVATION;
         case WakeupPolicy::FROM_NOTIFICATION:
-            return WakeupPolicy::SHORT_OBSERVATION; // 普通通知通常不需要长时间后台
+            return WakeupPolicy::SHORT_OBSERVATION;
         case WakeupPolicy::FROM_PROBE_START:
-            return WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND; // 用户主动启动，应该保持运行
+            return WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND;
         default:
-            return WakeupPolicy::STANDARD_OBSERVATION; // 其他情况给标准时间
+            return WakeupPolicy::STANDARD_OBSERVATION;
     }
 }
 
-// [核心修改] 实现精确的、基于白名单的Binder唤醒策略
 WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event) {
-    // 1. 检查是否是发往 NotificationManager 的调用
     if (event.rpc_name.find("android.app.INotificationManager") != std::string::npos) {
-        
-        // 2. 检查事务代码（event.code）是否在我们的白名单中
-        // 这些数字是 `INotificationManager.aidl` 中定义的 `TRANSACTION_enqueueNotificationWithTag` 等方法的ID
-        // 它们在不同Android版本中可能略有不同，但通常是稳定的。
-        // TRANSACTION_enqueueNotificationWithTag 通常是 `1` 或 `FIRST_CALL_TRANSACTION + 0`
-        // 这是一个比较常见的白名单，可以根据需要扩展
-        const std::unordered_set<int> notification_transaction_codes = {
-            1, // enqueueNotificationWithTag (most common)
-            2, // cancelNotificationWithTag
-            7  // enqueueNotificationWithTag
-        };
-
+        const std::unordered_set<int> notification_transaction_codes = { 1, 2, 7 };
         if (notification_transaction_codes.count(event.code)) {
             LOGI("Policy: Whitelisted Notification Binder call (code %d) to frozen app from UID %d. Waking up.", event.code, event.from_uid);
-            // 给予一个较短的观察期，足够应用发出通知即可
             return WakeupPolicy::SHORT_OBSERVATION;
         }
     }
 
-    // 3. (可选) 这里可以添加其他需要放行的Binder调用，例如与媒体会话相关的
-    // if (event.rpc_name.find("android.media.session.ISessionManager") != std::string::npos) { ... }
-
-    // 4. 对于所有其他未在白名单中的Binder调用，一律忽略
-    ignored_rpc_stats_[event.rpc_name]++; // 遥测
+    ignored_rpc_stats_[event.rpc_name]++;
     LOGD("Policy: Ignoring non-whitelisted Binder event from PID %d to %d (rpc: %s, code: %d).",
          event.from_pid, event.target_pid, event.rpc_name.c_str(), event.code);
          
@@ -938,9 +904,7 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
                 const time_t now = time(nullptr);
                 
                 WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
-                if (policy == WakeupPolicy::IGNORE) {
-                    return;
-                }
+                if (policy == WakeupPolicy::IGNORE) return;
 
                 if (now - app->last_wakeup_timestamp > 60) {
                     app->wakeup_count_in_window = 1;
@@ -988,9 +952,7 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
                 }
 
                 WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
-                if (policy == WakeupPolicy::IGNORE) {
-                    return;
-                }
+                if (policy == WakeupPolicy::IGNORE) return;
 
                 if (now - app->last_wakeup_timestamp > 60) {
                     app->wakeup_count_in_window = 1;
@@ -999,7 +961,6 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
                 }
                 app->last_wakeup_timestamp = now;
 
-                // 对于通知这类重要事件，我们可以适当放宽节流阀阈值
                 if (app->wakeup_count_in_window > 10) {
                     LOGW("Throttling: Whitelisted Kernel BINDER for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
                     logger_->log(LogLevel::WARN, "节流阀", "白名单Binder唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
@@ -1347,7 +1308,6 @@ void StateManager::on_wakeup_request(const json& payload) {
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
         if (it != managed_apps_.end()) {
-            // 旧接口统一使用标准观察期
             state_changed = unfreeze_and_observe_nolock(it->second, "WAKEUP_REQUEST (Legacy)", WakeupPolicy::STANDARD_OBSERVATION);
         } else {
             LOGW("Wakeup request for unknown app: %s", package_name.c_str());
@@ -1462,13 +1422,12 @@ void StateManager::update_master_config(const MasterConfig& config) {
 }
 
 bool StateManager::tick_state_machine() {
-    // [修改] tick_state_machine 现在调用两个职责更明确的方法
     bool changed1 = tick_state_machine_timers();
     bool changed2 = check_timed_unfreeze();
     return changed1 || changed2;
 }
 
-// [新增] 策略审计的实现
+// 这是您原始代码中已经存在的函数，我将它放在这里以保持文件结构的完整性
 void StateManager::audit_background_apps() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     time_t now = time(nullptr);
@@ -1486,11 +1445,12 @@ void StateManager::audit_background_apps() {
                 LOGW("AUDIT: Found background app %s (user %d) without active timer. Placing under observation.",
                      app.package_name.c_str(), app.user_id);
                 logger_->log(LogLevel::INFO, "审计", "发现逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
-                app.observation_since = now; // 启动观察期
+                app.observation_since = now;
             }
         }
     }
 }
+
 
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
@@ -1512,7 +1472,6 @@ void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     }
 }
 
-// [修改] 将原 check_timers 重命名为 tick_state_machine_timers
 bool StateManager::tick_state_machine_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -1524,11 +1483,10 @@ bool StateManager::tick_state_machine_timers() {
         time_t now = time(nullptr);    
 
         for (auto& [key, app] : managed_apps_) {
-            // 这个判断不再需要，因为审计工作已经由 audit_background_apps 完成
-            // 我们只处理已经有计时器的应用
-            // if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) { ... }
+            if (!app.is_foreground && !app.pids.empty()) {
+                validate_pids_nolock(app);
+            }
 
-            // 如果计时器被意外清除（例如，切换到前台又切回后台），确保它们被重置
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
                 if (app.observation_since > 0 || app.background_since > 0) {
                     app.observation_since = 0;
@@ -1539,7 +1497,6 @@ bool StateManager::tick_state_machine_timers() {
                 continue;
             }
 
-            // 观察期逻辑
             if (app.observation_since > 0 && now - app.observation_since >= 10) {
                 app.observation_since = 0;
 
@@ -1555,7 +1512,7 @@ bool StateManager::tick_state_machine_timers() {
                     }
                     std::string log_msg = "因 " + reason_str + " 活跃而推迟冻结";
                     logger_->log(LogLevel::ACTION_DELAY, "延迟", log_msg, app.package_name, app.user_id);
-                    app.observation_since = now; // 重新开始观察
+                    app.observation_since = now;
                     changed = true;
                     continue;
                 }
@@ -1565,7 +1522,6 @@ bool StateManager::tick_state_machine_timers() {
                 changed = true;
             }
 
-            // 等待冻结期逻辑
             if (app.background_since > 0) {
                 int timeout_sec = 0;
                 if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
@@ -1577,8 +1533,6 @@ bool StateManager::tick_state_machine_timers() {
                     size_t total_pids = app.pids.size();
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
-
-                    validate_pids_nolock(app);
 
                     if (app.pids.empty()) {
                         LOGI("Freeze skipped for %s as all its processes have died.", app.package_name.c_str());
@@ -1656,32 +1610,6 @@ bool StateManager::tick_state_machine_timers() {
     return changed;
 }
 
-// [核心新增] 实现后台应用审计函数
-void StateManager::audit_background_apps() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    time_t now = time(nullptr);
-
-    for (auto& [key, app] : managed_apps_) {
-        // 检查是否是需要被监管的后台应用
-        bool is_candidate = !app.is_foreground &&
-                            app.current_status == AppRuntimeState::Status::RUNNING &&
-                            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
-                            !app.pids.empty();
-
-        if (is_candidate) {
-            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它“逃逸”了
-            if (app.observation_since == 0 && app.background_since == 0) {
-                LOGW("AUDIT: Found background app %s (user %d) without active timer. Placing under observation.",
-                     app.package_name.c_str(), app.user_id);
-                logger_->log(LogLevel::INFO, "审计", "发现逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
-                app.observation_since = now; // 强制启动观察期
-                // 注意：这里不需要设置 changed = true，因为这个状态变化本身不会立即影响UI显示，
-                // 后续的 tick_state_machine 会处理它，并最终在冻结时触发UI更新。
-            }
-        }
-    }
-}
-
 void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
     if (app.scheduled_unfreeze_idx != -1) {
         if (app.scheduled_unfreeze_idx < unfrozen_timeline_.size()) {
@@ -1755,7 +1683,6 @@ bool StateManager::perform_deep_scan() {
         time_t now = time(nullptr);
 
         for (auto& [key, app] : managed_apps_) {
-            // [新增] OOM守护巡检逻辑
             if (app.current_status == AppRuntimeState::Status::FROZEN && !app.pids.empty()) {
                 action_executor_->verify_and_reapply_oom_scores(app.pids);
             }
@@ -1767,7 +1694,6 @@ bool StateManager::perform_deep_scan() {
                     if (app.current_status == AppRuntimeState::Status::FROZEN) {
                          LOGI("Frozen app %s no longer has active PIDs. Marking as STOPPED.", app.package_name.c_str());
                          cancel_timed_unfreeze(app);
-                         // 清理可能残留的OOM守护记录
                          action_executor_->verify_and_reapply_oom_scores(app.pids); 
                     }
                     app.current_status = AppRuntimeState::Status::STOPPED;
@@ -1799,7 +1725,6 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
 
         LOGI("Applying new configuration from UI...");
         
-        // [修改] 准备要写入数据库的新配置列表
         std::vector<AppConfig> new_configs;
         for (const auto& policy_item : payload["policies"]) {
             AppConfig new_config;
@@ -1811,14 +1736,11 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
             }
         }
 
-        // [修改] 调用新的原子化更新函数
         if (!db_manager_->update_all_app_policies(new_configs)) {
             LOGE("Failed to apply new configuration atomically. Old config remains.");
-            // 也许在这里向UI返回一个错误
             return false;
         }
 
-        // [修改] 更新内存中的状态
         for (const auto& new_config : new_configs) {
             AppRuntimeState* app = get_or_create_app_state(new_config.package_name, new_config.user_id);
             if (app) {
@@ -1832,7 +1754,6 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
                 }
             }
         }
-
         logger_->log(LogLevel::EVENT, "配置", "应用策略已从UI原子化更新");
         LOGI("New configuration applied atomically.");
     }
@@ -1842,6 +1763,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
     }
     return true;
 }
+
 
 json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
