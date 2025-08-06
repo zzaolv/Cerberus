@@ -152,27 +152,7 @@ std::optional<int> ActionExecutor::read_oom_score_adj(int pid) {
     return score;
 }
 
-// [新增] 真正可靠地查找主进程PID
-int ActionExecutor::find_main_pid(const std::vector<int>& pids) const {
-    if (pids.empty()) {
-        return -1;
-    }
 
-    // 优先策略：查找进程名不含':'的进程
-    for (int pid : pids) {
-        // 使用注入的 sys_monitor_ 来获取进程名 (cmdline)
-        std::string cmdline = sys_monitor_->get_app_name_from_pid(pid);
-        if (!cmdline.empty() && cmdline.find(':') == std::string::npos) {
-            LOGD("OOM: Found main process %d by cmdline '%s'", pid, cmdline.c_str());
-            return pid;
-        }
-    }
-
-    // 回退策略：使用最小PID
-    int fallback_pid = *std::min_element(pids.begin(), pids.end());
-    LOGW("OOM: Could not find main process by cmdline, falling back to min_pid heuristic: %d", fallback_pid);
-    return fallback_pid;
-}
 
 // [核心重构] adjust_oom_scores 实现基于角色和策略的动态守护
 void ActionExecutor::adjust_oom_scores(const std::vector<int>& pids, bool protect) {
