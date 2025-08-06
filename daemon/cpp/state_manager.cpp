@@ -1,6 +1,7 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
 #include "adj_mapper.h"
+#include "memory_butler.h"
 #include "state_manager.h"
 #include "main.h"
 #include <android/log.h>
