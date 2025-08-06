@@ -3,7 +3,7 @@
 #include <android/log.h>
 #include <filesystem>
 
-#define LOG_TAG "cerberusd_db_v9"
+#define LOG_TAG "cerberusd_db_v10_atomic" // 版本更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -27,7 +27,6 @@ void DatabaseManager::initialize_database() {
             )");
         }
 
-        // [核心修改] 更新 master_config 表结构和默认值
         if (!db_.tableExists("master_config_v2")) {
             LOGI("Table 'master_config_v2' does not exist. Creating it.");
             if (db_.tableExists("master_config_v1")) {
@@ -125,12 +124,37 @@ bool DatabaseManager::set_app_config(const AppConfig& config) {
     }
 }
 
-bool DatabaseManager::clear_all_policies() {
+// [修改] 删除此函数
+// bool DatabaseManager::clear_all_policies() { ... }
+
+// [新增] 实现新的事务函数
+bool DatabaseManager::update_all_app_policies(const std::vector<AppConfig>& configs) {
     try {
+        SQLite::Transaction transaction(db_);
+
+        // 1. 清空旧策略
         db_.exec("DELETE FROM app_policies_v3");
+
+        // 2. 准备插入语句
+        SQLite::Statement insert_query(db_, R"(
+            INSERT INTO app_policies_v3 (package_name, user_id, policy) VALUES (?, ?, ?)
+        )");
+
+        // 3. 循环插入新策略
+        for (const auto& config : configs) {
+            insert_query.bind(1, config.package_name);
+            insert_query.bind(2, config.user_id);
+            insert_query.bind(3, static_cast<int>(config.policy));
+            insert_query.exec();
+            insert_query.reset(); // 重置绑定
+        }
+
+        // 4. 提交事务
+        transaction.commit();
         return true;
+
     } catch (const std::exception& e) {
-        LOGE("Failed to clear all policies: %s", e.what());
+        LOGE("Failed to update all app policies in transaction: %s", e.what());
         return false;
     }
 }

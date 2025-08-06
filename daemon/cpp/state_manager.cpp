@@ -560,10 +560,11 @@ bool StateManager::evaluate_and_execute_strategy() {
     // 步骤1：更新前后台状态
     state_has_changed |= update_foreground_state(visible_app_keys);
 
-    // 步骤2：[新增] 对后台应用进行策略审计，确保它们都在监管中
+    // [核心修改] 步骤2：对后台应用进行策略审计，确保它们都在监管中
     audit_background_apps();
 
     // 步骤3：对应用内部的进程结构进行审计（例如“斩首行动”）
+    // 注意：这个检查只有在状态变化后执行可能不够频繁，但为了减少开销，暂时维持原样
     if (state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
@@ -917,8 +918,8 @@ WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalE
         LOGI("Policy: Termination signal for PID %d. Applying short observation.", event.dest_pid);
         return WakeupPolicy::SHORT_OBSERVATION;
     }
-    // 其他信号如 SIGABRT, SIGQUIT 也被视为致命信号
-    if (event.signal == 6 || event.signal == 3) {
+
+    if (event.signal == 6 /*SIGABRT*/) {
         LOGI("Policy: Abort/Quit signal (%d) for PID %d. Applying short observation.", event.signal, event.dest_pid);
         return WakeupPolicy::SHORT_OBSERVATION;
     }
@@ -1655,6 +1656,32 @@ bool StateManager::tick_state_machine_timers() {
     return changed;
 }
 
+// [核心新增] 实现后台应用审计函数
+void StateManager::audit_background_apps() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    time_t now = time(nullptr);
+
+    for (auto& [key, app] : managed_apps_) {
+        // 检查是否是需要被监管的后台应用
+        bool is_candidate = !app.is_foreground &&
+                            app.current_status == AppRuntimeState::Status::RUNNING &&
+                            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
+                            !app.pids.empty();
+
+        if (is_candidate) {
+            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它“逃逸”了
+            if (app.observation_since == 0 && app.background_since == 0) {
+                LOGW("AUDIT: Found background app %s (user %d) without active timer. Placing under observation.",
+                     app.package_name.c_str(), app.user_id);
+                logger_->log(LogLevel::INFO, "审计", "发现逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
+                app.observation_since = now; // 强制启动观察期
+                // 注意：这里不需要设置 changed = true，因为这个状态变化本身不会立即影响UI显示，
+                // 后续的 tick_state_machine 会处理它，并最终在冻结时触发UI更新。
+            }
+        }
+    }
+}
+
 void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
     if (app.scheduled_unfreeze_idx != -1) {
         if (app.scheduled_unfreeze_idx < unfrozen_timeline_.size()) {
@@ -1771,17 +1798,28 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
         if (!payload.contains("policies")) return false;
 
         LOGI("Applying new configuration from UI...");
-        db_manager_->clear_all_policies();
-
+        
+        // [修改] 准备要写入数据库的新配置列表
+        std::vector<AppConfig> new_configs;
         for (const auto& policy_item : payload["policies"]) {
             AppConfig new_config;
             new_config.package_name = policy_item.value("package_name", "");
             new_config.user_id = policy_item.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(policy_item.value("policy", 0));
+            if (!new_config.package_name.empty()) {
+                new_configs.push_back(new_config);
+            }
+        }
 
-            if (new_config.package_name.empty()) continue;
-            db_manager_->set_app_config(new_config);
+        // [修改] 调用新的原子化更新函数
+        if (!db_manager_->update_all_app_policies(new_configs)) {
+            LOGE("Failed to apply new configuration atomically. Old config remains.");
+            // 也许在这里向UI返回一个错误
+            return false;
+        }
 
+        // [修改] 更新内存中的状态
+        for (const auto& new_config : new_configs) {
             AppRuntimeState* app = get_or_create_app_state(new_config.package_name, new_config.user_id);
             if (app) {
                 bool policy_changed = app->config.policy != new_config.policy;
@@ -1794,8 +1832,9 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
                 }
             }
         }
-        logger_->log(LogLevel::EVENT, "配置", "应用策略已从UI更新");
-        LOGI("New configuration applied.");
+
+        logger_->log(LogLevel::EVENT, "配置", "应用策略已从UI原子化更新");
+        LOGI("New configuration applied atomically.");
     }
 
     if (probe_config_needs_update) {

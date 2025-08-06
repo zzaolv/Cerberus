@@ -22,11 +22,10 @@ struct AppConfig {
     AppPolicy policy = AppPolicy::STANDARD;
 };
 
-// [核心新增] 为 MasterConfig 增加定时解冻相关字段
 struct MasterConfig {
     int standard_timeout_sec = 90;
     bool is_timed_unfreeze_enabled = true;
-    int timed_unfreeze_interval_sec = 1800; // 30分钟
+    int timed_unfreeze_interval_sec = 1800;
 };
 
 class DatabaseManager {
@@ -38,8 +37,12 @@ public:
     
     std::optional<AppConfig> get_app_config(const std::string& package_name, int user_id);
     bool set_app_config(const AppConfig& config);
-    bool clear_all_policies();
+    // [修改] 删除此函数，其逻辑将被新函数替代
+    // bool clear_all_policies(); 
     std::vector<AppConfig> get_all_app_configs();
+
+    // [新增] 用于原子化更新所有策略的事务函数
+    bool update_all_app_policies(const std::vector<AppConfig>& configs);
 
 private:
     void initialize_database();

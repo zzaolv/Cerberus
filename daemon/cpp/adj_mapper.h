@@ -36,6 +36,7 @@ public:
 private:
     void parse_rules(const json& j);
     void load_default_rules();
+    void save_rules(const json& j); // [新增] 增加此函数声明    
 
     std::string config_path_;
     std::vector<AdjRule> rules_;

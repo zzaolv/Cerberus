@@ -11,7 +11,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object Configuration : Screen("configuration", "配置", AppIcons.Tune)
     data object Logs : Screen("logs", "日志", AppIcons.ListAlt)
     data object Settings : Screen("settings", "设置", Icons.Default.Settings)
-    // [FIX] Correctly refer to the icon defined in AppIcons
     data object ProfileManagement : Screen("profile_management", "情景模式", AppIcons.Style)
+    // [修正] 确保 MoreSettings 作为 data object 正确定义在 sealed class 内部
     data object MoreSettings : Screen("more_settings", "更多设置", AppIcons.SettingsApplications)
 }

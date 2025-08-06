@@ -167,18 +167,25 @@ std::vector<LogEntry> Logger::get_logs_from_file(const std::string& filename, in
 }
 
 void Logger::manage_log_files() {
-    auto files = get_log_files();
+    auto files = get_log_files(); // 这一行获取的是一个已排序的列表，但我们下面会重新分组
     std::map<std::string, std::vector<std::string>> files_by_day;
     
     for (const auto& f : files) {
         try {
+            // 文件名格式: fct_YYYY-MM-DD_X.log
             std::string date_str = f.substr(4, 10);
             files_by_day[date_str].push_back(f);
         } catch(...) {}
     }
     
     for (auto& pair : files_by_day) {
+        // [核心修改] 在清理之前，对当天的文件列表进行降序排序
+        // 这样可以确保最新的文件排在前面
+        std::sort(pair.second.rbegin(), pair.second.rend());
+
         if (pair.second.size() > MAX_LOG_FILES_PER_DAY) {
+            // 现在 pair.second[0] 是最新的, pair.second[N] 是最旧的
+            // 这个循环将从第 MAX_LOG_FILES_PER_DAY 个文件开始删除，即删除所有最旧的文件
             for (size_t i = MAX_LOG_FILES_PER_DAY; i < pair.second.size(); ++i) {
                 fs::remove(fs::path(log_dir_path_) / pair.second[i]);
                 LOGD("Cleaned up excess log file: %s", pair.second[i].c_str());

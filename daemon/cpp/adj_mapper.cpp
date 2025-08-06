@@ -5,10 +5,26 @@
 #include <cmath>
 #include <algorithm>
 
-#define LOG_TAG "cerberusd_adj_mapper"
+#define LOG_TAG "cerberusd_adj_mapper_v2" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// [新增] 声明一个私有的保存函数
+void AdjMapper::save_rules(const json& j) {
+    try {
+        std::ofstream ofs(config_path_);
+        if (ofs.is_open()) {
+            // 使用 dump(2) 进行格式化输出，方便用户阅读
+            ofs << j.dump(2);
+            LOGI("Saved default rules to '%s'.", config_path_.c_str());
+        } else {
+            LOGE("Failed to open '%s' for writing default rules.", config_path_.c_str());
+        }
+    } catch (const std::exception& e) {
+        LOGE("Exception while saving default rules: %s", e.what());
+    }
+}
 
 AdjMapper::AdjMapper(const std::string& config_path) : config_path_(config_path) {
     // 定义一个万能的默认规则，确保任何adj都有返回值
@@ -22,8 +38,8 @@ AdjMapper::AdjMapper(const std::string& config_path) : config_path_(config_path)
 void AdjMapper::load_rules() {
     std::ifstream ifs(config_path_);
     if (!ifs.is_open()) {
-        LOGW("adj_rules.json not found at '%s'. Loading default rules.", config_path_.c_str());
-        load_default_rules();
+        LOGW("adj_rules.json not found at '%s'. Loading default rules and creating file.", config_path_.c_str());
+        load_default_rules(); // 这将加载、解析并保存默认规则
         return;
     }
 
@@ -39,7 +55,6 @@ void AdjMapper::load_rules() {
 
 void AdjMapper::load_default_rules() {
     rules_.clear();
-    // 复制您在需求中提供的默认规则
     json default_json = R"({
       "rules": [
         { "source_range": [-1000, 0], "type": "linear", "target_range": [-1000, -900] },
@@ -48,6 +63,9 @@ void AdjMapper::load_default_rules() {
         { "source_range": [900, 1001], "type": "linear", "target_range": [21, 30] }
       ]
     })"_json;
+    
+    // [核心修改] 先保存再解析
+    save_rules(default_json);
     parse_rules(default_json);
 }
 
@@ -86,7 +104,6 @@ void AdjMapper::parse_rules(const json& j) {
             LOGW("Skipping invalid rule: %s", e.what());
         }
     }
-    // 按source_min排序，便于查找
     std::sort(rules_.begin(), rules_.end(), [](const auto& a, const auto& b) {
         return a.source_min < b.source_min;
     });
@@ -115,12 +132,11 @@ int AdjMapper::map_adj(int original_adj) const {
             break;
         }
         case AdjRule::Type::SIGMOID: {
-            // Sigmoid: D + L / (1 + e^(-k * (x - x0)))
             result = selected_rule->sigmoid_D + selected_rule->sigmoid_L / (1.0 + std::exp(-selected_rule->sigmoid_k * (original_adj - selected_rule->sigmoid_x0)));
             break;
         }
         default:
-            return 100; // Fallback
+            return 100;
     }
 
     return static_cast<int>(std::round(result));
