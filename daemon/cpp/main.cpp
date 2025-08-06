@@ -4,6 +4,8 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
+#include "adj_mapper.h"      // [新增]
+#include "memory_butler.h"   // [新增]
 #include "main.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
@@ -152,6 +154,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         } else if (type == "query.get_all_policies") {
             json payload = g_state_manager->get_full_config_for_ui();
             g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
+        } else if (type == "cmd.reload_adj_rules") { // [新增]
+            if (g_state_manager) g_state_manager->reload_adj_rules();
         } else if (type == "event.probe_hello") {
             g_probe_fd = client_fd;
             notify_probe_of_config_change();
@@ -200,6 +204,7 @@ void worker_thread_func() {
     int location_scan_countdown = 15;
     int audit_countdown = 30;
     int heartbeat_countdown = 7;
+    int butler_countdown = 60; // [新增] 内存管家调度周期    
 
     const int SAMPLING_INTERVAL_SEC = 2;
 
@@ -246,6 +251,11 @@ void worker_thread_func() {
             g_sys_monitor->update_location_state();
             location_scan_countdown = 15;
         }
+        // [新增] 内存管家调度
+        if (--butler_countdown <= 0) {
+            g_state_manager->run_memory_butler_tasks();
+            butler_countdown = 60; // 每120秒运行一次
+        }
 
         if (--heartbeat_countdown <= 0) {
             if (g_server) {
@@ -276,6 +286,7 @@ int main(int argc, char *argv[]) {
     const std::string DATA_DIR = "/data/adb/cerberus";
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
+    const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; // [新增]    
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
 
     try {
@@ -287,12 +298,16 @@ int main(int argc, char *argv[]) {
     }
 
     auto db_manager = std::make_shared<DatabaseManager>(DB_PATH);
-    // [修改] 先创建 g_sys_monitor，再注入到 ActionExecutor
+    // [修改] 更新初始化顺序
     g_sys_monitor = std::make_shared<SystemMonitor>();
-    auto action_executor = std::make_shared<ActionExecutor>(g_sys_monitor);
+    auto adj_mapper = std::make_shared<AdjMapper>(ADJ_RULES_PATH);
+    auto action_executor = std::make_shared<ActionExecutor>(g_sys_monitor, adj_mapper);
+    auto memory_butler = std::make_shared<MemoryButler>();
+
     g_logger = Logger::get_instance(LOG_DIR);
     g_ts_db = TimeSeriesDatabase::get_instance();
-    g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db);
+    // [修改] 向 StateManager 注入新组件
+    g_state_manager = std::make_shared<StateManager>(db_manager, g_sys_monitor, action_executor, g_logger, g_ts_db, adj_mapper, memory_butler);
 
     // [新增] 初始化并启动 Re-Kernel 客户端
     g_rekernel_client = std::make_unique<ReKernelClient>();

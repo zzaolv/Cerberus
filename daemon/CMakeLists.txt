@@ -46,6 +46,8 @@ add_executable(cerberusd
     cpp/database_manager.cpp
     cpp/state_manager.cpp
     cpp/action_executor.cpp
+    cpp/adj_mapper.cpp         # [新增]
+    cpp/memory_butler.cpp      # [新增]    
    # cpp/process_monitor.cpp
     cpp/logger.cpp
     cpp/time_series_database.cpp

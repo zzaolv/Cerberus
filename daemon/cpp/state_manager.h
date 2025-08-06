@@ -18,6 +18,9 @@
 #include "time_series_database.h"
 #include "rekernel_client.h"
 
+class AdjMapper;    // [新增] 前向声明
+class MemoryButler; // [新增] 前向声明
+
 using json = nlohmann::json;
 
 // [核心修改] WakeupType 替换为更通用的 WakeupPolicy
@@ -112,10 +115,17 @@ struct DozeProcessRecord {
 
 class StateManager {
 public:
-    StateManager(std::shared_ptr<DatabaseManager>, std::shared_ptr<SystemMonitor>, std::shared_ptr<ActionExecutor>,
-                 std::shared_ptr<Logger>, std::shared_ptr<TimeSeriesDatabase>);
+    // [修改] 构造函数签名更新
+    StateManager(std::shared_ptr<DatabaseManager> db,
+                 std::shared_ptr<SystemMonitor> sys,
+                 std::shared_ptr<ActionExecutor> act,
+                 std::shared_ptr<Logger> logger,
+                 std::shared_ptr<TimeSeriesDatabase> ts_db,
+                 std::shared_ptr<AdjMapper> adj_mapper,
+                 std::shared_ptr<MemoryButler> mem_butler);
 
     void initial_full_scan_and_warmup();
+    void reload_adj_rules(); // [新增] 热重载接口
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
     void process_new_metrics(const MetricsRecord& record);
@@ -138,8 +148,17 @@ public:
     // [新增] 处理来自 Re-Kernel 的事件
     void on_signal_from_rekernel(const ReKernelSignalEvent& event);
     void on_binder_from_rekernel(const ReKernelBinderEvent& event);
+    
+    // [新增] 内存管家调度入口
+    void run_memory_butler_tasks();
 
 private:
+    // [新增] 内存健康状态
+    enum class MemoryHealth {
+        HEALTHY,    // > 20% 可用
+        CONCERN,    // 10% - 20% 可用
+        CRITICAL    // < 10% 可用
+    };
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
@@ -164,14 +183,19 @@ private:
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
     void validate_pids_nolock(AppRuntimeState& app);
+    void update_memory_health(const MetricsRecord& record); // [新增]
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<TimeSeriesDatabase> ts_db_;
+    // [新增] 持有新组件
+    std::shared_ptr<AdjMapper> adj_mapper_;
+    std::shared_ptr<MemoryButler> memory_butler_;
 
     MasterConfig master_config_;
+    MemoryHealth memory_health_ = MemoryHealth::HEALTHY; // [新增]
     std::unique_ptr<DozeManager> doze_manager_;
     std::mutex state_mutex_;
     std::set<AppInstanceKey> last_known_visible_app_keys_;

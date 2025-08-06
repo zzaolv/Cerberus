@@ -12,13 +12,24 @@
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-// [新增] 前向声明 SystemMonitor
+
+
+// [新增] 前向声明 SystemMonitor 和 AdjMapper
 class SystemMonitor;
+class AdjMapper;
+
+// [新增] 定义进程角色
+enum class ProcessRole {
+    MAIN,  // 主进程
+    PUSH,  // Push进程
+    CHILD  // 普通子进程
+};
+
 
 class ActionExecutor {
 public:
-    // [修改] 构造函数接受 SystemMonitor
-    explicit ActionExecutor(std::shared_ptr<SystemMonitor> sys_monitor);
+    // [修改] 构造函数现在接受 SystemMonitor 和 AdjMapper
+    ActionExecutor(std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<AdjMapper> adj_mapper);
     ~ActionExecutor();
 
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
@@ -26,6 +37,7 @@ public:
     bool unfreeze(const std::vector<int>& pids);
     // [新增] 专门用于清理cgroup的函数
     bool cleanup_cgroup(const AppInstanceKey& key);
+    void verify_and_reapply_oom_scores(const std::vector<int>& pids);
 
 private:
     bool initialize_binder();
@@ -49,8 +61,8 @@ private:
     bool write_to_file(const std::string& path, const std::string& value);
 
     // [重构] OOM Score 调整逻辑
-    // [新增] 查找主进程的辅助函数
-    int find_main_pid(const std::vector<int>& pids) const;
+    // [修改] 识别所有进程的角色
+    std::map<int, ProcessRole> identify_process_roles(const std::vector<int>& pids) const;
     void adjust_oom_scores(const std::vector<int>& pids, bool protect);
     std::optional<int> read_oom_score_adj(int pid);
 
@@ -64,10 +76,13 @@ private:
     } binder_state_;
 
     std::map<int, int> original_oom_scores_;
+    std::map<int, int> protected_oom_scores_;
     std::mutex oom_scores_mutex_;
 
     // [新增] 持有 SystemMonitor 的指针
     std::shared_ptr<SystemMonitor> sys_monitor_;
+    // [新增] 持有 AdjMapper 的指针
+    std::shared_ptr<AdjMapper> adj_mapper_;
 };
 
 #endif //CERBERUS_ACTION_EXECUTOR_H

@@ -1,5 +1,7 @@
 // daemon/cpp/state_manager.cpp
 #include "state_manager.h"
+#include "adj_mapper.h"
+#include "state_manager.h"
 #include "main.h"
 #include <android/log.h>
 #include <filesystem>
@@ -127,9 +129,15 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
     return DozeEvent::NONE;
 }
 
-StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<SystemMonitor> sys, std::shared_ptr<ActionExecutor> act,
-                           std::shared_ptr<Logger> logger, std::shared_ptr<TimeSeriesDatabase> ts_db)
-    : db_manager_(db), sys_monitor_(sys), action_executor_(act), logger_(logger), ts_db_(ts_db) {
+// [修改] 构造函数实现
+StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
+                           std::shared_ptr<SystemMonitor> sys,
+                           std::shared_ptr<ActionExecutor> act,
+                           std::shared_ptr<Logger> logger,
+                           std::shared_ptr<TimeSeriesDatabase> ts_db,
+                           std::shared_ptr<AdjMapper> adj_mapper,
+                           std::shared_ptr<MemoryButler> mem_butler)
+    : db_manager_(db), sys_monitor_(sys), action_executor_(act), logger_(logger), ts_db_(ts_db), adj_mapper_(adj_mapper), memory_butler_(mem_butler) {
     LOGI("StateManager Initializing...");
 
     unfrozen_timeline_.resize(3600 * 2, 0);
@@ -489,6 +497,15 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db, std::shared_ptr<
     LOGI("StateManager Initialized. Ready for warmup.");
 }
 
+// [新增] 热重载 OOM 策略的实现
+void StateManager::reload_adj_rules() {
+    LOGI("Reloading adj_rules.json by request...");
+    if (adj_mapper_) {
+        adj_mapper_->load_rules();
+        logger_->log(LogLevel::EVENT, "配置", "OOM策略已从文件热重载");
+    }
+}
+
 void StateManager::initial_full_scan_and_warmup() {
     LOGI("Starting initial full scan and data warmup...");
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -554,7 +571,9 @@ bool StateManager::handle_top_app_change_fast() {
     return update_foreground_state_from_pids(top_pids);
 }
 
+// [修改] process_new_metrics 添加内存健康评估
 void StateManager::process_new_metrics(const MetricsRecord& record) {
+    update_memory_health(record); // [新增]
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     auto doze_event = doze_manager_->process_metrics(record);
@@ -582,6 +601,75 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     }
 
     last_metrics_record_ = record;
+}
+
+// [新增] 内存健康状态评估函数
+void StateManager::update_memory_health(const MetricsRecord& record) {
+    if (record.mem_total_kb <= 0) return;
+
+    double available_mem_percent = 100.0 * static_cast<double>(record.mem_available_kb) / record.mem_total_kb;
+    MemoryHealth old_health = memory_health_;
+
+    if (available_mem_percent < 10.0) {
+        memory_health_ = MemoryHealth::CRITICAL;
+    } else if (available_mem_percent < 20.0) {
+        memory_health_ = MemoryHealth::CONCERN;
+    } else {
+        memory_health_ = MemoryHealth::HEALTHY;
+    }
+
+    if (old_health != memory_health_) {
+        std::string health_str = (memory_health_ == MemoryHealth::CRITICAL) ? "CRITICAL" : 
+                                 (memory_health_ == MemoryHealth::CONCERN) ? "CONCERN" : "HEALTHY";
+        LOGI("Memory health changed from %d to %s (available: %.1f%%).", (int)old_health, health_str.c_str(), available_mem_percent);
+        if (memory_health_ == MemoryHealth::CRITICAL) {
+             logger_->log(LogLevel::WARN, "内存", "系统可用内存严重不足，已进入CRITICAL状态");
+        }
+    }
+}
+
+// [新增] 内存管家任务调度函数
+void StateManager::run_memory_butler_tasks() {
+    if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ == MemoryHealth::HEALTHY) {
+        return;
+    }
+
+    std::vector<std::pair<AppInstanceKey, size_t>> candidates;
+    std::map<AppInstanceKey, std::vector<int>> app_pids;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        for (const auto& [key, app] : managed_apps_) {
+            // 只考虑后台运行或已冻结的应用
+            if (!app.is_foreground && !app.pids.empty()) {
+                candidates.emplace_back(key, app.mem_usage_kb);
+                app_pids[key] = app.pids;
+            }
+        }
+    }
+    // 按内存使用量降序排序
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
+        return a.second > b.second;
+    });
+
+    MemoryButler::CompressionLevel level = (memory_health_ == MemoryHealth::CRITICAL) ?
+                                           MemoryButler::CompressionLevel::AGGRESSIVE :
+                                           MemoryButler::CompressionLevel::LIGHT;
+    
+    int processed_count = 0;
+    const int max_to_process = (level == MemoryButler::CompressionLevel::AGGRESSIVE) ? 5 : 2;
+
+    for(const auto& cand : candidates) {
+        if (processed_count >= max_to_process) break;
+        
+        auto it = app_pids.find(cand.first);
+        if (it != app_pids.end()) {
+            for(int pid : it->second) {
+                memory_butler_->compress_memory(pid, level);
+            }
+        }
+        processed_count++;
+    }
 }
 
 void StateManager::generate_doze_exit_report() {
@@ -1601,6 +1689,11 @@ bool StateManager::perform_deep_scan() {
         time_t now = time(nullptr);
 
         for (auto& [key, app] : managed_apps_) {
+            // [新增] OOM守护巡检逻辑
+            if (app.current_status == AppRuntimeState::Status::FROZEN && !app.pids.empty()) {
+                action_executor_->verify_and_reapply_oom_scores(app.pids);
+            }
+
             if (app.pids.empty() && app.current_status != AppRuntimeState::Status::STOPPED) {
                 if (app.undetected_since == 0) {
                     app.undetected_since = now;
@@ -1608,6 +1701,8 @@ bool StateManager::perform_deep_scan() {
                     if (app.current_status == AppRuntimeState::Status::FROZEN) {
                          LOGI("Frozen app %s no longer has active PIDs. Marking as STOPPED.", app.package_name.c_str());
                          cancel_timed_unfreeze(app);
+                         // 清理可能残留的OOM守护记录
+                         action_executor_->verify_and_reapply_oom_scores(app.pids); 
                     }
                     app.current_status = AppRuntimeState::Status::STOPPED;
                     app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
