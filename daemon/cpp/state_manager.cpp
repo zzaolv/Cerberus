@@ -557,8 +557,13 @@ bool StateManager::evaluate_and_execute_strategy() {
     
     auto visible_app_keys = sys_monitor_->get_visible_app_keys();
     
+    // 步骤1：更新前后台状态
     state_has_changed |= update_foreground_state(visible_app_keys);
 
+    // 步骤2：[新增] 对后台应用进行策略审计，确保它们都在监管中
+    audit_background_apps();
+
+    // 步骤3：对应用内部的进程结构进行审计（例如“斩首行动”）
     if (state_has_changed) {
         auto process_tree = sys_monitor_->get_full_process_tree();
         audit_app_structures(process_tree);
@@ -1456,9 +1461,34 @@ void StateManager::update_master_config(const MasterConfig& config) {
 }
 
 bool StateManager::tick_state_machine() {
-    bool changed1 = check_timers();
+    // [修改] tick_state_machine 现在调用两个职责更明确的方法
+    bool changed1 = tick_state_machine_timers();
     bool changed2 = check_timed_unfreeze();
     return changed1 || changed2;
+}
+
+// [新增] 策略审计的实现
+void StateManager::audit_background_apps() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    time_t now = time(nullptr);
+
+    for (auto& [key, app] : managed_apps_) {
+        // 检查是否是需要被监管的后台应用
+        bool is_candidate = !app.is_foreground &&
+                            app.current_status == AppRuntimeState::Status::RUNNING &&
+                            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
+                            !app.pids.empty();
+
+        if (is_candidate) {
+            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它“逃逸”了
+            if (app.observation_since == 0 && app.background_since == 0) {
+                LOGW("AUDIT: Found background app %s (user %d) without active timer. Placing under observation.",
+                     app.package_name.c_str(), app.user_id);
+                logger_->log(LogLevel::INFO, "审计", "发现逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
+                app.observation_since = now; // 启动观察期
+            }
+        }
+    }
 }
 
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
@@ -1481,7 +1511,8 @@ void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     }
 }
 
-bool StateManager::check_timers() {
+// [修改] 将原 check_timers 重命名为 tick_state_machine_timers
+bool StateManager::tick_state_machine_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
     const int MAX_FREEZE_RETRIES = 3;
@@ -1492,6 +1523,11 @@ bool StateManager::check_timers() {
         time_t now = time(nullptr);    
 
         for (auto& [key, app] : managed_apps_) {
+            // 这个判断不再需要，因为审计工作已经由 audit_background_apps 完成
+            // 我们只处理已经有计时器的应用
+            // if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) { ... }
+
+            // 如果计时器被意外清除（例如，切换到前台又切回后台），确保它们被重置
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
                 if (app.observation_since > 0 || app.background_since > 0) {
                     app.observation_since = 0;
@@ -1502,6 +1538,7 @@ bool StateManager::check_timers() {
                 continue;
             }
 
+            // 观察期逻辑
             if (app.observation_since > 0 && now - app.observation_since >= 10) {
                 app.observation_since = 0;
 
@@ -1517,7 +1554,7 @@ bool StateManager::check_timers() {
                     }
                     std::string log_msg = "因 " + reason_str + " 活跃而推迟冻结";
                     logger_->log(LogLevel::ACTION_DELAY, "延迟", log_msg, app.package_name, app.user_id);
-                    app.observation_since = now;
+                    app.observation_since = now; // 重新开始观察
                     changed = true;
                     continue;
                 }
@@ -1527,6 +1564,7 @@ bool StateManager::check_timers() {
                 changed = true;
             }
 
+            // 等待冻结期逻辑
             if (app.background_since > 0) {
                 int timeout_sec = 0;
                 if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;

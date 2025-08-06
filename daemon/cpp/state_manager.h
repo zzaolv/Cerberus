@@ -178,7 +178,10 @@ private:
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
-    bool check_timers();
+    // bool check_timers();
+    // [修改] 将 check_timers 拆分为两个职责更明确的方法
+    bool tick_state_machine_timers(); // 只负责推进计时器
+    void audit_background_apps();     // 负责巡检并启动计时器    
     bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
