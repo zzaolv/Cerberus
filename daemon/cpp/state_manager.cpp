@@ -623,47 +623,66 @@ void StateManager::update_memory_health(const MetricsRecord& record) {
 }
 
 void StateManager::run_memory_butler_tasks() {
-    if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ == MemoryHealth::HEALTHY) {
+    // 1. 检查触发条件：必须支持、且内存状态必须为 CRITICAL
+    if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ != MemoryHealth::CRITICAL) {
         return;
     }
 
-    std::vector<std::pair<AppInstanceKey, size_t>> candidates;
-    std::map<AppInstanceKey, std::vector<int>> app_pids;
+    LOGI("Memory health is CRITICAL, invoking Memory Butler...");
+    logger_->log(LogLevel::WARN, "内存管家", "可用内存严重不足，启动内存整理流程");
+
+    // 2. 收集候选应用
+    // 候选者是所有处于后台（非前台）且有 `background_since` 记录的应用
+    std::vector<std::tuple<AppInstanceKey, time_t, std::vector<int>>> candidates;
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         for (const auto& [key, app] : managed_apps_) {
-            // 只考虑后台运行或已冻结的应用
-            if (!app.is_foreground && !app.pids.empty()) {
-                candidates.emplace_back(key, app.mem_usage_kb);
-                app_pids[key] = app.pids;
+            // 应用必须在后台，有PID，并且有明确的进入后台时间戳
+            if (!app.is_foreground && !app.pids.empty() && app.background_since > 0) {
+                candidates.emplace_back(key, app.background_since, app.pids);
             }
         }
     }
+
+    if (candidates.empty()) {
+        LOGI("Memory Butler found no suitable background apps to trim.");
+        return;
+    }
     
+    // 3. 排序：按进入后台的时间升序排序，时间戳越小越老
     std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b){
-        return a.second > b.second;
+        // std::get<1> 对应 background_since
+        return std::get<1>(a) < std::get<1>(b);
     });
 
-    MemoryButler::CompressionLevel level = (memory_health_ == MemoryHealth::CRITICAL) ?
-                                           MemoryButler::CompressionLevel::AGGRESSIVE :
-                                           MemoryButler::CompressionLevel::LIGHT;
-    
+    // 4. 执行瘦身操作
+    long long total_bytes_advised = 0;
+    const int max_apps_to_trim = 5; // 每次最多处理5个最老的应用，防止单次操作过于耗时
     int processed_count = 0;
-    const int max_to_process = (level == MemoryButler::CompressionLevel::AGGRESSIVE) ? 5 : 2;
+
+    LOGI("Targeting %zu oldest background apps for memory trimming (MADV_COLD)...", std::min((size_t)max_apps_to_trim, candidates.size()));
 
     for(const auto& cand : candidates) {
-        if (processed_count >= max_to_process) break;
+        if (processed_count >= max_apps_to_trim) break;
         
-        auto it = app_pids.find(cand.first);
-        if (it != app_pids.end()) {
-            for(int pid : it->second) {
-                memory_butler_->compress_memory(pid, level);
-            }
+        const auto& pids = std::get<2>(cand);
+        for(int pid : pids) {
+            total_bytes_advised += memory_butler_->advise_cold_memory(pid);
         }
         processed_count++;
     }
+
+    // 5. 如果执行了任何操作，则最后清理系统缓存
+    if (total_bytes_advised > 0) {
+        LOGI("Memory Butler advised a total of %lld KB. Proceeding to drop system PageCache.", total_bytes_advised / 1024);
+        logger_->log(LogLevel::INFO, "内存管家", "已向内核提示回收 " + std::to_string(total_bytes_advised / 1024) + " KB内存，开始清理系统缓存");
+        memory_butler_->drop_system_caches(MemoryButler::DropCacheLevel::PAGE_CACHE_ONLY);
+    } else {
+        LOGI("Memory Butler finished, but no memory was advised to be cooled.");
+    }
 }
+
 
 void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
