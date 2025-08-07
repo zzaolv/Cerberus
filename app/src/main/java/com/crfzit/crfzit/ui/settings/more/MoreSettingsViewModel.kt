@@ -7,9 +7,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.AppPolicyPayload
-// [核心修复] 导入正确的 Policy
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.DaemonRepository
+import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,13 +19,17 @@ import kotlinx.coroutines.launch
 
 data class MoreSettingsUiState(
     val isLoading: Boolean = true,
-    val adjRulesContent: String = "正在加载...",
+    // [核心修改] 使用新的数据模型
+    val oomRules: List<OomRule> = emptyList(),
     val adjRulesError: String? = null,
     val dataAppPackages: List<String> = emptyList()
 )
 
 class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app) {
     private val daemonRepository = DaemonRepository.getInstance()
+    // [核心修改] 使用 Gson 进行序列化和反序列化
+    private val gson = GsonBuilder().setPrettyPrinting().create()
+
 
     private val _uiState = MutableStateFlow(MoreSettingsUiState())
     val uiState = _uiState.asStateFlow()
@@ -37,17 +41,76 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
 
     private fun loadAdjRules() {
         viewModelScope.launch {
-            _uiState.update { it.copy(adjRulesContent = "正在加载...", adjRulesError = null) }
+            _uiState.update { it.copy(isLoading = true, adjRulesError = null) }
             val content = daemonRepository.getAdjRulesContent()
-            if (content != null) {
-                _uiState.update { it.copy(adjRulesContent = formatJson(content)) }
+            if (content != null && content.isNotBlank()) {
+                try {
+                    val rulesFile = gson.fromJson(content, AdjRulesFile::class.java)
+                    // 排序规则以确保UI显示正确
+                    val sortedRules = rulesFile.rules.sortedBy { it.sourceRange.firstOrNull() ?: 0 }
+                    _uiState.update { it.copy(isLoading = false, oomRules = sortedRules) }
+                } catch (e: Exception) {
+                    _uiState.update { it.copy(isLoading = false, adjRulesError = "无法解析OOM策略文件: ${e.message}") }
+                }
             } else {
-                _uiState.update { it.copy(adjRulesError = "无法加载OOM策略文件。") }
+                _uiState.update { it.copy(isLoading = false, adjRulesError = "无法加载OOM策略文件或文件为空。") }
             }
         }
     }
 
-    private fun loadDataAppPackages() {
+    // [核心新增] 更新单条规则
+    fun updateRule(updatedRule: OomRule) {
+        _uiState.update { state ->
+            val updatedList = state.oomRules.map {
+                if (it.id == updatedRule.id) updatedRule else it
+            }
+            state.copy(oomRules = updatedList)
+        }
+    }
+
+    // [核心新增] 添加新规则
+    fun addNewRule() {
+        _uiState.update { state ->
+            val lastSourceMax = state.oomRules.lastOrNull()?.sourceRange?.getOrNull(1) ?: 900
+            val newRule = OomRule(
+                sourceRange = listOf(lastSourceMax + 1, lastSourceMax + 100),
+                type = "linear",
+                targetRange = listOf(0, 0)
+            )
+            val newList = (state.oomRules + newRule).sortedBy { it.sourceRange.firstOrNull() ?: 0 }
+            state.copy(oomRules = newList)
+        }
+    }
+
+    // [核心新增] 删除规则
+    fun deleteRule(ruleId: String) {
+        _uiState.update { state ->
+            val updatedList = state.oomRules.filterNot { it.id == ruleId }
+            state.copy(oomRules = updatedList)
+        }
+    }
+
+    // [核心新增] 保存并热重载所有规则
+    fun saveAndReloadRules() {
+        viewModelScope.launch {
+            val rulesToSave = _uiState.value.oomRules
+            // 在保存前，根据类型清理掉不必要的字段
+            val cleanedRules = rulesToSave.map {
+                when (it.type) {
+                    "linear" -> it.copy(params = null, targetRange = it.targetRange ?: listOf(0, 0))
+                    "sigmoid" -> it.copy(targetRange = null, params = it.params ?: SigmoidParams())
+                    else -> it
+                }
+            }
+            val rulesFile = AdjRulesFile(rules = cleanedRules)
+            val jsonContent = gson.toJson(rulesFile)
+            daemonRepository.setAdjRulesContent(jsonContent) // 这个新方法需要在Repository中添加
+            Toast.makeText(app, "OOM策略已保存并发送热重载指令", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+
+    private fun loadDataAppPackages() { /* ... 此函数保持不变 ... */
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val packages = daemonRepository.getDataAppPackages() ?: emptyList()
@@ -55,16 +118,7 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
         }
     }
 
-    fun hotReloadOomPolicy() {
-        viewModelScope.launch {
-            daemonRepository.reloadAdjRules()
-            Toast.makeText(app, "热重载指令已发送", Toast.LENGTH_SHORT).show()
-            // 重新加载并显示内容
-            loadAdjRules()
-        }
-    }
-
-    fun applyBulkPolicy(policy: Policy) {
+    fun applyBulkPolicy(policy: Policy) { /* ... 此函数保持不变 ... */
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val currentConfig = daemonRepository.getAllPolicies()
@@ -86,10 +140,7 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
             }.toMutableMap()
 
             for (pkg in targetPackages) {
-                // 仅对主用户(user 0)进行操作
                 val key = AppInstanceKey(pkg, 0)
-                // [核心修复] 使用 policy.value 获取整数值
-                // 另外，对于批量操作，我们只设置核心策略，其他豁免项保持默认值null
                 existingPolicies[key] = AppPolicyPayload(
                     packageName = pkg,
                     userId = 0,
@@ -100,18 +151,7 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
             val newConfig = currentConfig.copy(policies = existingPolicies.values.toList())
             daemonRepository.setPolicy(newConfig)
             _uiState.update { it.copy(isLoading = false) }
-            // [核心修复] 使用 policy.displayName
             Toast.makeText(app, "已为 ${targetPackages.size} 个应用批量应用'${policy.displayName}'策略", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun formatJson(jsonString: String): String {
-        return try {
-            val jsonElement = JsonParser.parseString(jsonString)
-            GsonBuilder().setPrettyPrinting().create().toJson(jsonElement)
-        } catch (e: Exception) {
-            // 如果JSON格式错误，返回原始字符串以便用户查看
-            jsonString
         }
     }
 }

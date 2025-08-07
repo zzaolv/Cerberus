@@ -11,6 +11,15 @@ import androidx.compose.ui.graphics.vector.ImageVector
  */
 object AppIcons {
 
+    // [核心新增] 添加 Save 图标的矢量路径
+    val Save: ImageVector by lazy { materialIcon(name = "Filled.Save") {
+        materialPath {
+            moveTo(17.0f, 3.0f); lineTo(5.0f, 3.0f); curveTo(3.89f, 3.0f, 3.0f, 3.9f, 3.0f, 5.0f); verticalLineToRelative(14.0f); curveToRelative(0.0f, 1.1f, 0.89f, 2.0f, 2.0f, 2.0f); horizontalLineToRelative(14.0f); curveToRelative(1.1f, 0.0f, 2.0f, -0.9f, 2.0f, -2.0f); lineTo(21.0f, 7.0f); lineToRelative(-4.0f, -4.0f); close();
+            moveTo(12.0f, 19.0f); curveToRelative(-1.66f, 0.0f, -3.0f, -1.34f, -3.0f, -3.0f); reflectiveCurveToRelative(1.34f, -3.0f, 3.0f, -3.0f); reflectiveCurveToRelative(3.0f, 1.34f, 3.0f, 3.0f); reflectiveCurveToRelative(-1.34f, 3.0f, -3.0f, 3.0f); close();
+            moveTo(15.0f, 9.0f); lineTo(5.0f, 9.0f); lineTo(5.0f, 5.0f); horizontalLineToRelative(10.0f); verticalLineToRelative(4.0f); close()
+        }
+    } }
+
     val Dashboard: ImageVector by lazy { materialIcon("Filled.Dashboard") {
         materialPath {
             moveTo(3.0f, 13.0f); horizontalLineToRelative(8.0f); lineTo(11.0f, 3.0f); lineTo(3.0f, 3.0f); verticalLineToRelative(10.0f); close()

@@ -133,6 +133,24 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
+        // [核心新增] 处理设置 OOM 策略文件内容的请求
+        if (type == "cmd.set_adj_rules_content") {
+            const auto& payload = msg.value("payload", json::object());
+            std::string content = payload.value("content", "");
+            if (!content.empty()) {
+                std::string path = "/data/adb/cerberus/adj_rules.json";
+                std::ofstream ofs(path);
+                if (ofs.is_open()) {
+                    ofs << content;
+                    LOGI("OOM rules content updated from UI.");
+                    // 通知 StateManager 热重载
+                    if (g_state_manager) g_state_manager->reload_adj_rules();
+                } else {
+                    LOGE("Failed to open '%s' to write new adj rules.", path.c_str());
+                }
+            }
+            return;
+        }
 
         if (!g_state_manager) return;
 

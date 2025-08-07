@@ -66,7 +66,14 @@ class DaemonRepository private constructor(
             }
         }
     }
-    
+
+    // [核心新增] 设置OOM策略文件内容
+    fun setAdjRulesContent(content: String) {
+        val payload = mapOf("content" to content)
+        val message = CerberusMessage(type = "cmd.set_adj_rules_content", payload = payload)
+        tcpClient.sendMessage(gson.toJson(message))
+    }
+
     // [核心新增] 获取 /data/app 下的包名
     suspend fun getDataAppPackages(): List<String>? {
         return query("query.get_data_app_packages", EmptyPayload) { responseJson ->
