@@ -25,12 +25,8 @@ import coil.request.ImageRequest
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppInfo
-// [核心修复] 导入正确的 Policy
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.navigation.Screen
-
-// [核心修复] 删除此文件中重复的 Policy enum 定义
-// enum class Policy(val value: Int, val displayName: String) { ... }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -70,6 +66,7 @@ fun ConfigurationScreen(
                 singleLine = true
             )
 
+            // --- UI 微调 ---
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -77,12 +74,21 @@ fun ConfigurationScreen(
                     .clickable { viewModel.onShowSystemAppsChanged(!uiState.showSystemApps) },
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("显示系统应用", modifier = Modifier.weight(1f))
+                // 修改文案，让用户知道列表现在更全了
+                Column(modifier = Modifier.weight(1f)) {
+                     Text("显示系统应用")
+                     Text(
+                         "列表包含所有已安装应用 (含无图标应用)", 
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                     )
+                }
                 Switch(
                     checked = uiState.showSystemApps,
                     onCheckedChange = viewModel::onShowSystemAppsChanged
                 )
             }
+            // --- UI 微调 END ---
 
             if (uiState.isLoading) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -97,7 +103,6 @@ fun ConfigurationScreen(
                     items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
                         AppPolicyItem(
                             appInfo = appInfo,
-                            // [核心修复] appInfo.policy 现在是正确的类型，不需要转换
                             policy = appInfo.policy,
                             onClick = { viewModel.onAppClicked(appInfo) }
                         )
@@ -121,6 +126,9 @@ fun ConfigurationScreen(
         }
     }
 }
+
+// ... AppPolicyItem, AppSettingsBottomSheet, 等其他 Composable 函数保持不变 ...
+// (此处省略未改动的函数，实际使用时请保留它们)
 
 @Composable
 fun AppPolicyItem(
@@ -215,7 +223,6 @@ fun AppSettingsBottomSheet(
         SegmentedButtonRow(
             policy = mutableAppInfo.policy,
             onPolicySelected = { newPolicy ->
-                // [核心修复] newPolicy 现在是正确的类型，可以直接赋值
                 mutableAppInfo = mutableAppInfo.copy(policy = newPolicy)
                 currentOnPolicyChange(mutableAppInfo)
             }
@@ -224,36 +231,38 @@ fun AppSettingsBottomSheet(
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
 
         Text("精细化豁免", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
+        
         ExemptionSwitch(
-            title = "强制音频豁免",
-            subtitle = "即使在后台播放无声或广告音频，也忽略此活动并执行冻结。",
-            checked = mutableAppInfo.forcePlaybackExemption,
-            onCheckedChange = {
-                mutableAppInfo = mutableAppInfo.copy(forcePlaybackExemption = it)
+            title = "音频活动豁免",
+            subtitle = "开启后，后台播放音频将阻止应用被冻结。",
+            checked = !mutableAppInfo.forcePlaybackExemption,
+            onCheckedChange = { newSwitchState ->
+                mutableAppInfo = mutableAppInfo.copy(forcePlaybackExemption = !newSwitchState)
                 currentOnPolicyChange(mutableAppInfo)
             }
         )
         ExemptionSwitch(
-            title = "强制定位豁免",
-            subtitle = "忽略后台定位活动并执行冻结（谨慎开启）。",
-            checked = mutableAppInfo.forceLocationExemption,
-            onCheckedChange = {
-                mutableAppInfo = mutableAppInfo.copy(forceLocationExemption = it)
+            title = "定位活动豁免",
+            subtitle = "开启后，后台使用定位将阻止应用被冻结。",
+            checked = !mutableAppInfo.forceLocationExemption,
+            onCheckedChange = { newSwitchState ->
+                mutableAppInfo = mutableAppInfo.copy(forceLocationExemption = !newSwitchState)
                 currentOnPolicyChange(mutableAppInfo)
             }
         )
         ExemptionSwitch(
-            title = "强制网络豁免",
-            subtitle = "忽略后台高网络活动并执行冻结（谨慎开启）。",
-            checked = mutableAppInfo.forceNetworkExemption,
-            onCheckedChange = {
-                mutableAppInfo = mutableAppInfo.copy(forceNetworkExemption = it)
+            title = "高网络活动豁免",
+            subtitle = "开启后，后台进行高速下载等将阻止应用被冻结。",
+            checked = !mutableAppInfo.forceNetworkExemption,
+            onCheckedChange = { newSwitchState ->
+                mutableAppInfo = mutableAppInfo.copy(forceNetworkExemption = !newSwitchState)
                 currentOnPolicyChange(mutableAppInfo)
             }
         )
+        
         ExemptionSwitch(
-            title = "允许定时唤醒 (心跳)",
-            subtitle = "允许此应用参与全局的定时解冻任务以接收消息。",
+            title = "允许定时唤醒",
+            subtitle = "允许此应用参与全局的定时解冻任务。",
             checked = mutableAppInfo.allowTimedUnfreeze,
             onCheckedChange = {
                 mutableAppInfo = mutableAppInfo.copy(allowTimedUnfreeze = it)
@@ -308,12 +317,10 @@ fun ExemptionSwitch(
 
 @Composable
 private fun getPolicyLabelAndIcon(policy: Policy): Pair<String, String> {
-    // [核心修复] policy.displayName 现在可以直接使用
     return when (policy) {
         Policy.EXEMPTED -> policy.displayName to "🛡️"
         Policy.STANDARD -> policy.displayName to "⚙️"
         Policy.STRICT -> policy.displayName to "🧊"
-        // 添加一个默认分支以处理 IMPORTANCE 等情况
         else -> policy.displayName to "🤔" 
     }
 }

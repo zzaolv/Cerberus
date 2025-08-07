@@ -379,7 +379,6 @@ fun AppStatusIcons(state: AppRuntimeState) {
     }
 }
 
-// ... (rest of the file remains the same) ...
 @Composable
 fun ConnectionLoadingIndicator() {
     Box(

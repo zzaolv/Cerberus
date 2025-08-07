@@ -2,13 +2,12 @@
 package com.crfzit.crfzit.ui.configuration
 
 import android.app.Application
-import android.content.Intent
-import android.content.pm.ApplicationInfo
+// import android.content.Intent // 不再需要
+// import android.content.pm.ApplicationInfo // 不再需要
 import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.*
-// [核心修复] 确保导入的是 data.model.Policy
 import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
@@ -58,16 +57,22 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            val launchableApps = getAllLaunchableApps()
+            // --- 核心修改 START ---
+            // 1. 从 AppInfoRepository 获取所有已安装的应用，而不是仅可启动的应用
+            val allApps = appInfoRepository.getAllApps(forceRefresh = true) 
+            // --- 核心修改 END ---
+
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             } ?: emptyMap()
 
-            val finalAppMap = launchableApps.associateBy {
+            // 使用 allApps 作为基础数据源
+            val finalAppMap = allApps.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             }.toMutableMap()
 
+            // （这部分逻辑保持不变，用于处理数据库中有但物理上可能不存在的分身应用策略）
             daemonPolicyMap.values.forEach { policy ->
                 val key = AppInstanceKey(policy.packageName, policy.userId)
                 if (!finalAppMap.containsKey(key) && policy.userId != 0) {
@@ -81,10 +86,11 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                 }
             }
 
+            // （这部分逻辑保持不变，为所有应用应用从守护进程获取的策略）
             finalAppMap.values.forEach { appInfo ->
                 daemonPolicyMap[AppInstanceKey(appInfo.packageName, appInfo.userId)]?.let { policy ->
-                    // [核心修复] 这里的 Policy.fromInt 调用现在是明确且正确的
                     appInfo.policy = Policy.fromInt(policy.policy)
+                    // 使用您上次修改后的反转逻辑，此处保持不变
                     appInfo.forcePlaybackExemption = policy.forcePlaybackExemption ?: false
                     appInfo.forceNetworkExemption = policy.forceNetworkExemption ?: false
                     appInfo.forceLocationExemption = policy.forceLocationExemption ?: false
@@ -141,26 +147,14 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         daemonRepository.setPolicy(newConfig)
     }
 
-
+    // --- 核心修改 START ---
+    // getAllLaunchableApps 方法不再需要，可以直接删除或注释掉
+    /*
     private suspend fun getAllLaunchableApps(): List<AppInfo> = withContext(Dispatchers.IO) {
-        val intent = Intent(Intent.ACTION_MAIN, null).apply {
-            addCategory(Intent.CATEGORY_LAUNCHER)
-        }
-        packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
-            .mapNotNull { resolveInfo ->
-                try {
-                    val appInfo: ApplicationInfo = resolveInfo.activityInfo.applicationInfo
-                    AppInfo(
-                        packageName = appInfo.packageName,
-                        appName = appInfo.loadLabel(packageManager).toString(),
-                        isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                        userId = 0
-                    )
-                } catch (e: Exception) {
-                    null
-                }
-            }
+        // ... old implementation ...
     }
+    */
+    // --- 核心修改 END ---
 
     fun onSearchQueryChanged(query: String) {
         _uiState.update { it.copy(searchQuery = query) }

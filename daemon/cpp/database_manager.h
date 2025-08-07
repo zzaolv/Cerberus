@@ -9,6 +9,11 @@
 #include <SQLiteCpp/Statement.h>
 #include <SQLiteCpp/Transaction.h>
 
+// --- 核心修改：定义最新的数据库版本号 ---
+// 每次您需要修改数据库结构时，请将此版本号 +1
+const int DATABASE_VERSION = 4;
+
+
 enum class AppPolicy {
     EXEMPTED = 0,
     IMPORTANT = 1,
@@ -20,11 +25,10 @@ struct AppConfig {
     std::string package_name;
     int user_id = 0; 
     AppPolicy policy = AppPolicy::STANDARD;
-    // [核心新增] 添加新的豁免标志
     bool force_playback_exemption = false;
     bool force_network_exemption = false;
     bool force_location_exemption = false;
-    bool allow_timed_unfreeze = true; // 默认允许
+    bool allow_timed_unfreeze = true;
 };
 
 struct MasterConfig {
@@ -47,7 +51,11 @@ public:
     bool update_all_app_policies(const std::vector<AppConfig>& configs);
 
 private:
-    void initialize_database();
+    // --- 核心修改：重构初始化/升级逻辑 ---
+    void initialize_and_migrate_database();
+    int get_db_version();
+    void set_db_version(int version);
+
     SQLite::Database db_;
 };
 
