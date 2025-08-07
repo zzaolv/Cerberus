@@ -20,10 +20,11 @@ import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import java.io.IOException
-import java.io.OutputStreamWriter
-import java.net.Socket
-import java.nio.charset.StandardCharsets
+// [核心重构] 不再需要以下导入
+// import java.io.IOException
+// import java.io.OutputStreamWriter
+// import java.net.Socket
+// import java.nio.charset.StandardCharsets
 
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -31,14 +32,41 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var nmsInstance: Any? = null
     @Volatile private var packageManager: PackageManager? = null
 
+    // [核心重构] 创建一个DaemonConnector的单例
+    private lateinit var daemonConnector: DaemonConnector
+
     companion object {
-        // [核心修改] 更新TAG，版本号+1
-        private const val TAG = "CerberusProbe_v40_DynamicBqHook"
+        private const val TAG = "CerberusProbe_v41_PersistentConn" // 版本号更新
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val DAEMON_HOST = "127.0.0.1"
         private const val DAEMON_PORT = 28900
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
+
+        // [核心重构] 将 ConfigManager 移至顶层，以便 DaemonConnector 可以访问
+        object ConfigManager {
+            @Volatile var isBqHooked = false
+            @Volatile private var frozenUids = emptySet<Int>()
+
+            fun updateConfig(jsonString: String) {
+                try {
+                    // 注意：守护进程发来的配置更新消息是完整的JSON，我们需要解析它
+                    val payload = JsonParser.parseString(jsonString).asJsonObject
+                        .getAsJsonObject("payload")
+                        ?: return
+                    if (payload.has("frozen_uids")) {
+                        frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
+                    }
+                    if (frozenUids.isNotEmpty()) {
+                        XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} frozen UIDs.")
+                    }
+                } catch (e: Exception) {
+                    XposedBridge.log("[$TAG]: [ERROR] Failed to parse probe config: $e")
+                }
+            }
+
+            fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
+        }
     }
 
     private enum class WakeupType(val value: Int) {
@@ -51,11 +79,16 @@ class ProbeHook : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
-        sendEventToDaemon("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
+
+        // [核心重构] 初始化并启动 DaemonConnector
+        daemonConnector = DaemonConnector(DAEMON_HOST, DAEMON_PORT, TAG)
+        daemonConnector.start()
+
+        // 注意：probe_hello 消息现在由 DaemonConnector 自动在连接成功后发送
+        // sendEventToDaemon("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
-            // [核心修改] hookAmsLifecycle 的职责改变了
             hookAmsLifecycle(classLoader)
             hookNmsConstructor(classLoader)
             hookActivitySwitchEvents(classLoader)
@@ -71,12 +104,25 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // [核心重构] hookAmsLifecycle 的新职责：动态拦截广播队列
+    // [核心重构] sendEventToDaemon 现在变得非常简单
+    private fun sendEventToDaemon(type: String, payload: Any) {
+        // 创建消息模型
+        val message = CerberusMessage(type = type, payload = payload)
+        // 序列化为JSON字符串
+        val jsonMessage = gson.toJson(message)
+        // 交给连接器发送，无需关心连接细节
+        daemonConnector.sendMessage(jsonMessage)
+    }
+
+    //
+    // --- 所有其他的 Hook 方法 (hookAmsLifecycle, hookNotificationService 等) 保持完全不变 ---
+    // --- 它们现在会调用新的、高效的 sendEventToDaemon 方法 ---
+    //
+
+
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
-
-            // 找到 broadcastIntentLocked 或类似方法作为入口点
             val broadcastIntentMethod = amsClass.declaredMethods.find {
                 it.name == "broadcastIntentLocked" || it.name == "broadcastIntent"
             }
@@ -84,17 +130,12 @@ class ProbeHook : IXposedHookLoadPackage {
                 logError("FATAL: Could not find AMS#broadcastIntentLocked method.")
                 return
             }
-
             XposedBridge.hookMethod(broadcastIntentMethod, object : XC_MethodHook() {
-                // 我们在方法执行前Hook，确保只Hook一次
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (ConfigManager.isBqHooked) return
-
                     val amsInstance = param.thisObject
                     val bqFieldNames = listOf("mFgBroadcastQueue", "mBgBroadcastQueue", "mBroadcastQueues")
                     var bqObject: Any? = null
-
-                    // 再次尝试查找字段，因为此时它们很可能已经被初始化了
                     for (fieldName in bqFieldNames) {
                         try {
                             val field = XposedHelpers.findFieldIfExists(amsClass, fieldName) ?: continue
@@ -107,19 +148,14 @@ class ProbeHook : IXposedHookLoadPackage {
                             }
                         } catch (t: Throwable) { /* ignore */ }
                     }
-
                     if (bqObject == null) {
-                        // 如果还是找不到，打印一个警告，但这次不是致命错误，因为通知唤醒仍然可以工作
                         logError("WARN: Could not find BroadcastQueue instance on-demand. FCM wakeup might be affected.")
-                        // 标记为已尝试，避免重复执行
                         ConfigManager.isBqHooked = true
                         return
                     }
-
                     val concreteBqClass = bqObject.javaClass
                     log("Dynamically found BroadcastQueue class: ${concreteBqClass.name}")
                     findAndHookBroadcastMethod(concreteBqClass)
-                    // 标记为成功，这个beforeHookedMethod将不再执行查找逻辑
                     ConfigManager.isBqHooked = true
                 }
             })
@@ -128,8 +164,6 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Could not hook AMS lifecycle for dynamic BQ hooking: ${t.message}")
         }
     }
-
-    // findAndHookBroadcastMethod 保持不变，它的逻辑是正确的
     private fun findAndHookBroadcastMethod(concreteBqClass: Class<*>) {
         val classLoader = concreteBqClass.classLoader ?: run {
             logError("FATAL: ClassLoader for ${concreteBqClass.name} is null!")
@@ -139,13 +173,11 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("FATAL: Could not find BroadcastRecord class!")
             return
         }
-
         val hook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
                     val record = param.args.firstOrNull { it != null && brClass.isInstance(it) } ?: return
                     val intent = XposedHelpers.getObjectField(record, "intent") as? Intent ?: return
-
                     if (isGcmOrFcmIntent(intent)) {
                         intent.flags = intent.flags or FLAG_INCLUDE_STOPPED_PACKAGES
                         (XposedHelpers.getObjectField(record, "receivers") as? List<*>)?.forEach { receiver ->
@@ -159,8 +191,6 @@ class ProbeHook : IXposedHookLoadPackage {
                 } catch (t: Throwable) { logError("Error in BroadcastQueue hook: ${t.message}") }
             }
         }
-
-        // 尝试的方法名列表保持不变
         val potentialMethodNames = listOf("processNextBroadcast", "processNextBroadcastLocked", "scheduleReceiverLocked", "scheduleReceiverColdLocked")
         var hookedCount = 0
         for (methodName in potentialMethodNames) {
@@ -174,16 +204,10 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             }
         }
-
         if (hookedCount == 0) {
             logError("FATAL: Could not hook any broadcast processing method in ${concreteBqClass.name}.")
         }
     }
-
-
-    // --- 其他所有方法保持不变 ---
-    // (此处省略了所有未改动的函数，以保持简洁，实际使用时请保留它们)
-
     private fun hookNmsConstructor(classLoader: ClassLoader) {
         try {
             val nmsClass = XposedHelpers.findClass("com.android.server.notification.NotificationManagerService", classLoader)
@@ -203,20 +227,17 @@ class ProbeHook : IXposedHookLoadPackage {
             })
         } catch (t: Throwable) { logError("Could not hook NMS constructor: ${t.message}") }
     }
-
     private fun hookNotificationService(classLoader: ClassLoader) {
         val nmsClass = findClass("com.android.server.notification.NotificationManagerService", classLoader) ?: run {
             logError("FATAL: Could not find NotificationManagerService class!")
             return
         }
-
         val hook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val pm = packageManager ?: return
                 try {
                     val pkg = param.args.firstOrNull { it is String } as? String ?: return
                     val notification = param.args.find { it is Notification } as? Notification ?: return
-
                     val targetUid: Int
                     try {
                         targetUid = pm.getApplicationInfo(pkg, 0).uid
@@ -225,33 +246,27 @@ class ProbeHook : IXposedHookLoadPackage {
                         logError("Unexpected error while getting UID for package '$pkg': ${t.message}")
                         return
                     }
-
                     if (ConfigManager.isUidFrozen(targetUid)) {
                         val channel = try {
                             nmsInstance?.let { XposedHelpers.callMethod(it, "getNotificationChannelForPackage", pkg, targetUid, notification.channelId, false) as? NotificationChannel }
                         } catch (t: Throwable) { null }
-
                         if (channel != null && channel.importance < NotificationManager.IMPORTANCE_DEFAULT) {
                             log("Ignoring low-importance notification for frozen UID $targetUid")
                             return
                         }
-
                         requestWakeupForUid(targetUid, WakeupType.GENERIC_NOTIFICATION)
                     }
                 } catch (t: Throwable) { logError("CRITICAL Error in NMS hook: ${t.javaClass.simpleName} - ${t.message}") }
             }
         }
-
         var hookCount = 0
         nmsClass.declaredMethods.filter { it.name == "enqueueNotificationInternal" }.forEach {
             try { XposedBridge.hookMethod(it, hook); hookCount++ }
             catch (t: Throwable) { logError("Failed to hook a variant of enqueueNotificationInternal: $t") }
         }
-
         if (hookCount > 0) log("SUCCESS: Hooked $hookCount NMS#enqueueNotificationInternal methods.")
         else logError("FATAL: No NMS#enqueueNotificationInternal methods were hooked.")
     }
-
     private fun requestWakeupForUid(uid: Int, type: WakeupType) {
         if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidFrozen(uid)) {
             val reason = when(type) {
@@ -263,46 +278,6 @@ class ProbeHook : IXposedHookLoadPackage {
             sendEventToDaemon("event.app_wakeup_request_v2", mapOf("uid" to uid, "type_int" to type.value))
         }
     }
-
-    private fun sendEventToDaemon(type: String, payload: Any) {
-        Thread {
-            val message = CerberusMessage(type = type, payload = payload)
-            val jsonMessage = gson.toJson(message)
-            try {
-                Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                    socket.soTimeout = 2000
-                    OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
-                        writer.write(jsonMessage + "\n"); writer.flush()
-                        if (type == "event.probe_hello") {
-                            try {
-                                socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()?.let {
-                                    ConfigManager.updateConfig(it)
-                                }
-                            } catch (e: Exception) { logError("Failed to read config response after hello: $e") }
-                        }
-                    }
-                }
-            } catch (e: IOException) {
-                if (e.message?.contains("ECONNREFUSED") != true) { logError("Daemon short-conn send error for $type: ${e.message}") }
-            } catch (e: Exception) { logError("Unexpected error during short-conn send for $type: $e") }
-        }.start()
-    }
-
-    private object ConfigManager {
-        @Volatile var isBqHooked = false
-        @Volatile private var frozenUids = emptySet<Int>()
-        fun updateConfig(jsonString: String) {
-            try {
-                val payload = JsonParser.parseString(jsonString).asJsonObject.getAsJsonObject("payload")
-                if (payload.has("frozen_uids")) {
-                    frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
-                }
-                if (frozenUids.isNotEmpty()) XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} UIDs.")
-            } catch (e: Exception) { XposedBridge.log("[$TAG]: [ERROR] Failed to parse probe config: $e") }
-        }
-        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
-    }
-
     private fun log(message: String) = XposedBridge.log("[$TAG] $message")
     private fun logError(message: String) = XposedBridge.log("[$TAG] [ERROR] $message")
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? = XposedHelpers.findClassIfExists(className, classLoader)
