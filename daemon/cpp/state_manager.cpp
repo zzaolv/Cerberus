@@ -1466,6 +1466,7 @@ void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     }
 }
 
+// [核心修改] tick_state_machine_timers 函数
 bool StateManager::tick_state_machine_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
@@ -1495,9 +1496,10 @@ bool StateManager::tick_state_machine_timers() {
                 app.observation_since = 0;
 
                 std::vector<std::string> active_reasons;
-                if (is_app_playing_audio(app)) active_reasons.push_back("音频");
-                if (sys_monitor_->is_uid_using_location(app.uid)) active_reasons.push_back("定位");
-                if (sys_monitor_->get_cached_network_speed(app.uid).download_kbps > NETWORK_THRESHOLD_KBPS) active_reasons.push_back("网络");
+                // [核心修改] 应用新的豁免规则
+                if (!app.config.force_playback_exemption && is_app_playing_audio(app)) active_reasons.push_back("音频");
+                if (!app.config.force_location_exemption && sys_monitor_->is_uid_using_location(app.uid)) active_reasons.push_back("定位");
+                if (!app.config.force_network_exemption && sys_monitor_->get_cached_network_speed(app.uid).download_kbps > NETWORK_THRESHOLD_KBPS) active_reasons.push_back("网络");
 
                 if (!active_reasons.empty()) {
                     std::string reason_str;
@@ -1617,7 +1619,8 @@ void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
 }
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
-    if (!master_config_.is_timed_unfreeze_enabled || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
+    // 检查全局开关和单个应用的开关
+    if (!master_config_.is_timed_unfreeze_enabled || !app.config.allow_timed_unfreeze || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
         return;
     }
     cancel_timed_unfreeze(app);
@@ -1710,6 +1713,7 @@ bool StateManager::perform_deep_scan() {
     return changed;
 }
 
+// [核心修改] on_config_changed_from_ui 函数
 bool StateManager::on_config_changed_from_ui(const json& payload) {
     bool probe_config_needs_update = false;
 
@@ -1725,6 +1729,12 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
             new_config.package_name = policy_item.value("package_name", "");
             new_config.user_id = policy_item.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(policy_item.value("policy", 0));
+            // [核心修改] 解析新的豁免字段
+            new_config.force_playback_exemption = policy_item.value("force_playback_exemption", false);
+            new_config.force_network_exemption = policy_item.value("force_network_exemption", false);
+            new_config.force_location_exemption = policy_item.value("force_location_exemption", false);
+            new_config.allow_timed_unfreeze = policy_item.value("allow_timed_unfreeze", true);
+
             if (!new_config.package_name.empty()) {
                 new_configs.push_back(new_config);
             }
@@ -1739,7 +1749,7 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
             AppRuntimeState* app = get_or_create_app_state(new_config.package_name, new_config.user_id);
             if (app) {
                 bool policy_changed = app->config.policy != new_config.policy;
-                app->config = new_config;
+                app->config = new_config; // 直接用新的完整配置覆盖
 
                 if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
                      if (unfreeze_and_observe_nolock(*app, "策略变更", WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND)) {
@@ -1818,10 +1828,15 @@ json StateManager::get_full_config_for_ui() {
     response["exempt_config"] = {{"exempt_foreground_services", true}};
     json policies = json::array();
     for (const auto& config : all_db_configs) {
+        // [核心修改] 序列化新的豁免字段
         policies.push_back({
             {"package_name", config.package_name},
             {"user_id", config.user_id},
-            {"policy", static_cast<int>(config.policy)}
+            {"policy", static_cast<int>(config.policy)},
+            {"force_playback_exemption", config.force_playback_exemption},
+            {"force_network_exemption", config.force_network_exemption},
+            {"force_location_exemption", config.force_location_exemption},
+            {"allow_timed_unfreeze", config.allow_timed_unfreeze}
         });
     }
     response["policies"] = policies;

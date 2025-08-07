@@ -18,12 +18,12 @@
 #include "time_series_database.h"
 #include "rekernel_client.h"
 
-class AdjMapper;    // [新增] 前向声明
-class MemoryButler; // [新增] 前向声明
+class AdjMapper;
+class MemoryButler;
 
 using json = nlohmann::json;
 
-// [核心修改] WakeupType 替换为更通用的 WakeupPolicy
+
 enum class WakeupPolicy {
     // 决策结果
     IGNORE,                       // 忽略事件, 不解冻
@@ -38,6 +38,7 @@ enum class WakeupPolicy {
     FROM_PROBE_START,             // 来自Probe探测到的应用启动
     FROM_KERNEL                   // 来自内核事件 (统一归类)
 };
+
 
 struct AppRuntimeState {
     enum class Status {
@@ -57,6 +58,7 @@ struct AppRuntimeState {
     int uid = -1;
     int user_id = 0;
     std::vector<int> pids;
+    // [核心修改] AppConfig 现在直接作为成员，而不是指针
     AppConfig config;
     bool is_oom_protected = false;
 
@@ -80,10 +82,8 @@ struct AppRuntimeState {
     long long last_foreground_timestamp_ms = 0;
     long long total_runtime_ms = 0;
 
-    // [修改] 节流阀相关字段
-    time_t last_wakeup_timestamp = 0; // 记录上一次有效唤醒尝试的时间窗口
-    int wakeup_count_in_window = 0;   // 记录在时间窗口内的唤醒次数
-    // [新增] 上次成功唤醒的时间戳，用于事件突发节流（消抖）
+    time_t last_wakeup_timestamp = 0; 
+    int wakeup_count_in_window = 0;   
     time_t last_successful_wakeup_timestamp = 0;
 };
 
@@ -105,7 +105,6 @@ private:
     std::shared_ptr<ActionExecutor> action_executor_;
 };
 
-// [核心重构] 为Doze报告增加一个专门的结构体
 struct DozeProcessRecord {
     long long start_jiffies;
     std::string process_name;
@@ -115,7 +114,7 @@ struct DozeProcessRecord {
 
 class StateManager {
 public:
-    // [修改] 构造函数签名更新
+    // ... (构造函数和公共方法)
     StateManager(std::shared_ptr<DatabaseManager> db,
                  std::shared_ptr<SystemMonitor> sys,
                  std::shared_ptr<ActionExecutor> act,
@@ -125,7 +124,7 @@ public:
                  std::shared_ptr<MemoryButler> mem_butler);
 
     void initial_full_scan_and_warmup();
-    void reload_adj_rules(); // [新增] 热重载接口
+    void reload_adj_rules(); 
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
     void process_new_metrics(const MetricsRecord& record);
@@ -145,12 +144,11 @@ public:
     void on_temp_unfreeze_request_by_pid(const json& payload);
     bool perform_staggered_stats_scan();
     void on_wakeup_request_from_probe(const json& payload);
-    // [新增] 处理来自 Re-Kernel 的事件
     void on_signal_from_rekernel(const ReKernelSignalEvent& event);
     void on_binder_from_rekernel(const ReKernelBinderEvent& event);
     
-    // [新增] 内存管家调度入口
     void run_memory_butler_tasks();
+
 
 private:
     // [新增] 内存健康状态
@@ -171,7 +169,6 @@ private:
     AppRuntimeState* get_or_create_app_state(const std::string&, int user_id);
     bool is_critical_system_app(const std::string&) const;
     bool is_app_playing_audio(const AppRuntimeState& app);
-    // [新增] 决策函数
     WakeupPolicy decide_wakeup_policy_for_probe(WakeupPolicy event_type);
     WakeupPolicy decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event);
     WakeupPolicy decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event);
@@ -179,25 +176,22 @@ private:
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
     bool tick_state_machine_timers(); 
-    // [核心修改] 移除 audit_background_apps，其逻辑将被合并
-    // void audit_background_apps();
     bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
     void validate_pids_nolock(AppRuntimeState& app);
-    void update_memory_health(const MetricsRecord& record); // [新增]
+    void update_memory_health(const MetricsRecord& record); 
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
     std::shared_ptr<ActionExecutor> action_executor_;
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<TimeSeriesDatabase> ts_db_;
-    // [新增] 持有新组件
     std::shared_ptr<AdjMapper> adj_mapper_;
     std::shared_ptr<MemoryButler> memory_butler_;
 
     MasterConfig master_config_;
-    MemoryHealth memory_health_ = MemoryHealth::HEALTHY; // [新增]
+    MemoryHealth memory_health_ = MemoryHealth::HEALTHY; 
     std::unique_ptr<DozeManager> doze_manager_;
     std::mutex state_mutex_;
     std::set<AppInstanceKey> last_known_visible_app_keys_;
@@ -206,11 +200,9 @@ private:
     uint32_t timeline_idx_ = 0;
     std::vector<int> unfrozen_timeline_;
 
-    // [新增] 遥测统计
-    std::map<int, int> kernel_wakeup_source_stats_; // key: source_uid, value: count
-    std::map<std::string, int> ignored_rpc_stats_;   // key: rpc_name, value: count
+    std::map<int, int> kernel_wakeup_source_stats_;
+    std::map<std::string, int> ignored_rpc_stats_;   
 
-    // [核心重构] 修改Doze数据结构，以PID为key
     std::map<int, DozeProcessRecord> doze_start_process_info_;
 
     std::map<AppInstanceKey, AppRuntimeState> managed_apps_;

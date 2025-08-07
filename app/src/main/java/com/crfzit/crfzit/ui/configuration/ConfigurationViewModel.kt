@@ -17,12 +17,13 @@ import kotlinx.coroutines.withContext
 
 data class ConfigurationUiState(
     val isLoading: Boolean = true,
-    // [内存优化] allInstalledApps 列表现在非常轻量，因为它不包含图标
     val allInstalledApps: List<AppInfo> = emptyList(),
     val policies: Map<AppInstanceKey, AppPolicyPayload> = emptyMap(),
     val fullConfig: FullConfigPayload? = null,
     val searchQuery: String = "",
-    val showSystemApps: Boolean = false
+    val showSystemApps: Boolean = false,
+    // [核心新增] 用于控制 BottomSheet 的状态
+    val selectedAppForSheet: AppInfo? = null
 )
 
 class ConfigurationViewModel(application: Application) : AndroidViewModel(application) {
@@ -47,10 +48,8 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                                 appInfo.packageName.contains(state.searchQuery, ignoreCase = true))
             }
             .sortedWith(
-                compareByDescending<AppInfo> {
-                    val key = AppInstanceKey(it.packageName, it.userId)
-                    state.policies[key]?.policy ?: 0
-                }.thenBy { it.appName.lowercase() }
+                compareByDescending<AppInfo> { it.policy.value }
+                    .thenBy { it.appName.lowercase() }
             )
     }
 
@@ -58,7 +57,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
 
-            // [内存优化] 这两个调用现在都非常快且内存占用低
             val launchableApps = getAllLaunchableApps()
             val configPayload = daemonRepository.getAllPolicies()
             val daemonPolicyMap = configPayload?.policies?.associateBy {
@@ -76,10 +74,20 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                     finalAppMap[key] = AppInfo(
                         packageName = policy.packageName,
                         appName = baseAppInfo?.appName ?: policy.packageName,
-                        // [内存优化] 不再加载和存储Drawable对象
                         isSystemApp = baseAppInfo?.isSystemApp ?: false,
                         userId = policy.userId
                     )
+                }
+            }
+
+            // [核心修改] 将后台策略数据同步到前端 AppInfo 对象中
+            finalAppMap.values.forEach { appInfo ->
+                daemonPolicyMap[AppInstanceKey(appInfo.packageName, appInfo.userId)]?.let { policy ->
+                    appInfo.policy = Policy.fromInt(policy.policy)
+                    appInfo.forcePlaybackExemption = policy.forcePlaybackExemption ?: false
+                    appInfo.forceNetworkExemption = policy.forceNetworkExemption ?: false
+                    appInfo.forceLocationExemption = policy.forceLocationExemption ?: false
+                    appInfo.allowTimedUnfreeze = policy.allowTimedUnfreeze ?: true
                 }
             }
 
@@ -93,6 +101,48 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
         }
     }
+    
+    // [核心新增] 新的、更全面的设置更新函数
+    fun setAppFullPolicy(appInfo: AppInfo) {
+        val currentConfig = _uiState.value.fullConfig ?: return
+
+        val newPolicies = currentConfig.policies.toMutableList()
+        val key = AppInstanceKey(appInfo.packageName, appInfo.userId)
+        val existingPolicyIndex = newPolicies.indexOfFirst { it.packageName == key.packageName && it.userId == key.userId }
+
+        val newPolicyPayload = AppPolicyPayload(
+            packageName = appInfo.packageName,
+            userId = appInfo.userId,
+            policy = appInfo.policy.value,
+            forcePlaybackExemption = appInfo.forcePlaybackExemption,
+            forceNetworkExemption = appInfo.forceNetworkExemption,
+            forceLocationExemption = appInfo.forceLocationExemption,
+            allowTimedUnfreeze = appInfo.allowTimedUnfreeze
+        )
+
+        if (existingPolicyIndex != -1) {
+            newPolicies[existingPolicyIndex] = newPolicyPayload
+        } else {
+            newPolicies.add(newPolicyPayload)
+        }
+
+        val newConfig = currentConfig.copy(policies = newPolicies)
+        
+        _uiState.update { state ->
+            // 立即更新UI状态以获得即时反馈
+            val updatedApps = state.allInstalledApps.map {
+                if (it.packageName == appInfo.packageName && it.userId == appInfo.userId) appInfo else it
+            }
+            state.copy(
+                allInstalledApps = updatedApps,
+                policies = newPolicies.associateBy { p -> AppInstanceKey(p.packageName, p.userId) },
+                fullConfig = newConfig
+            )
+        }
+        // 向后台发送更新
+        daemonRepository.setPolicy(newConfig)
+    }
+
 
     private suspend fun getAllLaunchableApps(): List<AppInfo> = withContext(Dispatchers.IO) {
         val intent = Intent(Intent.ACTION_MAIN, null).apply {
@@ -114,28 +164,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
             }
     }
 
-    fun setAppPolicy(packageName: String, userId: Int, newPolicyValue: Int) {
-        val currentConfig = _uiState.value.fullConfig ?: return
-
-        val newPolicies = currentConfig.policies.toMutableList()
-        val existingPolicyIndex = newPolicies.indexOfFirst { it.packageName == packageName && it.userId == userId }
-
-        if (existingPolicyIndex != -1) {
-            newPolicies[existingPolicyIndex] = newPolicies[existingPolicyIndex].copy(policy = newPolicyValue)
-        } else {
-            newPolicies.add(AppPolicyPayload(packageName, userId, newPolicyValue))
-        }
-
-        val newConfig = currentConfig.copy(policies = newPolicies)
-        _uiState.update {
-            it.copy(
-                policies = newPolicies.associateBy { p -> AppInstanceKey(p.packageName, p.userId) },
-                fullConfig = newConfig
-            )
-        }
-        daemonRepository.setPolicy(newConfig)
-    }
-
     fun onSearchQueryChanged(query: String) {
         _uiState.update { it.copy(searchQuery = query) }
     }
@@ -143,8 +171,13 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
     fun onShowSystemAppsChanged(show: Boolean) {
         _uiState.update { it.copy(showSystemApps = show) }
     }
+    
+    // [核心新增] BottomSheet 控制
+    fun onAppClicked(appInfo: AppInfo) {
+        _uiState.update { it.copy(selectedAppForSheet = appInfo) }
+    }
 
-    override fun onCleared() {
-        super.onCleared()
+    fun onSheetDismiss() {
+        _uiState.update { it.copy(selectedAppForSheet = null) }
     }
 }

@@ -19,8 +19,11 @@ data class AppInfo(
     val userId: Int = 0,
 
     var policy: Policy = Policy.EXEMPTED,
+    // [核心新增] 为每个应用添加独立的豁免开关，设为 var 以便在ViewModel中直接修改
     var forcePlaybackExemption: Boolean = false,
-    var forceNetworkExemption: Boolean = false
+    var forceNetworkExemption: Boolean = false,
+    var forceLocationExemption: Boolean = false,
+    var allowTimedUnfreeze: Boolean = true // 默认允许定时唤醒
 )
 
 enum class LogLevel(val value: Int) {

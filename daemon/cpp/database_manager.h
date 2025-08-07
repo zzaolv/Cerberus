@@ -20,6 +20,11 @@ struct AppConfig {
     std::string package_name;
     int user_id = 0; 
     AppPolicy policy = AppPolicy::STANDARD;
+    // [核心新增] 添加新的豁免标志
+    bool force_playback_exemption = false;
+    bool force_network_exemption = false;
+    bool force_location_exemption = false;
+    bool allow_timed_unfreeze = true; // 默认允许
 };
 
 struct MasterConfig {
@@ -37,11 +42,8 @@ public:
     
     std::optional<AppConfig> get_app_config(const std::string& package_name, int user_id);
     bool set_app_config(const AppConfig& config);
-    // [修改] 删除此函数，其逻辑将被新函数替代
-    // bool clear_all_policies(); 
     std::vector<AppConfig> get_all_app_configs();
 
-    // [新增] 用于原子化更新所有策略的事务函数
     bool update_all_app_policies(const std::vector<AppConfig>& configs);
 
 private:

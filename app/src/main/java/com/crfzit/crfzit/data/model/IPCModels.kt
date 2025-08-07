@@ -99,12 +99,23 @@ data class ExemptConfig(
     val exemptForegroundServices: Boolean = true
 )
 
+// [核心修改] 在 AppPolicyPayload 中添加新的豁免字段
 data class AppPolicyPayload(
     @SerializedName("package_name")
     val packageName: String,
     @SerializedName("user_id")
     val userId: Int,
-    val policy: Int // Corresponds to AppPolicy enum
+    val policy: Int, // Corresponds to AppPolicy enum
+    // 新增字段，使用 @SerializedName 确保JSON key正确
+    // 设为可空并提供默认值，以兼容旧版守护进程可能不返回这些字段的情况
+    @SerializedName("force_playback_exemption")
+    val forcePlaybackExemption: Boolean? = null,
+    @SerializedName("force_network_exemption")
+    val forceNetworkExemption: Boolean? = null,
+    @SerializedName("force_location_exemption")
+    val forceLocationExemption: Boolean? = null,
+    @SerializedName("allow_timed_unfreeze")
+    val allowTimedUnfreeze: Boolean? = null
 )
 
 data class AppInstanceKey(
@@ -114,6 +125,7 @@ data class AppInstanceKey(
     val userId: Int
 )
 
+// ... (LogEntryPayload, MetricsRecordPayload, GetLogsPayload 保持不变) ...
 data class LogEntryPayload(
     val timestamp: Long,
     val level: Int,
