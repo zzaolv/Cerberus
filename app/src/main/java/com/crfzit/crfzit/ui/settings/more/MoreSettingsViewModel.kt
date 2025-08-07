@@ -7,8 +7,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.AppInstanceKey
 import com.crfzit.crfzit.data.model.AppPolicyPayload
+// [核心修复] 导入正确的 Policy
+import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.DaemonRepository
-import com.crfzit.crfzit.ui.configuration.Policy
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonParser
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,7 +63,7 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
             loadAdjRules()
         }
     }
-    
+
     fun applyBulkPolicy(policy: Policy) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
@@ -76,23 +77,30 @@ class MoreSettingsViewModel(private val app: Application) : AndroidViewModel(app
             val targetPackages = _uiState.value.dataAppPackages
             if (targetPackages.isEmpty()) {
                 Toast.makeText(app, "没有找到/data/app下的应用", Toast.LENGTH_SHORT).show()
-                 _uiState.update { it.copy(isLoading = false) }
+                _uiState.update { it.copy(isLoading = false) }
                 return@launch
             }
 
             val existingPolicies = currentConfig.policies.associateBy {
                 AppInstanceKey(it.packageName, it.userId)
             }.toMutableMap()
-            
+
             for (pkg in targetPackages) {
                 // 仅对主用户(user 0)进行操作
                 val key = AppInstanceKey(pkg, 0)
-                existingPolicies[key] = AppPolicyPayload(pkg, 0, policy.value)
+                // [核心修复] 使用 policy.value 获取整数值
+                // 另外，对于批量操作，我们只设置核心策略，其他豁免项保持默认值null
+                existingPolicies[key] = AppPolicyPayload(
+                    packageName = pkg,
+                    userId = 0,
+                    policy = policy.value
+                )
             }
 
             val newConfig = currentConfig.copy(policies = existingPolicies.values.toList())
             daemonRepository.setPolicy(newConfig)
             _uiState.update { it.copy(isLoading = false) }
+            // [核心修复] 使用 policy.displayName
             Toast.makeText(app, "已为 ${targetPackages.size} 个应用批量应用'${policy.displayName}'策略", Toast.LENGTH_LONG).show()
         }
     }

@@ -9,7 +9,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -26,20 +25,12 @@ import coil.request.ImageRequest
 import com.crfzit.crfzit.R
 import com.crfzit.crfzit.coil.AppIcon
 import com.crfzit.crfzit.data.model.AppInfo
-import com.crfzit.crfzit.data.model.AppInstanceKey
-import com.crfzit.crfzit.data.model.AppPolicyPayload
-import com.crfzit.crfzit.navigation.Screen 
-import com.crfzit.crfzit.ui.icons.AppIcons
+// [核心修复] 导入正确的 Policy
+import com.crfzit.crfzit.data.model.Policy
+import com.crfzit.crfzit.navigation.Screen
 
-enum class Policy(val value: Int, val displayName: String) {
-    EXEMPTED(0, "豁免"),
-    STANDARD(2, "智能"),
-    STRICT(3, "严格");
-
-    companion object {
-        fun fromInt(value: Int) = entries.find { it.value == value } ?: EXEMPTED
-    }
-}
+// [核心修复] 删除此文件中重复的 Policy enum 定义
+// enum class Policy(val value: Int, val displayName: String) { ... }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -97,7 +88,8 @@ fun ConfigurationScreen(
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-            } else {
+            } 
+            else {
                 LazyColumn(
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -105,6 +97,7 @@ fun ConfigurationScreen(
                     items(filteredApps, key = { "${it.packageName}-${it.userId}" }) { appInfo ->
                         AppPolicyItem(
                             appInfo = appInfo,
+                            // [核心修复] appInfo.policy 现在是正确的类型，不需要转换
                             policy = appInfo.policy,
                             onClick = { viewModel.onAppClicked(appInfo) }
                         )
@@ -114,7 +107,6 @@ fun ConfigurationScreen(
         }
     }
 
-    // [核心新增] Bottom Sheet 逻辑
     if (selectedApp != null) {
         ModalBottomSheet(
             onDismissRequest = { viewModel.onSheetDismiss() },
@@ -130,7 +122,6 @@ fun ConfigurationScreen(
     }
 }
 
-// [核心重构] AppPolicyItem 现在只负责显示和触发点击
 @Composable
 fun AppPolicyItem(
     appInfo: AppInfo,
@@ -187,29 +178,24 @@ fun AppPolicyItem(
     }
 }
 
-// [核心新增] BottomSheet 的内容
 @Composable
 fun AppSettingsBottomSheet(
     appInfo: AppInfo,
     onPolicyChange: (AppInfo) -> Unit
 ) {
-    // 使用 rememberUpdatedState 确保 lambda 总是最新的
     val currentOnPolicyChange by rememberUpdatedState(onPolicyChange)
     
-    // 创建一个可变的本地副本，用于UI交互
     var mutableAppInfo by remember { mutableStateOf(appInfo.copy()) }
 
     LaunchedEffect(appInfo) {
-        // 当外部传入的 appInfo 变化时，同步更新本地状态
         mutableAppInfo = appInfo.copy()
     }
 
     Column(
         modifier = Modifier
             .padding(16.dp)
-            .navigationBarsPadding() // 确保内容在导航栏之上
+            .navigationBarsPadding()
     ) {
-        // 头部信息
         Row(verticalAlignment = Alignment.CenterVertically) {
             Image(
                 painter = rememberAsyncImagePainter(model = AppIcon(mutableAppInfo.packageName)),
@@ -225,11 +211,11 @@ fun AppSettingsBottomSheet(
 
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
 
-        // 策略选择
         Text("策略模式", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
         SegmentedButtonRow(
             policy = mutableAppInfo.policy,
             onPolicySelected = { newPolicy ->
+                // [核心修复] newPolicy 现在是正确的类型，可以直接赋值
                 mutableAppInfo = mutableAppInfo.copy(policy = newPolicy)
                 currentOnPolicyChange(mutableAppInfo)
             }
@@ -237,7 +223,6 @@ fun AppSettingsBottomSheet(
 
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
 
-        // 豁免开关
         Text("精细化豁免", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
         ExemptionSwitch(
             title = "强制音频豁免",
@@ -279,6 +264,7 @@ fun AppSettingsBottomSheet(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SegmentedButtonRow(policy: Policy, onPolicySelected: (Policy) -> Unit) {
     val policies = listOf(Policy.EXEMPTED, Policy.STANDARD, Policy.STRICT)
@@ -322,9 +308,12 @@ fun ExemptionSwitch(
 
 @Composable
 private fun getPolicyLabelAndIcon(policy: Policy): Pair<String, String> {
+    // [核心修复] policy.displayName 现在可以直接使用
     return when (policy) {
         Policy.EXEMPTED -> policy.displayName to "🛡️"
         Policy.STANDARD -> policy.displayName to "⚙️"
         Policy.STRICT -> policy.displayName to "🧊"
+        // 添加一个默认分支以处理 IMPORTANCE 等情况
+        else -> policy.displayName to "🤔" 
     }
 }

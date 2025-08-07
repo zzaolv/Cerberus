@@ -1,11 +1,12 @@
 // app/src/main/java/com/crfzit/crfzit/data/model/AppModels.kt
 package com.crfzit.crfzit.data.model
 
-enum class Policy(val value: Int) {
-    EXEMPTED(0),
-    IMPORTANT(1),
-    STANDARD(2),
-    STRICT(3);
+// [核心修改] 将 displayName 添加到核心数据模型中，并为所有成员提供
+enum class Policy(val value: Int, val displayName: String) {
+    EXEMPTED(0, "豁免"),
+    IMPORTANT(1, "重要"), // 即使UI不用，也为它提供一个合理的名称
+    STANDARD(2, "智能"),
+    STRICT(3, "严格");
 
     companion object {
         fun fromInt(value: Int) = entries.find { it.value == value } ?: EXEMPTED
@@ -19,11 +20,10 @@ data class AppInfo(
     val userId: Int = 0,
 
     var policy: Policy = Policy.EXEMPTED,
-    // [核心新增] 为每个应用添加独立的豁免开关，设为 var 以便在ViewModel中直接修改
     var forcePlaybackExemption: Boolean = false,
     var forceNetworkExemption: Boolean = false,
     var forceLocationExemption: Boolean = false,
-    var allowTimedUnfreeze: Boolean = true // 默认允许定时唤醒
+    var allowTimedUnfreeze: Boolean = true
 )
 
 enum class LogLevel(val value: Int) {
@@ -59,8 +59,8 @@ data class LogEntry(
 
 data class MetricsRecord(
     val timestamp: Long,
-    val totalCpuUsagePercent: Float, // [核心修改] 重命名
-    val perCoreCpuUsagePercent: List<Float>, // [核心新增]
+    val totalCpuUsagePercent: Float,
+    val perCoreCpuUsagePercent: List<Float>,
     val memTotalKb: Long,
     val memAvailableKb: Long,
     val swapTotalKb: Long,

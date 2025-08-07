@@ -17,7 +17,8 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import com.crfzit.crfzit.ui.configuration.Policy
+// [核心修复] 导入正确的 Policy
+import com.crfzit.crfzit.data.model.Policy
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -26,8 +27,9 @@ fun MoreSettingsScreen(
     onNavigateBack: () -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    // [核心修复] 明确指定 State 的类型为可空的 Policy
     var showBulkDialog by remember { mutableStateOf<Policy?>(null) }
-    
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -62,11 +64,14 @@ fun MoreSettingsScreen(
         }
     }
 
+    // [核心修复] 检查 showBulkDialog 不为 null
     if (showBulkDialog != null) {
+        // 使用 !! 断言它不为 null，因为我们已经检查过了
         val policyToApply = showBulkDialog!!
         AlertDialog(
             onDismissRequest = { showBulkDialog = null },
             title = { Text("确认批量操作") },
+            // [核心修复] 使用 policyToApply.displayName
             text = { Text("您确定要将所有 /data/app 下的应用策略设置为'${policyToApply.displayName}'吗？此操作不可逆。") },
             confirmButton = {
                 Button(
@@ -143,6 +148,7 @@ fun BulkOperationsCard(isLoading: Boolean, appCount: Int, onApplyPolicy: (Policy
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 Button(
+                    // [核心修复] 直接使用 Policy 枚举成员
                     onClick = { onApplyPolicy(Policy.EXEMPTED) },
                     enabled = !isLoading && appCount > 0,
                     modifier = Modifier.weight(1f)
@@ -186,23 +192,23 @@ fun BeautifiedJsonText(jsonString: String) {
                 append("\":")
                 append(trimmedLine.substring(keyMatch.range.last + 1))
             } else {
-                 val stringMatch = "\"(.*)\"".toRegex().find(trimmedLine)
-                 if (stringMatch != null) {
-                     withStyle(style = SpanStyle(color = stringColor)) {
-                         append(trimmedLine)
-                     }
-                 } else {
-                     val numberMatch = "([\\d.-]+)".toRegex().find(trimmedLine)
-                     if (numberMatch != null) {
-                         withStyle(style = SpanStyle(color = numberColor)) {
-                             append(trimmedLine)
-                         }
-                     } else {
-                         withStyle(style = SpanStyle(color = defaultColor)) {
-                              append(trimmedLine)
-                         }
-                     }
-                 }
+                val stringMatch = "\"(.*)\"".toRegex().find(trimmedLine)
+                if (stringMatch != null) {
+                    withStyle(style = SpanStyle(color = stringColor)) {
+                        append(trimmedLine)
+                    }
+                } else {
+                    val numberMatch = "([\\d.-]+)".toRegex().find(trimmedLine)
+                    if (numberMatch != null) {
+                        withStyle(style = SpanStyle(color = numberColor)) {
+                            append(trimmedLine)
+                        }
+                    } else {
+                        withStyle(style = SpanStyle(color = defaultColor)) {
+                            append(trimmedLine)
+                        }
+                    }
+                }
             }
             append("\n")
         }

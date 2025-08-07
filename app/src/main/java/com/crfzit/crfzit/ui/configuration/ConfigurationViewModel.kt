@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.crfzit.crfzit.data.model.*
+// [核心修复] 确保导入的是 data.model.Policy
+import com.crfzit.crfzit.data.model.Policy
 import com.crfzit.crfzit.data.repository.AppInfoRepository
 import com.crfzit.crfzit.data.repository.DaemonRepository
 import kotlinx.coroutines.Dispatchers
@@ -22,7 +24,6 @@ data class ConfigurationUiState(
     val fullConfig: FullConfigPayload? = null,
     val searchQuery: String = "",
     val showSystemApps: Boolean = false,
-    // [核心新增] 用于控制 BottomSheet 的状态
     val selectedAppForSheet: AppInfo? = null
 )
 
@@ -80,9 +81,9 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                 }
             }
 
-            // [核心修改] 将后台策略数据同步到前端 AppInfo 对象中
             finalAppMap.values.forEach { appInfo ->
                 daemonPolicyMap[AppInstanceKey(appInfo.packageName, appInfo.userId)]?.let { policy ->
+                    // [核心修复] 这里的 Policy.fromInt 调用现在是明确且正确的
                     appInfo.policy = Policy.fromInt(policy.policy)
                     appInfo.forcePlaybackExemption = policy.forcePlaybackExemption ?: false
                     appInfo.forceNetworkExemption = policy.forceNetworkExemption ?: false
@@ -102,7 +103,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         }
     }
     
-    // [核心新增] 新的、更全面的设置更新函数
     fun setAppFullPolicy(appInfo: AppInfo) {
         val currentConfig = _uiState.value.fullConfig ?: return
 
@@ -129,7 +129,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         val newConfig = currentConfig.copy(policies = newPolicies)
         
         _uiState.update { state ->
-            // 立即更新UI状态以获得即时反馈
             val updatedApps = state.allInstalledApps.map {
                 if (it.packageName == appInfo.packageName && it.userId == appInfo.userId) appInfo else it
             }
@@ -139,7 +138,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
                 fullConfig = newConfig
             )
         }
-        // 向后台发送更新
         daemonRepository.setPolicy(newConfig)
     }
 
@@ -172,7 +170,6 @@ class ConfigurationViewModel(application: Application) : AndroidViewModel(applic
         _uiState.update { it.copy(showSystemApps = show) }
     }
     
-    // [核心新增] BottomSheet 控制
     fun onAppClicked(appInfo: AppInfo) {
         _uiState.update { it.copy(selectedAppForSheet = appInfo) }
     }
