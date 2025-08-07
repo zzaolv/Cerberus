@@ -19,7 +19,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class DaemonConnector(
     private val host: String,
     private val port: Int,
-    private val tag: String
+    private val tag: String,
+    // [修正] PID通过构造函数传入，解除对Android框架的直接依赖
+    private val pid: Int
 ) {
     // 使用单线程执行器来保证所有网络操作（连接、发送）的顺序性
     private val executor = Executors.newSingleThreadExecutor()
@@ -88,8 +90,8 @@ class DaemonConnector(
                 log("Successfully connected to daemon.")
 
                 // 发送一个 "hello" 消息，让守护进程知道我们是Probe
-                // 这个操作也放在消息队列里，以保证顺序
-                sendMessage("{\"type\":\"event.probe_hello\",\"payload\":{\"pid\":${Process.myPid()},\"version\":\"$tag\"}}")
+                // [修正] 使用构造函数传入的pid
+                sendMessage("{\"type\":\"event.probe_hello\",\"payload\":{\"pid\":$pid,\"version\":\"$tag\"}}")
 
                 // 2. 进入消息发送/读取循环
                 communicationLoop()
@@ -149,8 +151,8 @@ class DaemonConnector(
                 if (reader.ready()) {
                     val response = reader.readLine()
                     if (response != null && response.contains("probe_config_update")) {
-                        // 在这里处理从守护进程收到的配置更新
-                        ProbeHook.ConfigManager.updateConfig(response)
+                        // [修正] 直接调用顶级的 ConfigManager
+                        ConfigManager.updateConfig(response)
                     }
                 }
 

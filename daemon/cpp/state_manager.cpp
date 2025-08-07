@@ -14,7 +14,7 @@
 #include <ctime>
 #include <iomanip>
 
-#define LOG_TAG "cerberusd_state_v45_audit_fix" // 版本号更新
+#define LOG_TAG "cerberusd_state_v46_escapee_fix" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -550,8 +550,8 @@ bool StateManager::evaluate_and_execute_strategy() {
     // 步骤1：更新前后台状态
     state_has_changed |= update_foreground_state(visible_app_keys);
 
-    // 步骤2：对后台应用进行策略审计，确保它们都在监管中
-    audit_background_apps();
+    // [核心修改] 移除对 audit_background_apps 的调用，其逻辑已被合并
+    // audit_background_apps();
 
     // 步骤3：对应用内部的进程结构进行审计（例如“斩首行动”）
     if (state_has_changed) {
@@ -1446,31 +1446,6 @@ bool StateManager::tick_state_machine() {
     return changed1 || changed2;
 }
 
-// 这是您原始代码中已经存在的函数，我将它放在这里以保持文件结构的完整性
-void StateManager::audit_background_apps() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    time_t now = time(nullptr);
-
-    for (auto& [key, app] : managed_apps_) {
-        // 检查是否是需要被监管的后台应用
-        bool is_candidate = !app.is_foreground &&
-                            app.current_status == AppRuntimeState::Status::RUNNING &&
-                            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
-                            !app.pids.empty();
-
-        if (is_candidate) {
-            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它“逃逸”了
-            if (app.observation_since == 0 && app.background_since == 0) {
-                LOGW("AUDIT: Found background app %s (user %d) without active timer. Placing under observation.",
-                     app.package_name.c_str(), app.user_id);
-                logger_->log(LogLevel::INFO, "审计", "发现逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
-                app.observation_since = now;
-            }
-        }
-    }
-}
-
-
 bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
     return sys_monitor_->is_uid_playing_audio(app.uid);
 }
@@ -1874,8 +1849,12 @@ json StateManager::get_probe_config_payload() {
     return payload;
 }
 
+// [核心修改] 此函数现在是解决“逃逸”问题的核心
 bool StateManager::reconcile_process_state_full() {
     bool changed = false;
+    time_t now = time(nullptr); // 获取当前时间，用于启动观察期
+
+    // --- 阶段 1: 从 /proc 同步真实进程状态 (此部分逻辑不变) ---
     std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
@@ -1907,6 +1886,35 @@ bool StateManager::reconcile_process_state_full() {
             add_pid_to_app(pid, pkg_name, user_id, uid);
         }
     }
+
+    // --- 阶段 2: [核心新增] 主动审计和策略执行 ---
+    // 在同步完所有进程后，立即对所有后台应用进行一次审计
+    for (auto& [key, app] : managed_apps_) {
+        // 定义一个需要被监管的候选者：
+        // 1. 它不在前台
+        // 2. 它当前是“运行中”状态 (不是 STOPPED 或 FROZEN)
+        // 3. 它的策略是需要被管理的 (STANDARD 或 STRICT)
+        // 4. 它有存活的进程
+        bool is_candidate = !app.is_foreground &&
+                            app.current_status == AppRuntimeState::Status::RUNNING &&
+                            (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
+                            !app.pids.empty();
+
+        if (is_candidate) {
+            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它就是“逃逸”的应用
+            if (app.observation_since == 0 && app.background_since == 0) {
+                // 捕获到“逃逸”的应用，开始对它进行监管
+                LOGW("AUDIT [Catch]: Found an 'escaped' background app %s (user %d). Placing under observation.",
+                     app.package_name.c_str(), app.user_id);
+                logger_->log(LogLevel::INFO, "审计", "捕获到逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
+                
+                // 启动观察期计时器，将它拉回到正常的生命周期管理中
+                app.observation_since = now;
+                changed = true; // 状态已改变，需要更新UI
+            }
+        }
+    }
+
     return changed;
 }
 

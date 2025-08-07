@@ -20,11 +20,32 @@ import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-// [核心重构] 不再需要以下导入
-// import java.io.IOException
-// import java.io.OutputStreamWriter
-// import java.net.Socket
-// import java.nio.charset.StandardCharsets
+
+// [修正] 将 ConfigManager 移至顶层，作为一个独立的object
+object ConfigManager {
+    @Volatile var isBqHooked = false
+    @Volatile private var frozenUids = emptySet<Int>()
+
+    fun updateConfig(jsonString: String) {
+        try {
+            val payload = JsonParser.parseString(jsonString).asJsonObject
+                .getAsJsonObject("payload")
+                ?: return
+            if (payload.has("frozen_uids")) {
+                frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
+            }
+            if (frozenUids.isNotEmpty()) {
+                // 使用硬编码的TAG，因为无法直接从ProbeHook实例获取
+                XposedBridge.log("[CerberusProbe/Config] Config updated. Tracking ${frozenUids.size} frozen UIDs.")
+            }
+        } catch (e: Exception) {
+            XposedBridge.log("[CerberusProbe/Config] [ERROR] Failed to parse probe config: $e")
+        }
+    }
+
+    fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
+}
+
 
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -32,41 +53,16 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var nmsInstance: Any? = null
     @Volatile private var packageManager: PackageManager? = null
 
-    // [核心重构] 创建一个DaemonConnector的单例
     private lateinit var daemonConnector: DaemonConnector
 
     companion object {
-        private const val TAG = "CerberusProbe_v41_PersistentConn" // 版本号更新
+        // 版本号再次更新以反映修复
+        private const val TAG = "CerberusProbe_v42_ScopeFix"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val DAEMON_HOST = "127.0.0.1"
         private const val DAEMON_PORT = 28900
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
-
-        // [核心重构] 将 ConfigManager 移至顶层，以便 DaemonConnector 可以访问
-        object ConfigManager {
-            @Volatile var isBqHooked = false
-            @Volatile private var frozenUids = emptySet<Int>()
-
-            fun updateConfig(jsonString: String) {
-                try {
-                    // 注意：守护进程发来的配置更新消息是完整的JSON，我们需要解析它
-                    val payload = JsonParser.parseString(jsonString).asJsonObject
-                        .getAsJsonObject("payload")
-                        ?: return
-                    if (payload.has("frozen_uids")) {
-                        frozenUids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
-                    }
-                    if (frozenUids.isNotEmpty()) {
-                        XposedBridge.log("[$TAG]: Config updated. Tracking ${frozenUids.size} frozen UIDs.")
-                    }
-                } catch (e: Exception) {
-                    XposedBridge.log("[$TAG]: [ERROR] Failed to parse probe config: $e")
-                }
-            }
-
-            fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
-        }
     }
 
     private enum class WakeupType(val value: Int) {
@@ -80,12 +76,9 @@ class ProbeHook : IXposedHookLoadPackage {
         if (lpparam.packageName != "android") return
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
 
-        // [核心重构] 初始化并启动 DaemonConnector
-        daemonConnector = DaemonConnector(DAEMON_HOST, DAEMON_PORT, TAG)
+        // [修正] 在初始化DaemonConnector时，传入当前进程的PID
+        daemonConnector = DaemonConnector(DAEMON_HOST, DAEMON_PORT, TAG, Process.myPid())
         daemonConnector.start()
-
-        // 注意：probe_hello 消息现在由 DaemonConnector 自动在连接成功后发送
-        // sendEventToDaemon("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
@@ -104,21 +97,15 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // [核心重构] sendEventToDaemon 现在变得非常简单
     private fun sendEventToDaemon(type: String, payload: Any) {
-        // 创建消息模型
         val message = CerberusMessage(type = type, payload = payload)
-        // 序列化为JSON字符串
         val jsonMessage = gson.toJson(message)
-        // 交给连接器发送，无需关心连接细节
         daemonConnector.sendMessage(jsonMessage)
     }
 
     //
-    // --- 所有其他的 Hook 方法 (hookAmsLifecycle, hookNotificationService 等) 保持完全不变 ---
-    // --- 它们现在会调用新的、高效的 sendEventToDaemon 方法 ---
+    // --- 所有其他的 Hook 方法保持不变 ---
     //
-
 
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
