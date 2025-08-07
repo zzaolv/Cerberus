@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <mutex>
 #include <unistd.h>
+#include <fstream>
 
 #define LOG_TAG "cerberusd_main_v35_more_settings" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
