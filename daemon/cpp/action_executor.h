@@ -7,18 +7,16 @@
 #include <utility>
 #include <map>
 #include <mutex>
-#include <memory> // [新增]
+#include <memory>
 #include <linux/android/binder.h>
 
 using AppInstanceKey = std::pair<std::string, int>;
 
-
-
-// [新增] 前向声明 SystemMonitor 和 AdjMapper
+// 前向声明
 class SystemMonitor;
 class AdjMapper;
 
-// [新增] 定义进程角色
+// 定义进程角色
 enum class ProcessRole {
     MAIN,  // 主进程
     PUSH,  // Push进程
@@ -28,16 +26,21 @@ enum class ProcessRole {
 
 class ActionExecutor {
 public:
-    // [修改] 构造函数现在接受 SystemMonitor 和 AdjMapper
     ActionExecutor(std::shared_ptr<SystemMonitor> sys_monitor, std::shared_ptr<AdjMapper> adj_mapper);
     ~ActionExecutor();
 
+    // 冻结操作保持不变
     int freeze(const AppInstanceKey& key, const std::vector<int>& pids);
-    // [修改] unfreeze现在只负责恢复状态
-    bool unfreeze(const std::vector<int>& pids);
-    // [新增] 专门用于清理cgroup的函数
-    bool cleanup_cgroup(const AppInstanceKey& key);
+    
+    // [核心重构] unfreeze 现在是统一的、顺序正确的解冻入口
+    bool unfreeze(const AppInstanceKey& key, const std::vector<int>& pids);
+
+    // OOM 巡检方法保持不变
     void verify_and_reapply_oom_scores(const std::vector<int>& pids);
+    
+    // [新增] 移除指定PID的OOM守护记录，用于进程死亡清理
+    void remove_oom_protection_records(int pid);
+
 
 private:
     bool initialize_binder();
@@ -60,8 +63,7 @@ private:
     bool move_pids_to_default_cgroup(const std::vector<int>& pids);
     bool write_to_file(const std::string& path, const std::string& value);
 
-    // [重构] OOM Score 调整逻辑
-    // [修改] 识别所有进程的角色
+    // OOM Score 调整逻辑
     std::map<int, ProcessRole> identify_process_roles(const std::vector<int>& pids) const;
     void adjust_oom_scores(const std::vector<int>& pids, bool protect);
     std::optional<int> read_oom_score_adj(int pid);
@@ -79,9 +81,7 @@ private:
     std::map<int, int> protected_oom_scores_;
     std::mutex oom_scores_mutex_;
 
-    // [新增] 持有 SystemMonitor 的指针
     std::shared_ptr<SystemMonitor> sys_monitor_;
-    // [新增] 持有 AdjMapper 的指针
     std::shared_ptr<AdjMapper> adj_mapper_;
 };
 

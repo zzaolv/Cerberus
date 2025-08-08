@@ -58,30 +58,23 @@ struct AppRuntimeState {
     int uid = -1;
     int user_id = 0;
     std::vector<int> pids;
-    // [核心修改] AppConfig 现在直接作为成员，而不是指针
     AppConfig config;
     bool is_oom_protected = false;
-
     bool is_foreground = false;
     time_t background_since = 0;
     time_t observation_since = 0;
     time_t undetected_since = 0;
     int freeze_retry_count = 0;
-
     bool has_rogue_structure = false;
     int rogue_puppet_pid = -1;
     int rogue_master_pid = -1;
-
     bool has_logged_rogue_warning = false;
-
     int scheduled_unfreeze_idx = -1;
-
     float cpu_usage_percent = 0.0f;
     long mem_usage_kb = 0;
     long swap_usage_kb = 0;
     long long last_foreground_timestamp_ms = 0;
     long long total_runtime_ms = 0;
-
     time_t last_wakeup_timestamp = 0; 
     int wakeup_count_in_window = 0;   
     time_t last_successful_wakeup_timestamp = 0;
@@ -114,7 +107,6 @@ struct DozeProcessRecord {
 
 class StateManager {
 public:
-    // ... (构造函数和公共方法)
     StateManager(std::shared_ptr<DatabaseManager> db,
                  std::shared_ptr<SystemMonitor> sys,
                  std::shared_ptr<ActionExecutor> act,
@@ -146,17 +138,19 @@ public:
     void on_wakeup_request_from_probe(const json& payload);
     void on_signal_from_rekernel(const ReKernelSignalEvent& event);
     void on_binder_from_rekernel(const ReKernelBinderEvent& event);
-    
     void run_memory_butler_tasks();
 
 
 private:
-    // [新增] 内存健康状态
     enum class MemoryHealth {
         HEALTHY,    // > 20% 可用
         CONCERN,    // 10% - 20% 可用
         CRITICAL    // < 10% 可用
     };
+    
+    // [核心新增] 新增一个专门处理进程死亡的内部函数
+    void handle_process_death(int pid, const std::string& reason);
+
     void handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
     void generate_doze_exit_report();
     void analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record);
