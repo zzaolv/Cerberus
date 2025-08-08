@@ -3,7 +3,7 @@
 #include <android/log.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h> // [新增] For TCP_NODELAY
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
@@ -14,7 +14,7 @@
 #include <sys/select.h>
 #include <thread>
 
-#define LOG_TAG "cerberusd_tcp_v3_nodelay" // 版本号更新
+#define LOG_TAG "cerberusd_tcp_v4_safe_remove" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -63,6 +63,7 @@ void UdsServer::add_client(int client_fd) {
 }
 
 void UdsServer::remove_client(int client_fd) {
+    // 这个函数现在只应该被主线程调用
     std::lock_guard<std::mutex> lock(client_mutex_);
     auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
     if (it != client_fds_.end()) {
@@ -76,6 +77,32 @@ void UdsServer::remove_client(int client_fd) {
         }
     }
 }
+
+// [核心修复] 新增的方法，用于将客户端标记为待移除
+void UdsServer::schedule_client_removal(int client_fd) {
+    std::lock_guard<std::mutex> lock(clients_to_remove_mutex_);
+    // 防止重复添加
+    if (std::find(clients_to_remove_.begin(), clients_to_remove_.end(), client_fd) == clients_to_remove_.end()) {
+        clients_to_remove_.push_back(client_fd);
+    }
+}
+
+// [核心修复] 新增的方法，用于在主循环中安全地处理移除
+void UdsServer::process_clients_to_remove() {
+    std::vector<int> to_remove;
+    {
+        std::lock_guard<std::mutex> lock(clients_to_remove_mutex_);
+        if (clients_to_remove_.empty()) {
+            return;
+        }
+        to_remove.swap(clients_to_remove_);
+    }
+
+    for (int fd : to_remove) {
+        remove_client(fd);
+    }
+}
+
 
 void UdsServer::broadcast_message_except(const std::string& message, int excluded_fd) {
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -94,8 +121,9 @@ bool UdsServer::send_message(int client_fd, const std::string& message) {
     ssize_t bytes_sent = send(client_fd, line.c_str(), line.length(), MSG_NOSIGNAL);
     if (bytes_sent < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
-            LOGW("Send to fd %d failed (connection closed), removing client.", client_fd);
-            std::thread([this, client_fd] { this->remove_client(client_fd); }).detach();
+            LOGW("Send to fd %d failed (connection closed), scheduling for removal.", client_fd);
+            // [核心修复] 不再创建线程，而是安全地调度移除
+            schedule_client_removal(client_fd);
         } else {
             LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
         }
@@ -119,7 +147,8 @@ void UdsServer::handle_client_data(int client_fd) {
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
 
     if (bytes_read <= 0) {
-        remove_client(client_fd);
+        // [核心修复] 接收失败也通过调度来移除，而不是直接移除
+        schedule_client_removal(client_fd);
         return;
     }
 
@@ -161,6 +190,9 @@ void UdsServer::stop() {
         server_fd_ = -1;
     }
 
+    // [核心修复] 在主线程中安全关闭所有客户端
+    process_clients_to_remove(); 
+    
     std::lock_guard<std::mutex> lock(client_mutex_);
     for (int fd : client_fds_) {
         close(fd);
@@ -207,6 +239,9 @@ void UdsServer::run() {
     is_running_ = true;
 
     while (is_running_) {
+        // [核心修复] 在循环开始时，处理所有待移除的客户端
+        process_clients_to_remove();
+
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(server_fd_, &read_fds);
@@ -223,12 +258,12 @@ void UdsServer::run() {
         struct timeval tv { .tv_sec = 1, .tv_usec = 0 };
         int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
 
+        if (!is_running_) break;
         if (activity < 0) {
             if (errno == EINTR) continue;
             LOGE("select() error: %s", strerror(errno));
             break;
         }
-        if (!is_running_) break;
         if (activity == 0) continue;
 
         if (FD_ISSET(server_fd_, &read_fds)) {
@@ -236,7 +271,6 @@ void UdsServer::run() {
             socklen_t client_len = sizeof(client_addr);
             int new_socket = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (new_socket >= 0) {
-                // [通信优化] 禁用Nagle算法
                 int nodelay_opt = 1;
                 if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay_opt, sizeof(nodelay_opt)) < 0) {
                     LOGW("setsockopt(TCP_NODELAY) failed for client fd %d: %s", new_socket, strerror(errno));

@@ -40,8 +40,6 @@ class ProbeHook : IXposedHookLoadPackage {
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
 
-        // [修正] 将日志函数移动到 companion object 中，使其成为静态可访问的。
-        // 这样，内部的 CommManager 和 ConfigManager 就可以正确调用它们。
         private fun log(message: String) = XposedBridge.log("[$TAG] $message")
         private fun logError(message: String) = XposedBridge.log("[$TAG] [ERROR] $message")
     }
@@ -53,19 +51,11 @@ class ProbeHook : IXposedHookLoadPackage {
         OTHER(3)
     }
 
-    /**
-     * [核心重构] handleLoadPackage 现在只负责初始化CommManager工作线程。
-     * 所有的通信任务都被委托给CommManager，实现了异步和解耦。
-     */
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != "android") return
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
 
-        // 启动事件发送工作线程
         CommManager.start()
-
-        // 首次启动时，发送一个 "hello" 事件，这个事件会排在队列的最前面。
-        // 工作线程将处理它并获取初始配置。
         CommManager.sendEvent("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
@@ -73,6 +63,7 @@ class ProbeHook : IXposedHookLoadPackage {
             hookAmsLifecycle(classLoader)
             hookNmsConstructor(classLoader)
             hookActivitySwitchEvents(classLoader)
+            // [核心新增] 调用新的Hook方法
             hookTaskTrimming(classLoader)
             hookSystemFreezer(classLoader)
             hookAnrHelper(classLoader)
@@ -85,40 +76,28 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * [核心重构] CommManager (通信管理器)
-     * 这是一个单例对象，负责所有与守护进程的通信。
-     * 它采用 "生产者-消费者" 模型，将Hook点（生产者）与网络IO（消费者）解耦。
-     */
     private object CommManager {
-        // 使用线程安全的阻塞队列作为事件缓冲区
         private val eventQueue = LinkedBlockingQueue<Pair<String, Any>>()
         private var workerThread: Thread? = null
         private val gson = Gson()
 
-        /**
-         * 启动唯一的后台工作线程。此方法是幂等的。
-         */
         fun start() {
             if (workerThread?.isAlive == true) return
             workerThread = Thread {
                 log("CommManager worker thread started.")
                 while (true) {
                     try {
-                        // 从队列中阻塞式地获取一个事件，如果没有事件，线程会在此处休眠，不消耗CPU
                         val (type, payload) = eventQueue.take()
                         val message = CerberusMessage(type = type, payload = payload)
                         val jsonMessage = gson.toJson(message)
 
-                        // 使用短连接发送事件
                         try {
                             Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                                socket.soTimeout = 2000 // 2秒超时
+                                socket.soTimeout = 2000 
                                 OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
                                     writer.write(jsonMessage + "\n")
                                     writer.flush()
 
-                                    // 只有 "hello" 事件需要等待并处理响应，以获取初始配置
                                     if (type == "event.probe_hello") {
                                         try {
                                             socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()?.let {
@@ -131,7 +110,6 @@ class ProbeHook : IXposedHookLoadPackage {
                                 }
                             }
                         } catch (e: IOException) {
-                            // 连接被拒绝是正常情况（守护进程可能还没启动），不需要刷屏报错
                             if (e.message?.contains("ECONNREFUSED") != true) {
                                 logError("Daemon short-conn send error for '$type': ${e.message}")
                             }
@@ -139,50 +117,33 @@ class ProbeHook : IXposedHookLoadPackage {
                             logError("Unexpected error during short-conn send for '$type': $e")
                         }
                     } catch (ie: InterruptedException) {
-                        // 线程被中断，正常退出循环
                         Thread.currentThread().interrupt()
                         break
                     } catch (t: Throwable) {
                         logError("FATAL: Error in CommManager worker thread: ${t.message}")
-                        // 即使发生未知错误，也休眠一下防止CPU空转
                         Thread.sleep(1000)
                     }
                 }
                 log("CommManager worker thread stopped.")
             }.apply {
                 name = "CerberusCommThread"
-                // 降低优先级，减少对 system_server 的影响
                 priority = Thread.NORM_PRIORITY - 1
-                isDaemon = true // 设为守护线程
+                isDaemon = true
                 start()
             }
         }
 
-        /**
-         * 外部调用此方法将事件放入队列。此方法是非阻塞的，速度极快。
-         * @param type 事件类型，如 "event.app_foreground"
-         * @param payload 事件的负载数据
-         */
         fun sendEvent(type: String, payload: Any) {
-            // offer是非阻塞的，如果队列满了会返回false，但LinkedBlockingQueue默认是无界的
             eventQueue.offer(type to payload)
         }
     }
 
 
-    /**
-     * [核心重构] 所有 sendEventToDaemon 的调用都改为 CommManager.sendEvent。
-     * 这个操作非常轻量级，只是向队列中添加一个对象，不会创建线程或Socket。
-     */
     private fun sendEventToDaemon(type: String, payload: Any) {
         CommManager.sendEvent(type, payload)
     }
 
-    /**
-     * 请求唤醒UID。现在它只会调用 sendEventToDaemon，将请求放入队列。
-     */
     private fun requestWakeupForUid(uid: Int, type: WakeupType) {
-        // [核心重构] 检查UID是否被冻结的逻辑现在委托给 ConfigManager
         if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidFrozen(uid)) {
             val reason = when(type) {
                 WakeupType.FCM_PUSH -> "FCM"
@@ -194,10 +155,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-
-    // --- 其他所有 Hook 方法保持不变 ---
-    // 它们的内部逻辑（例如 hookActivitySwitchEvents）现在只会调用 CommManager.sendEvent，
-    // 这是一个非常轻量级的操作，不会再创建线程或Socket。
 
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
@@ -347,28 +304,18 @@ class ProbeHook : IXposedHookLoadPackage {
         else logError("FATAL: No NMS#enqueueNotificationInternal methods were hooked.")
     }
 
-    /**
-     * [核心重构] ConfigManager (配置管理器)
-     * 这是一个单例对象，负责存储从守护进程获取的配置。
-     * 它的状态由CommManager的后台线程安全地更新。
-     */
     private object ConfigManager {
         @Volatile var isBqHooked = false
         @Volatile private var frozenUids = emptySet<Int>()
 
-        /**
-         * 由 CommManager 的工作线程调用，用于更新配置。
-         * @param jsonString 从守护进程收到的原始JSON响应字符串
-         */
         fun updateConfig(jsonString: String) {
             try {
-                // 解析完整的响应，并提取 'payload' 部分
                 val payload = JsonParser.parseString(jsonString)
                     ?.asJsonObject?.getAsJsonObject("payload") ?: return
 
                 if (payload.has("frozen_uids")) {
                     val uids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
-                    frozenUids = uids // 原子性地替换整个Set
+                    frozenUids = uids
                 }
                 if (frozenUids.isNotEmpty()) {
                     log("Config updated. Now tracking ${frozenUids.size} frozen UIDs.")
@@ -378,17 +325,10 @@ class ProbeHook : IXposedHookLoadPackage {
             }
         }
 
-        /**
-         * 检查指定的UID是否处于被冻结状态。
-         * 这是一个只读操作，是线程安全的。
-         */
         fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
     }
 
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? = XposedHelpers.findClassIfExists(className, classLoader)
-
-    // 以下所有Hook方法的实现都保持不变，只是它们调用的 `sendEventToDaemon` 和 `ConfigManager.isUidFrozen`
-    // 现在是新架构下的高效、安全的方法。
 
     private fun hookActivitySwitchEvents(classLoader: ClassLoader) {
         findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { clazz ->
@@ -410,12 +350,17 @@ class ProbeHook : IXposedHookLoadPackage {
                 ?: logError("FATAL: Could not find ActivityManagerService#updateActivityUsageStats method!")
         } ?: logError("FATAL: Could not find com.android.server.am.ActivityManagerService class!")
     }
+
+    // [核心新增] 实现对任务修剪的 Hook，防止“白重载”
     private fun hookTaskTrimming(classLoader: ClassLoader) {
+        // 安全地查找目标类，因为它属于内部API，未来可能变动
         findClass("com.android.server.wm.RecentTasks", classLoader)?.let {
+            // 使用 XC_MethodReplacement.DO_NOTHING 完全替换该方法，使其变为空方法
             XposedBridge.hookAllMethods(it, "trimInactiveRecentTasks", XC_MethodReplacement.DO_NOTHING)
             log("SUCCESS: Hooked and disabled RecentTasks#trimInactiveRecentTasks.")
-        } ?: logError("WARN: Could not find com.android.server.wm.RecentTasks class.")
+        } ?: logError("WARN: Could not find com.android.server.wm.RecentTasks class. Task trimming prevention is disabled.")
     }
+
     private fun hookSystemFreezer(classLoader: ClassLoader) {
         findClass("com.android.server.am.CachedAppOptimizer", classLoader)?.let {
             XposedBridge.hookAllMethods(it, "useFreezer", XC_MethodReplacement.returnConstant(false))
