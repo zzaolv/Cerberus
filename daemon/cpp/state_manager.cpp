@@ -24,7 +24,6 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 const double NETWORK_THRESHOLD_KBPS = 500.0;
 
-// status_to_string 函数保持不变
 static std::string status_to_string(const AppRuntimeState& app, const MasterConfig& master_config) {
     if (app.current_status == AppRuntimeState::Status::STOPPED) return "未运行";
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
@@ -60,11 +59,11 @@ static std::string status_to_string(const AppRuntimeState& app, const MasterConf
     return "后台运行";
 }
 
-// 构造函数和 DozeManager 保持不变
 DozeManager::DozeManager(std::shared_ptr<Logger> logger, std::shared_ptr<ActionExecutor> executor)
     : logger_(logger), action_executor_(executor) {
     state_change_timestamp_ = std::chrono::steady_clock::now();
 }
+
 void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
     if (new_state == current_state_) return;
     current_state_ = new_state;
@@ -84,6 +83,7 @@ void DozeManager::enter_state(State new_state, const MetricsRecord& record) {
             break;
     }
 }
+
 DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record) {
     auto now = std::chrono::steady_clock::now();
     auto duration_in_state = std::chrono::duration_cast<std::chrono::seconds>(now - state_change_timestamp_).count();
@@ -100,14 +100,10 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
                 enter_state(State::INACTIVE, record);
             }
         } else if (current_state_ == State::INACTIVE && duration_in_state > 60) {
-             if (record.is_audio_playing || record.is_location_active) {
-                enter_state(State::IDLE, record);
-            } else {
-                enter_state(State::DEEP_DOZE, record);
+             if (record.is_audio_playing || record.is_location_active) enter_state(State::IDLE, record);
+             else enter_state(State::DEEP_DOZE, record);
         }
     }
-    }
-
     if (old_state == State::DEEP_DOZE && current_state_ != State::DEEP_DOZE) {
         auto doze_duration = std::chrono::duration_cast<std::chrono::seconds>(now - deep_doze_start_time_);
         long minutes = doze_duration.count() / 60;
@@ -124,6 +120,7 @@ DozeManager::DozeEvent DozeManager::process_metrics(const MetricsRecord& record)
 
     return DozeEvent::NONE;
 }
+
 StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
                            std::shared_ptr<SystemMonitor> sys,
                            std::shared_ptr<ActionExecutor> act,
@@ -482,153 +479,6 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
     LOGI("StateManager Initialized. Ready for warmup.");
 }
 
-// [核心修复] unfreeze_and_observe_nolock 调用统一的 unfreeze 接口
-bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupPolicy policy) {
-    cancel_timed_unfreeze(app);
-    if (app.current_status == AppRuntimeState::Status::FROZEN) {
-        std::string msg = "因 " + reason + " 而解冻";
-        logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", msg, app.package_name, app.user_id);
-        
-        // 调用统一的、顺序正确的解冻函数
-        action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
-        
-        app.current_status = AppRuntimeState::Status::RUNNING;
-        app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
-        app.is_oom_protected = false;
-        
-        time_t now = time(nullptr);
-        int observation_seconds = 0;
-        switch(policy) {
-            case WakeupPolicy::SHORT_OBSERVATION: observation_seconds = 3; break;
-            case WakeupPolicy::STANDARD_OBSERVATION: observation_seconds = 10; break;
-            case WakeupPolicy::LONG_OBSERVATION: observation_seconds = 20; break;
-            case WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND:
-                app.observation_since = 0;
-                app.background_since = 0;
-                LOGI("Smart Unfreeze: %s un-frozen by policy until next background event.", app.package_name.c_str());
-                return true;
-            default: observation_seconds = 10; break;
-        }
-        if (observation_seconds > 0) {
-            app.observation_since = now - (10 - observation_seconds);
-            LOGI("Smart Unfreeze: %s gets %ds observation for %s.", app.package_name.c_str(), observation_seconds, reason.c_str());
-        }
-        app.background_since = 0;
-        app.freeze_retry_count = 0;
-        return true;
-    } else {
-        LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
-            reason.c_str(), app.package_name.c_str(), static_cast<int>(app.current_status));
-        return false;
-    }
-}
-
-// [核心修复] 对 SIGKILL 信号返回 IGNORE
-WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event) {
-    // 对于 SIGKILL 和 SIGTERM，我们不进行干预，只清理状态
-    if (event.signal == 9 /*SIGKILL*/ || event.signal == 15 /*SIGTERM*/) {
-        return WakeupPolicy::IGNORE;
-    }
-    // 对于其他可恢复的信号，可以给予观察期
-    if (event.signal == 6 /*SIGABRT*/) {
-        LOGI("Policy: Abort/Quit signal (%d) for PID %d. Applying short observation.", event.signal, event.dest_pid);
-        return WakeupPolicy::SHORT_OBSERVATION;
-    }
-    // 默认忽略其他信号，避免不必要的唤醒
-    return WakeupPolicy::IGNORE;
-}
-
-// [核心修复] on_signal_from_rekernel 现在正确处理进程死亡
-void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
-    // 检查是否是致命信号
-    if (event.signal == 9 || event.signal == 15) {
-        std::string reason = (event.signal == 9) ? "SIGKILL" : "SIGTERM";
-        LOGW("ReKernel: Received death signal %s for pid %d (uid %d) from killer pid %d (uid %d).",
-             reason.c_str(), event.dest_pid, event.dest_uid, event.killer_pid, event.killer_uid);
-        
-        // 调用专门的清理函数，而不是尝试解冻
-        handle_process_death(event.dest_pid, "Re-Kernel " + reason);
-        return;
-    }
-
-    // --- 对于非致命信号，保留原来的唤醒逻辑 ---
-    bool state_changed = false;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        auto it = pid_to_app_map_.find(event.dest_pid);
-        if (it != pid_to_app_map_.end()) {
-            AppRuntimeState* app = it->second;
-            if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
-                if (policy == WakeupPolicy::IGNORE) return;
-
-                // 节流阀逻辑保持不变
-                const time_t now = time(nullptr);
-                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
-                else app->wakeup_count_in_window++;
-                app->last_wakeup_timestamp = now;
-                if (app->wakeup_count_in_window > 5) {
-                    LOGW("Throttling: Kernel SIGNAL for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
-                    return;
-                }
-
-                std::stringstream reason_ss;
-                reason_ss << "内核信号 " << event.signal << " (from PID " << event.killer_pid << ")";
-                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), policy)) {
-                    state_changed = true;
-                }
-            }
-        }
-    }
-    if (state_changed) {
-        broadcast_dashboard_update();
-        notify_probe_of_config_change();
-    }
-}
-
-// [新增] 实现 handle_process_death
-void StateManager::handle_process_death(int pid, const std::string& reason) {
-    bool state_changed = false;
-    AppRuntimeState* app = nullptr;
-
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        auto it = pid_to_app_map_.find(pid);
-        if (it == pid_to_app_map_.end()) {
-            LOGI("Process Death: PID %d not found in our records. Ignoring.", pid);
-            return;
-        }
-        app = it->second;
-
-        // 1. 记录日志
-        logger_->log(LogLevel::WARN, "进程消亡", "进程 " + std::to_string(pid) + " 已消亡，原因: " + reason, app->package_name, app->user_id);
-        
-        // 2. 清理 ActionExecutor 中的 OOM 记录
-        action_executor_->remove_oom_protection_records(pid);
-
-        // 3. 从 StateManager 的内部状态中移除
-        remove_pid_from_app(pid);
-
-        // 4. 检查应用是否还有其他进程，如果没有则重置应用状态
-        if (app->pids.empty()) {
-            LOGI("Process Death: App %s has no more active PIDs. Marking as STOPPED.", app->package_name.c_str());
-            app->current_status = AppRuntimeState::Status::STOPPED;
-            app->freeze_method = AppRuntimeState::FreezeMethod::NONE;
-            // 清理所有计时器
-            app->background_since = 0;
-            app->observation_since = 0;
-            cancel_timed_unfreeze(*app);
-        }
-        state_changed = true;
-    }
-
-    if (state_changed) {
-        broadcast_dashboard_update();
-        notify_probe_of_config_change();
-    }
-}
-
-
 void StateManager::reload_adj_rules() {
     LOGI("Reloading adj_rules.json by request...");
     if (adj_mapper_) {
@@ -636,6 +486,7 @@ void StateManager::reload_adj_rules() {
         logger_->log(LogLevel::EVENT, "配置", "OOM策略已从文件热重载");
     }
 }
+
 void StateManager::initial_full_scan_and_warmup() {
     LOGI("Starting initial full scan and data warmup...");
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -650,21 +501,14 @@ void StateManager::initial_full_scan_and_warmup() {
     LOGI("Warmup complete. Populated initial stats for %d running app instances.", warmed_up_count);
     logger_->log(LogLevel::EVENT, "Daemon", "启动预热完成，已填充初始数据");
 }
+
 bool StateManager::perform_staggered_stats_scan() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    if (managed_apps_.empty()) {
-        return false;
-    }
-
+    if (managed_apps_.empty()) return false;
     const int APPS_PER_TICK = 2;
     for (int i = 0; i < APPS_PER_TICK; ++i) {
-        if (next_scan_iterator_ == managed_apps_.end()) {
-            next_scan_iterator_ = managed_apps_.begin();
-        }
-        if (next_scan_iterator_ == managed_apps_.end()) {
-            break;
-        }
-
+        if (next_scan_iterator_ == managed_apps_.end()) next_scan_iterator_ = managed_apps_.begin();
+        if (next_scan_iterator_ == managed_apps_.end()) break;
         auto& app = next_scan_iterator_->second;
         if (!app.pids.empty()) {
             sys_monitor_->update_app_stats(app.pids, app.mem_usage_kb, app.swap_usage_kb, app.cpu_usage_percent);
@@ -673,6 +517,7 @@ bool StateManager::perform_staggered_stats_scan() {
     }
     return true;
 }
+
 bool StateManager::evaluate_and_execute_strategy() {
     bool state_has_changed = false;
     auto visible_app_keys = sys_monitor_->get_visible_app_keys();
@@ -683,10 +528,12 @@ bool StateManager::evaluate_and_execute_strategy() {
     }
     return state_has_changed;
 }
+
 bool StateManager::handle_top_app_change_fast() {
     auto top_pids = sys_monitor_->read_top_app_pids();
     return update_foreground_state_from_pids(top_pids);
 }
+
 void StateManager::process_new_metrics(const MetricsRecord& record) {
     update_memory_health(record);
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -713,6 +560,7 @@ void StateManager::process_new_metrics(const MetricsRecord& record) {
     }
     last_metrics_record_ = record;
 }
+
 void StateManager::update_memory_health(const MetricsRecord& record) {
     if (record.mem_total_kb <= 0) return;
     double available_mem_percent = 100.0 * static_cast<double>(record.mem_available_kb) / record.mem_total_kb;
@@ -735,12 +583,9 @@ void StateManager::update_memory_health(const MetricsRecord& record) {
         }
     }
 }
-void StateManager::run_memory_butler_tasks() {
-    // 1. 检查触发条件：必须支持、且内存状态必须为 CRITICAL
-    if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ != MemoryHealth::CRITICAL) {
-        return;
-    }
 
+void StateManager::run_memory_butler_tasks() {
+    if (!memory_butler_ || !memory_butler_->is_supported() || memory_health_ != MemoryHealth::CRITICAL) return;
     LOGI("Memory health is CRITICAL, invoking Memory Butler...");
     logger_->log(LogLevel::WARN, "内存管家", "可用内存严重不足，启动内存整理流程");
     std::vector<std::tuple<AppInstanceKey, time_t, std::vector<int>>> candidates;
@@ -784,6 +629,7 @@ void StateManager::run_memory_butler_tasks() {
         LOGI("Memory Butler finished, but no memory was advised to be cooled.");
     }
 }
+
 void StateManager::generate_doze_exit_report() {
     struct ProcessActivity {
         std::string process_name;
@@ -829,44 +675,31 @@ void StateManager::generate_doze_exit_report() {
         return;
     }
     std::vector<LogEntry> batch_log_entries;
-    long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
+    long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     batch_log_entries.push_back({now_ms, LogLevel::BATCH_PARENT, "报告", "Doze期间应用的CPU活跃时间：", "", -1});
     std::vector<AppActivitySummary> sorted_apps;
-    for (auto const& [key, val] : grouped_activities) {
-        sorted_apps.push_back(val);
-    }
-    std::sort(sorted_apps.begin(), sorted_apps.end(),
-              [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
-
+    for (auto const& [key, val] : grouped_activities) sorted_apps.push_back(val);
+    std::sort(sorted_apps.begin(), sorted_apps.end(), [](const auto& a, const auto& b) { return a.total_cpu_seconds > b.total_cpu_seconds; });
     const int REPORT_LIMIT = 7;
     int count = 0;
     for (const auto& summary : sorted_apps) {
         if (++count > REPORT_LIMIT) break;
         std::stringstream report_ss;
-        report_ss << summary.app_name << " 总计: "
-                  << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
-        
-        if (!summary.processes.empty()) {
-            report_ss << "\n包括:";
-        }
-        
-        for (const auto& proc : summary.processes) {
-            report_ss << "\n- " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
-        }
+        report_ss << summary.app_name << " 总计: " << std::fixed << std::setprecision(3) << summary.total_cpu_seconds << "s";
+        if (!summary.processes.empty()) report_ss << "\n包括:";
+        for (const auto& proc : summary.processes) report_ss << "\n- " << proc.process_name << ": " << std::fixed << std::setprecision(3) << proc.cpu_seconds << "s";
         batch_log_entries.push_back({now_ms, LogLevel::REPORT, "报告", report_ss.str(), summary.package_name, summary.user_id});
     }
     logger_->log_batch(batch_log_entries);
-}
+} // <<<<<<<<<<<<<<<<< [修正] 在这里补上了缺失的右花括号
+
 void StateManager::handle_charging_state_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (old_record.is_charging != new_record.is_charging) {
-        if (new_record.is_charging) {
-            logger_->log(LogLevel::BATTERY, "充电", "⚡️ 开始充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
-        } else {
-            logger_->log(LogLevel::BATTERY, "充电", "🔌 停止充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
+        if (new_record.is_charging) logger_->log(LogLevel::BATTERY, "充电", "⚡️ 开始充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
+        else logger_->log(LogLevel::BATTERY, "充电", "🔌 停止充电 (当前电量: " + std::to_string(new_record.battery_level) + "%)");
     }
 }
+
 void StateManager::analyze_battery_change(const MetricsRecord& old_record, const MetricsRecord& new_record) {
     if (new_record.is_charging || new_record.battery_level < 0) {
         last_battery_level_info_ = std::nullopt;
@@ -900,12 +733,11 @@ void StateManager::analyze_battery_change(const MetricsRecord& old_record, const
 
 bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::string& reason, WakeupPolicy policy) {
     cancel_timed_unfreeze(app);
-
     if (app.current_status == AppRuntimeState::Status::FROZEN) {
         std::string msg = "因 " + reason + " 而解冻";
         logger_->log(LogLevel::ACTION_UNFREEZE, "解冻", msg, app.package_name, app.user_id);
-        action_executor_->unfreeze(app.pids);
-        action_executor_->cleanup_cgroup({app.package_name, app.user_id});
+        
+        action_executor_->unfreeze({app.package_name, app.user_id}, app.pids);
         
         app.current_status = AppRuntimeState::Status::RUNNING;
         app.freeze_method = AppRuntimeState::FreezeMethod::NONE;
@@ -932,15 +764,12 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
                 observation_seconds = 10;
                 break;
         }
-
         if (observation_seconds > 0) {
             app.observation_since = now - (10 - observation_seconds);
             LOGI("Smart Unfreeze: %s gets %ds observation for %s.", app.package_name.c_str(), observation_seconds, reason.c_str());
         }
-
         app.background_since = 0;
         app.freeze_retry_count = 0;
-
         return true;
     } else {
         LOGD("UNFREEZE [%s]: Request for %s ignored. Reason: App not frozen (current state: %d).",
@@ -951,16 +780,13 @@ bool StateManager::unfreeze_and_observe_nolock(AppRuntimeState& app, const std::
 
 WakeupPolicy StateManager::decide_wakeup_policy_for_probe(WakeupPolicy event_type) {
     switch (event_type) {
-        case WakeupPolicy::FROM_FCM:
-            return WakeupPolicy::LONG_OBSERVATION;
-        case WakeupPolicy::FROM_NOTIFICATION:
-            return WakeupPolicy::SHORT_OBSERVATION;
-        case WakeupPolicy::FROM_PROBE_START:
-            return WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND;
-        default:
-            return WakeupPolicy::STANDARD_OBSERVATION;
+        case WakeupPolicy::FROM_FCM: return WakeupPolicy::LONG_OBSERVATION;
+        case WakeupPolicy::FROM_NOTIFICATION: return WakeupPolicy::SHORT_OBSERVATION;
+        case WakeupPolicy::FROM_PROBE_START: return WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND;
+        default: return WakeupPolicy::STANDARD_OBSERVATION;
     }
 }
+
 WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderEvent& event) {
     if (event.rpc_name.find("android.app.INotificationManager") != std::string::npos) {
         const std::unordered_set<int> notification_transaction_codes = { 1, 2, 7 };
@@ -970,23 +796,14 @@ WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelBinderE
         }
     }
     ignored_rpc_stats_[event.rpc_name]++;
-    LOGD("Policy: Ignoring non-whitelisted Binder event from PID %d to %d (rpc: %s, code: %d).",
-         event.from_pid, event.target_pid, event.rpc_name.c_str(), event.code);
-         
+    LOGD("Policy: Ignoring non-whitelisted Binder event from PID %d to %d (rpc: %s, code: %d).", event.from_pid, event.target_pid, event.rpc_name.c_str(), event.code);
     return WakeupPolicy::IGNORE;
 }
 
-
 WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalEvent& event) {
-    if (event.signal == 9 /*SIGKILL*/) {
-        LOGI("Policy: High-priority SIGKILL for PID %d. Applying standard observation.", event.dest_pid);
-        return WakeupPolicy::STANDARD_OBSERVATION;
+    if (event.signal == 9 /*SIGKILL*/ || event.signal == 15 /*SIGTERM*/) {
+        return WakeupPolicy::IGNORE;
     }
-    if (event.signal == 15 /*SIGTERM*/) {
-        LOGI("Policy: Termination signal for PID %d. Applying short observation.", event.dest_pid);
-        return WakeupPolicy::SHORT_OBSERVATION;
-    }
-
     if (event.signal == 6 /*SIGABRT*/) {
         LOGI("Policy: Abort/Quit signal (%d) for PID %d. Applying short observation.", event.signal, event.dest_pid);
         return WakeupPolicy::SHORT_OBSERVATION;
@@ -994,8 +811,44 @@ WakeupPolicy StateManager::decide_wakeup_policy_for_kernel(const ReKernelSignalE
     return WakeupPolicy::IGNORE;
 }
 
+void StateManager::handle_process_death(int pid, const std::string& reason) {
+    bool state_changed = false;
+    AppRuntimeState* app = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = pid_to_app_map_.find(pid);
+        if (it == pid_to_app_map_.end()) {
+            LOGI("Process Death: PID %d not found in our records. Ignoring.", pid);
+            return;
+        }
+        app = it->second;
+        logger_->log(LogLevel::WARN, "进程消亡", "进程 " + std::to_string(pid) + " 已消亡，原因: " + reason, app->package_name, app->user_id);
+        action_executor_->remove_oom_protection_records(pid);
+        remove_pid_from_app(pid);
+        if (app->pids.empty()) {
+            LOGI("Process Death: App %s has no more active PIDs. Marking as STOPPED.", app->package_name.c_str());
+            app->current_status = AppRuntimeState::Status::STOPPED;
+            app->freeze_method = AppRuntimeState::FreezeMethod::NONE;
+            app->background_since = 0;
+            app->observation_since = 0;
+            cancel_timed_unfreeze(*app);
+        }
+        state_changed = true;
+    }
+    if (state_changed) {
+        broadcast_dashboard_update();
+        notify_probe_of_config_change();
+    }
+}
 
 void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
+    if (event.signal == 9 || event.signal == 15) {
+        std::string reason = (event.signal == 9) ? "SIGKILL" : "SIGTERM";
+        LOGW("ReKernel: Received death signal %s for pid %d (uid %d) from killer pid %d (uid %d).",
+             reason.c_str(), event.dest_pid, event.dest_uid, event.killer_pid, event.killer_uid);
+        handle_process_death(event.dest_pid, "Re-Kernel " + reason);
+        return;
+    }
     bool state_changed = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1003,35 +856,24 @@ void StateManager::on_signal_from_rekernel(const ReKernelSignalEvent& event) {
         if (it != pid_to_app_map_.end()) {
             AppRuntimeState* app = it->second;
             if (app && app->current_status == AppRuntimeState::Status::FROZEN) {
-                const time_t now = time(nullptr);
-                
                 WakeupPolicy policy = decide_wakeup_policy_for_kernel(event);
                 if (policy == WakeupPolicy::IGNORE) return;
-
-                if (now - app->last_wakeup_timestamp > 60) {
-                    app->wakeup_count_in_window = 1;
-                } else {
-                    app->wakeup_count_in_window++;
-                }
+                const time_t now = time(nullptr);
+                if (now - app->last_wakeup_timestamp > 60) app->wakeup_count_in_window = 1;
+                else app->wakeup_count_in_window++;
                 app->last_wakeup_timestamp = now;
-
                 if (app->wakeup_count_in_window > 5) {
                     LOGW("Throttling: Kernel SIGNAL for %s ignored. Triggered %d times in last 60s.", app->package_name.c_str(), app->wakeup_count_in_window);
-                    logger_->log(LogLevel::WARN, "节流阀", "内核信号唤醒过于频繁，已临时忽略", app->package_name, app->user_id);
                     return;
                 }
-
                 std::stringstream reason_ss;
                 reason_ss << "内核信号 " << event.signal << " (from PID " << event.killer_pid << ")";
-                logger_->log(LogLevel::WARN, "内核事件", reason_ss.str(), app->package_name, app->user_id);
-
-                if (unfreeze_and_observe_nolock(*app, "Kernel Signal", policy)) {
+                if (unfreeze_and_observe_nolock(*app, reason_ss.str(), policy)) {
                     state_changed = true;
                 }
             }
         }
     }
-
     if (state_changed) {
         broadcast_dashboard_update();
         notify_probe_of_config_change();
@@ -1076,6 +918,7 @@ void StateManager::on_binder_from_rekernel(const ReKernelBinderEvent& event) {
         notify_probe_of_config_change();
     }
 }
+
 void StateManager::on_wakeup_request_from_probe(const json& payload) {
     bool state_changed = false;
     try {
@@ -1120,20 +963,16 @@ void StateManager::on_wakeup_request_from_probe(const json& payload) {
     }
 }
 
-
 void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& process_tree) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     for(auto& [key, app] : managed_apps_) {
         app.has_rogue_structure = false;
         app.rogue_puppet_pid = -1;
         app.rogue_master_pid = -1;
-
         if (app.is_foreground || app.pids.size() < 2) continue;
-
         for (int pid : app.pids) {
             auto it_pid = process_tree.find(pid);
             if (it_pid == process_tree.end()) continue;
-
             const auto& child_info = it_pid->second;
             if (child_info.oom_score_adj <= 0) {
                 auto it_ppid = process_tree.find(child_info.ppid);
@@ -1161,34 +1000,27 @@ void StateManager::audit_app_structures(const std::map<int, ProcessInfo>& proces
 bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
-
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (visible_app_keys == last_known_visible_app_keys_) {
             return false;
         }
-
         last_known_visible_app_keys_ = visible_app_keys;
-
         std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
         if (!current_ime_pkg.empty()) {
             last_known_visible_app_keys_.insert({current_ime_pkg, 0});
         }
-
         std::set<AppInstanceKey> prev_foreground_keys;
         for (const auto& [key, app] : managed_apps_) {
             if (app.is_foreground) prev_foreground_keys.insert(key);
         }
-
         const auto& final_foreground_keys = last_known_visible_app_keys_;
-
         time_t now = time(nullptr);
         for (auto& [key, app] : managed_apps_) {
             bool is_now_foreground = final_foreground_keys.count(key);
             if (app.is_foreground != is_now_foreground) {
                 state_has_changed = true;
                 app.is_foreground = is_now_foreground;
-
                 if (is_now_foreground) {
                     app.has_logged_rogue_warning = false;
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
@@ -1219,7 +1051,6 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
             }
         }
     }
-
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
     }
@@ -1229,10 +1060,8 @@ bool StateManager::update_foreground_state(const std::set<AppInstanceKey>& visib
 bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pids) {
     bool state_has_changed = false;
     bool probe_config_needs_update = false;
-
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-
         std::map<int, AppInstanceKey> pid_to_key_map;
         std::set<AppInstanceKey> top_app_keys;
         for (int pid : top_pids) {
@@ -1244,12 +1073,10 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
                 pid_to_key_map[pid] = key;
             }
         }
-
         std::string current_ime_pkg = sys_monitor_->get_current_ime_package();
         if (!current_ime_pkg.empty()) {
             top_app_keys.insert({current_ime_pkg, 0});
         }
-
         for (const auto& key : top_app_keys) {
             if (managed_apps_.find(key) == managed_apps_.end()) {
                 LOGI("Discovered new top app via fast path: %s (user %d). Creating state...", key.first.c_str(), key.second);
@@ -1267,25 +1094,20 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
                 }
             }
         }
-
         std::set<AppInstanceKey> prev_foreground_keys;
         for (const auto& [key, app] : managed_apps_) {
             if (app.is_foreground) prev_foreground_keys.insert(key);
         }
-
         if (top_app_keys == prev_foreground_keys && !state_has_changed) {
             return false;
         }
-
         const auto& final_foreground_keys = top_app_keys;
-        
         time_t now = time(nullptr);
         for (auto& [key, app] : managed_apps_) {
             bool is_now_foreground = final_foreground_keys.count(key);
             if (app.is_foreground != is_now_foreground) {
                 state_has_changed = true;
                 app.is_foreground = is_now_foreground;
-
                 if (is_now_foreground) {
                     app.has_logged_rogue_warning = false;
                     if (prev_foreground_keys.find(key) == prev_foreground_keys.end()) {
@@ -1316,7 +1138,6 @@ bool StateManager::update_foreground_state_from_pids(const std::set<int>& top_pi
             }
         }
     }
-
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
     }
@@ -1328,10 +1149,8 @@ void StateManager::on_app_foreground_event(const json& payload) {
         std::string package_name = payload.value("package_name", "");
         int user_id = payload.value("user_id", 0);
         if (package_name.empty()) return;
-
         LOGD("EVENT: Received foreground event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
         g_top_app_refresh_tickets = 1;
-
     } catch (const json::exception& e) {
         LOGE("Error processing foreground event: %s", e.what());
     }
@@ -1342,25 +1161,19 @@ void StateManager::on_app_background_event(const json& payload) {
         std::string package_name = payload.value("package_name", "");
         int user_id = payload.value("user_id", 0);
         if (package_name.empty()) return;
-
         LOGD("EVENT: Received background event for %s (user %d), issuing refresh ticket.", package_name.c_str(), user_id);
-
         g_top_app_refresh_tickets = 1;
-
     } catch (const json::exception& e) {
         LOGE("Error processing background event: %s", e.what());
     }
 }
-
 
 void StateManager::on_proactive_unfreeze_request(const json& payload) {
     try {
         std::string package_name = payload.value("package_name", "");
         int user_id = payload.value("user_id", 0);
         if (package_name.empty()) return;
-
         LOGD("PROACTIVE: Received unfreeze request for %s (user %d)", package_name.c_str(), user_id);
-
         std::lock_guard<std::mutex> lock(state_mutex_);
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
@@ -1383,9 +1196,7 @@ void StateManager::on_wakeup_request(const json& payload) {
         std::string package_name = payload.value("package_name", "");
         int user_id = payload.value("user_id", 0);
         if (package_name.empty()) return;
-
         LOGD("Received wakeup request for %s (user %d)", package_name.c_str(), user_id);
-
         std::lock_guard<std::mutex> lock(state_mutex_);
         AppInstanceKey key = {package_name, user_id};
         auto it = managed_apps_.find(key);
@@ -1397,7 +1208,6 @@ void StateManager::on_wakeup_request(const json& payload) {
     } catch (const json::exception& e) {
         LOGE("Error processing wakeup request: %s", e.what());
     }
-
     if (state_changed) {
         broadcast_dashboard_update();
         notify_probe_of_config_change();
@@ -1409,9 +1219,7 @@ void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     try {
         std::string package_name = payload.value("package_name", "");
         if (package_name.empty()) return;
-
         LOGD("Received temp unfreeze request by package: %s", package_name.c_str());
-
         std::lock_guard<std::mutex> lock(state_mutex_);
         bool app_found = false;
         for (auto& [key, app] : managed_apps_) {
@@ -1428,7 +1236,6 @@ void StateManager::on_temp_unfreeze_request_by_pkg(const json& payload) {
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by pkg: %s", e.what());
     }
-
     if (state_changed) {
         broadcast_dashboard_update();
         notify_probe_of_config_change();
@@ -1440,9 +1247,7 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
     try {
         int uid = payload.value("uid", -1);
         if (uid < 0) return;
-
         LOGD("Received temp unfreeze request by UID: %d", uid);
-
         std::lock_guard<std::mutex> lock(state_mutex_);
         bool app_found = false;
         for (auto& [key, app] : managed_apps_) {
@@ -1460,7 +1265,6 @@ void StateManager::on_temp_unfreeze_request_by_uid(const json& payload) {
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by uid: %s", e.what());
     }
-
     if (state_changed) {
         broadcast_dashboard_update();
         notify_probe_of_config_change();
@@ -1472,9 +1276,7 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     try {
         int pid = payload.value("pid", -1);
         if (pid < 0) return;
-
         LOGD("Received temp unfreeze request by PID: %d", pid);
-
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = pid_to_app_map_.find(pid);
         if (it != pid_to_app_map_.end()) {
@@ -1487,7 +1289,6 @@ void StateManager::on_temp_unfreeze_request_by_pid(const json& payload) {
     } catch (const json::exception& e) {
         LOGE("Error processing temp unfreeze by pid: %s", e.what());
     }
-
     if (state_changed) {
         broadcast_dashboard_update();
         notify_probe_of_config_change();
@@ -1515,7 +1316,6 @@ bool StateManager::is_app_playing_audio(const AppRuntimeState& app) {
 
 void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     if (app.pids.empty()) return;
-
     auto it = app.pids.begin();
     while (it != app.pids.end()) {
         fs::path proc_path("/proc/" + std::to_string(*it));
@@ -1529,22 +1329,18 @@ void StateManager::validate_pids_nolock(AppRuntimeState& app) {
     }
 }
 
-// [核心修改] tick_state_machine_timers 函数
 bool StateManager::tick_state_machine_timers() {
     bool changed = false;
     bool probe_config_needs_update = false;
     const int MAX_FREEZE_RETRIES = 3;
     const int RETRY_DELAY_BASE_SEC = 5;
-
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         time_t now = time(nullptr);    
-
         for (auto& [key, app] : managed_apps_) {
             if (!app.is_foreground && !app.pids.empty()) {
                 validate_pids_nolock(app);
             }
-
             if (app.is_foreground || app.config.policy == AppPolicy::EXEMPTED || app.config.policy == AppPolicy::IMPORTANT) {
                 if (app.observation_since > 0 || app.background_since > 0) {
                     app.observation_since = 0;
@@ -1554,16 +1350,12 @@ bool StateManager::tick_state_machine_timers() {
                 }
                 continue;
             }
-
             if (app.observation_since > 0 && now - app.observation_since >= 10) {
                 app.observation_since = 0;
-
                 std::vector<std::string> active_reasons;
-                // [核心修改] 应用新的豁免规则
                 if (!app.config.force_playback_exemption && is_app_playing_audio(app)) active_reasons.push_back("音频");
                 if (!app.config.force_location_exemption && sys_monitor_->is_uid_using_location(app.uid)) active_reasons.push_back("定位");
                 if (!app.config.force_network_exemption && sys_monitor_->get_cached_network_speed(app.uid).download_kbps > NETWORK_THRESHOLD_KBPS) active_reasons.push_back("网络");
-
                 if (!active_reasons.empty()) {
                     std::string reason_str;
                     for (size_t i = 0; i < active_reasons.size(); ++i) {
@@ -1575,31 +1367,25 @@ bool StateManager::tick_state_machine_timers() {
                     changed = true;
                     continue;
                 }
-
                 app.background_since = now;
                 app.freeze_retry_count = 0;
                 changed = true;
             }
-
             if (app.background_since > 0) {
                 int timeout_sec = 0;
                 if(app.config.policy == AppPolicy::STRICT) timeout_sec = 15;
                 else if(app.config.policy == AppPolicy::STANDARD) timeout_sec = master_config_.standard_timeout_sec;
                 if (app.freeze_retry_count > 0) timeout_sec += (RETRY_DELAY_BASE_SEC * app.freeze_retry_count);
-
                 if (timeout_sec > 0 && (now - app.background_since >= timeout_sec)) {
-                
                     size_t total_pids = app.pids.size();
                     std::vector<int> pids_to_freeze;
                     std::string strategy_log_msg;
-
                     if (app.pids.empty()) {
                         LOGI("Freeze skipped for %s as all its processes have died.", app.package_name.c_str());
                         app.background_since = 0;
                         app.freeze_retry_count = 0;
                         continue;
                     }
-
                     if (app.has_rogue_structure) {
                         strategy_log_msg = "检测到流氓结构，执行“斩首行动”";
                         for (int pid : app.pids) {
@@ -1612,13 +1398,10 @@ bool StateManager::tick_state_machine_timers() {
                         pids_to_freeze = app.pids;
                     }
                     size_t frozen_pids_count = pids_to_freeze.size();
-
                     logger_->log(LogLevel::INFO, "冻结", strategy_log_msg, app.package_name, app.user_id);
                     int freeze_result = action_executor_->freeze(key, app.pids);
-                    
                     std::stringstream log_msg_ss;
                     log_msg_ss << "[" << frozen_pids_count << "/" << total_pids << "] ";
-
                     switch (freeze_result) {
                         case 0:
                             app.current_status = AppRuntimeState::Status::FROZEN;
@@ -1662,7 +1445,6 @@ bool StateManager::tick_state_machine_timers() {
             }
         }
     }
-
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
     }
@@ -1682,7 +1464,6 @@ void StateManager::cancel_timed_unfreeze(AppRuntimeState& app) {
 }
 
 void StateManager::schedule_timed_unfreeze(AppRuntimeState& app) {
-    // 检查全局开关和单个应用的开关
     if (!master_config_.is_timed_unfreeze_enabled || !app.config.allow_timed_unfreeze || master_config_.timed_unfreeze_interval_sec <= 0 || app.uid < 0) {
         return;
     }
@@ -1737,16 +1518,12 @@ bool StateManager::perform_deep_scan() {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-
         changed = reconcile_process_state_full();
-
         time_t now = time(nullptr);
-
         for (auto& [key, app] : managed_apps_) {
             if (app.current_status == AppRuntimeState::Status::FROZEN && !app.pids.empty()) {
                 action_executor_->verify_and_reapply_oom_scores(app.pids);
             }
-
             if (app.pids.empty() && app.current_status != AppRuntimeState::Status::STOPPED) {
                 if (app.undetected_since == 0) {
                     app.undetected_since = now;
@@ -1776,44 +1553,35 @@ bool StateManager::perform_deep_scan() {
     return changed;
 }
 
-// [核心修改] on_config_changed_from_ui 函数
 bool StateManager::on_config_changed_from_ui(const json& payload) {
     bool probe_config_needs_update = false;
-
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!payload.contains("policies")) return false;
-
         LOGI("Applying new configuration from UI...");
-        
         std::vector<AppConfig> new_configs;
         for (const auto& policy_item : payload["policies"]) {
             AppConfig new_config;
             new_config.package_name = policy_item.value("package_name", "");
             new_config.user_id = policy_item.value("user_id", 0);
             new_config.policy = static_cast<AppPolicy>(policy_item.value("policy", 0));
-            // [核心修改] 解析新的豁免字段
             new_config.force_playback_exemption = policy_item.value("force_playback_exemption", false);
             new_config.force_network_exemption = policy_item.value("force_network_exemption", false);
             new_config.force_location_exemption = policy_item.value("force_location_exemption", false);
             new_config.allow_timed_unfreeze = policy_item.value("allow_timed_unfreeze", true);
-
             if (!new_config.package_name.empty()) {
                 new_configs.push_back(new_config);
             }
         }
-
         if (!db_manager_->update_all_app_policies(new_configs)) {
             LOGE("Failed to apply new configuration atomically. Old config remains.");
             return false;
         }
-
         for (const auto& new_config : new_configs) {
             AppRuntimeState* app = get_or_create_app_state(new_config.package_name, new_config.user_id);
             if (app) {
                 bool policy_changed = app->config.policy != new_config.policy;
-                app->config = new_config; // 直接用新的完整配置覆盖
-
+                app->config = new_config;
                 if (policy_changed && app->current_status == AppRuntimeState::Status::FROZEN && (new_config.policy == AppPolicy::EXEMPTED || new_config.policy == AppPolicy::IMPORTANT)) {
                      if (unfreeze_and_observe_nolock(*app, "策略变更", WakeupPolicy::UNFREEZE_UNTIL_BACKGROUND)) {
                          probe_config_needs_update = true;
@@ -1824,13 +1592,11 @@ bool StateManager::on_config_changed_from_ui(const json& payload) {
         logger_->log(LogLevel::EVENT, "配置", "应用策略已从UI原子化更新");
         LOGI("New configuration applied atomically.");
     }
-
     if (probe_config_needs_update) {
         notify_probe_of_config_change();
     }
     return true;
 }
-
 
 json StateManager::get_dashboard_payload() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1846,7 +1612,6 @@ json StateManager::get_dashboard_payload() {
     } else {
         payload["global_stats"] = json::object();
     }
-
     json apps_state = json::array();
     for (auto& [key, app] : managed_apps_) {
         if (app.pids.empty() && app.current_status == AppRuntimeState::Status::STOPPED) {
@@ -1891,7 +1656,6 @@ json StateManager::get_full_config_for_ui() {
     response["exempt_config"] = {{"exempt_foreground_services", true}};
     json policies = json::array();
     for (const auto& config : all_db_configs) {
-        // [核心修改] 序列化新的豁免字段
         policies.push_back({
             {"package_name", config.package_name},
             {"user_id", config.user_id},
@@ -1911,7 +1675,6 @@ json StateManager::get_probe_config_payload() {
     json payload = get_full_config_for_ui();
     json frozen_uids = json::array();
     json frozen_pids = json::array();
-
     for (const auto& [key, app] : managed_apps_) {
         if (app.current_status == AppRuntimeState::Status::FROZEN) {
             if (app.uid != -1) {
@@ -1927,12 +1690,9 @@ json StateManager::get_probe_config_payload() {
     return payload;
 }
 
-// [核心修改] 此函数现在是解决“逃逸”问题的核心
 bool StateManager::reconcile_process_state_full() {
     bool changed = false;
-    time_t now = time(nullptr); // 获取当前时间，用于启动观察期
-
-    // --- 阶段 1: 从 /proc 同步真实进程状态 (此部分逻辑不变) ---
+    time_t now = time(nullptr);
     std::unordered_map<int, std::tuple<std::string, int, int>> current_pids;
     for (const auto& entry : fs::directory_iterator("/proc")) {
         if (!entry.is_directory()) continue;
@@ -1945,7 +1705,6 @@ bool StateManager::reconcile_process_state_full() {
             }
         } catch (...) { continue; }
     }
-
     std::vector<int> dead_pids;
     for(const auto& [pid, app_ptr] : pid_to_app_map_) {
         if (current_pids.find(pid) == current_pids.end()) {
@@ -1956,7 +1715,6 @@ bool StateManager::reconcile_process_state_full() {
         changed = true;
         for (int pid : dead_pids) remove_pid_from_app(pid);
     }
-
     for(const auto& [pid, info_tuple] : current_pids) {
         if (pid_to_app_map_.find(pid) == pid_to_app_map_.end()) {
             changed = true;
@@ -1964,35 +1722,21 @@ bool StateManager::reconcile_process_state_full() {
             add_pid_to_app(pid, pkg_name, user_id, uid);
         }
     }
-
-    // --- 阶段 2: [核心新增] 主动审计和策略执行 ---
-    // 在同步完所有进程后，立即对所有后台应用进行一次审计
     for (auto& [key, app] : managed_apps_) {
-        // 定义一个需要被监管的候选者：
-        // 1. 它不在前台
-        // 2. 它当前是“运行中”状态 (不是 STOPPED 或 FROZEN)
-        // 3. 它的策略是需要被管理的 (STANDARD 或 STRICT)
-        // 4. 它有存活的进程
         bool is_candidate = !app.is_foreground &&
                             app.current_status == AppRuntimeState::Status::RUNNING &&
                             (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) &&
                             !app.pids.empty();
-
         if (is_candidate) {
-            // 如果它是一个合格的候选者，但没有任何计时器在运行，说明它就是“逃逸”的应用
             if (app.observation_since == 0 && app.background_since == 0) {
-                // 捕获到“逃逸”的应用，开始对它进行监管
                 LOGW("AUDIT [Catch]: Found an 'escaped' background app %s (user %d). Placing under observation.",
                      app.package_name.c_str(), app.user_id);
                 logger_->log(LogLevel::INFO, "审计", "捕获到逃逸的后台应用，已置于观察期", app.package_name, app.user_id);
-                
-                // 启动观察期计时器，将它拉回到正常的生命周期管理中
                 app.observation_since = now;
-                changed = true; // 状态已改变，需要更新UI
+                changed = true;
             }
         }
     }
-
     return changed;
 }
 
@@ -2006,7 +1750,6 @@ void StateManager::load_all_configs() {
 std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user_id) {
     constexpr int PER_USER_RANGE = 100000;
     uid = -1; user_id = -1;
-
     char path_buffer[64];
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d", pid);
     struct stat st;
@@ -2014,23 +1757,18 @@ std::string StateManager::get_package_name_from_pid(int pid, int& uid, int& user
     uid = st.st_uid;
     if (uid < 10000) return "";
     user_id = uid / PER_USER_RANGE;
-
     snprintf(path_buffer, sizeof(path_buffer), "/proc/%d/cmdline", pid);
     std::ifstream cmdline_file(path_buffer);
     if (!cmdline_file.is_open()) return "";
-
     std::string cmdline;
     std::getline(cmdline_file, cmdline, '\0');
-
     if (cmdline.empty() || cmdline.find('.') == std::string::npos) {
         return "";
     }
-
     size_t colon_pos = cmdline.find(':');
     if (colon_pos != std::string::npos) {
         return cmdline.substr(0, colon_pos);
     }
-
     return cmdline;
 }
 
@@ -2039,12 +1777,10 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
     if (it != managed_apps_.end()) return &it->second;
-
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
     new_state.app_name = package_name;
-
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
     if (config_opt) {
         new_state.config = *config_opt;
@@ -2057,7 +1793,6 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         }
         db_manager_->set_app_config(new_state.config);
     }
-
     new_state.current_status = AppRuntimeState::Status::STOPPED;
     auto [map_iterator, success] = managed_apps_.emplace(key, new_state);
     return &map_iterator->second;
@@ -2067,7 +1802,6 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
     if (app->uid == -1) app->uid = uid;
-
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
         if (!friendly_name.empty()) {
@@ -2079,7 +1813,6 @@ void StateManager::add_pid_to_app(int pid, const std::string& package_name, int 
             }
         }
     }
-
     if (std::find(app->pids.begin(), app->pids.end(), pid) == app->pids.end()) {
         app->pids.push_back(pid);
         pid_to_app_map_[pid] = app;
