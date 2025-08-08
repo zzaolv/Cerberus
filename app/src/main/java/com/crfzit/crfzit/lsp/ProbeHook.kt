@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.os.Build
 import android.os.Process
 import com.crfzit.crfzit.data.model.CerberusMessage
 import com.google.gson.Gson
@@ -33,7 +34,7 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var packageManager: PackageManager? = null
 
     companion object {
-        private const val TAG = "CerberusProbe_v42_AsyncComm"
+        private const val TAG = "CerberusProbe_v51_Diag" // 版本更新
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val DAEMON_HOST = "127.0.0.1"
         private const val DAEMON_PORT = 28900
@@ -48,6 +49,7 @@ class ProbeHook : IXposedHookLoadPackage {
         GENERIC_NOTIFICATION(0),
         FCM_PUSH(1),
         PROACTIVE_START(2),
+        BINDER_TRANSACTION(4),
         OTHER(3)
     }
 
@@ -56,14 +58,12 @@ class ProbeHook : IXposedHookLoadPackage {
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
 
         CommManager.start()
-        CommManager.sendEvent("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
             hookAmsLifecycle(classLoader)
             hookNmsConstructor(classLoader)
             hookActivitySwitchEvents(classLoader)
-            // [核心新增] 调用新的Hook方法
             hookTaskTrimming(classLoader)
             hookSystemFreezer(classLoader)
             hookAnrHelper(classLoader)
@@ -71,6 +71,11 @@ class ProbeHook : IXposedHookLoadPackage {
             hookActivityStarter(classLoader)
             hookNotificationService(classLoader)
             hookServices(classLoader)
+            hookOomAdjustments(classLoader)
+            hookPhantomProcessKiller(classLoader)
+            hookExcessivePowerUsage(classLoader)
+            hookMiuiGreezeManager(classLoader)
+            hookOplusHansManager(classLoader)
         } catch (t: Throwable) {
             logError("CRITICAL: Failed during hook placement: $t")
         }
@@ -85,46 +90,28 @@ class ProbeHook : IXposedHookLoadPackage {
             if (workerThread?.isAlive == true) return
             workerThread = Thread {
                 log("CommManager worker thread started.")
-                while (true) {
+
+                var initialConfigFetched = false
+                for (i in 1..5) { 
+                    if (fetchInitialConfig()) {
+                        initialConfigFetched = true
+                        break
+                    }
+                    logError("Failed to fetch initial config, retrying in ${i * 2} seconds...")
                     try {
-                        val (type, payload) = eventQueue.take()
-                        val message = CerberusMessage(type = type, payload = payload)
-                        val jsonMessage = gson.toJson(message)
-
-                        try {
-                            Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                                socket.soTimeout = 2000 
-                                OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
-                                    writer.write(jsonMessage + "\n")
-                                    writer.flush()
-
-                                    if (type == "event.probe_hello") {
-                                        try {
-                                            socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()?.let {
-                                                ConfigManager.updateConfig(it)
-                                            }
-                                        } catch (e: Exception) {
-                                            logError("Failed to read config response after hello: $e")
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (e: IOException) {
-                            if (e.message?.contains("ECONNREFUSED") != true) {
-                                logError("Daemon short-conn send error for '$type': ${e.message}")
-                            }
-                        } catch (e: Exception) {
-                            logError("Unexpected error during short-conn send for '$type': $e")
-                        }
-                    } catch (ie: InterruptedException) {
+                        Thread.sleep(i * 2000L)
+                    } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
                         break
-                    } catch (t: Throwable) {
-                        logError("FATAL: Error in CommManager worker thread: ${t.message}")
-                        Thread.sleep(1000)
                     }
                 }
-                log("CommManager worker thread stopped.")
+
+                if (!initialConfigFetched) {
+                    logError("FATAL: Could not fetch initial config after multiple retries. Probe functionality will be severely degraded.")
+                }
+
+                processEventQueue()
+
             }.apply {
                 name = "CerberusCommThread"
                 priority = Thread.NORM_PRIORITY - 1
@@ -132,30 +119,353 @@ class ProbeHook : IXposedHookLoadPackage {
                 start()
             }
         }
-
+        
         fun sendEvent(type: String, payload: Any) {
             eventQueue.offer(type to payload)
         }
+
+        private fun fetchInitialConfig(): Boolean {
+            val helloPayload = mapOf("pid" to Process.myPid(), "version" to TAG)
+            val helloMessage = CerberusMessage(type = "event.probe_hello", payload = helloPayload)
+            val jsonMessage = gson.toJson(helloMessage)
+
+            return try {
+                Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
+                    socket.soTimeout = 5000 
+
+                    OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
+                        writer.write(jsonMessage + "\n")
+                        writer.flush()
+                        log("Sent probe hello, waiting for config response...")
+
+                        socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()?.let { response ->
+                            val responseJson = try {
+                                JsonParser.parseString(response).asJsonObject
+                            } catch (e: Exception) {
+                                logError("Failed to parse config response as JSON: $response")
+                                return false
+                            }
+
+                            if (responseJson.has("type") && responseJson.get("type").asString == "resp.probe_hello") {
+                                log("Received valid 'resp.probe_hello'. Updating config.")
+                                ConfigManager.updateConfig(response)
+                                return true
+                            } else {
+                                logError("Received unexpected response type: ${responseJson.get("type")?.asString ?: "null"}")
+                                return false
+                            }
+                        } ?: run {
+                            logError("Daemon closed connection without sending config.")
+                            return false
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                logError("Exception during initial config fetch: ${e.javaClass.simpleName} - ${e.message}")
+                return false
+            }
+        }
+
+        private fun processEventQueue() {
+            log("Entering event processing loop.")
+            while (true) {
+                try {
+                    val (type, payload) = eventQueue.take()
+                    val message = CerberusMessage(type = type, payload = payload)
+                    val jsonMessage = gson.toJson(message)
+
+                    try {
+                        Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
+                            socket.soTimeout = 2000
+                            OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
+                                writer.write(jsonMessage + "\n")
+                                writer.flush()
+                            }
+                        }
+                    } catch (e: IOException) {
+                        if (e.message?.contains("ECONNREFUSED") != true) {
+                            logError("Daemon short-conn send error for '$type': ${e.message}")
+                        }
+                    } catch (e: Exception) {
+                        logError("Unexpected error during short-conn send for '$type': $e")
+                    }
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                } catch (t: Throwable) {
+                    logError("FATAL: Error in CommManager event queue: ${t.message}")
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) {}
+                }
+            }
+            log("CommManager worker thread stopped.")
+        }
     }
 
+    private object ConfigManager {
+        @Volatile var isBqHooked = false
+        @Volatile private var frozenUids = emptySet<Int>()
 
-    private fun sendEventToDaemon(type: String, payload: Any) {
-        CommManager.sendEvent(type, payload)
+        fun updateConfig(jsonString: String) {
+            try {
+                val payload = JsonParser.parseString(jsonString)
+                    ?.asJsonObject?.getAsJsonObject("payload") ?: return
+                if (payload.has("frozen_uids")) {
+                    val uids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
+                    frozenUids = uids
+                    // [DIAGNOSTIC] 打印收到的冻结名单信息
+                    val uidsToPrint = if (uids.size > 10) uids.take(10).joinToString() + "..." else uids.joinToString()
+                    log("Config updated. Now tracking ${frozenUids.size} frozen UIDs. Sample: [$uidsToPrint]")
+                }
+            } catch (e: Exception) {
+                logError("Failed to parse probe config: $e")
+            }
+        }
+        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
+        
+        // [DIAGNOSTIC] 提供一个获取当前名单大小的方法，用于日志打印
+        fun getFrozenUidsCount(): Int = frozenUids.size
     }
 
+    private fun findAndHookBroadcastMethod(concreteBqClass: Class<*>) {
+        val classLoader = concreteBqClass.classLoader ?: run {
+            logError("FATAL: ClassLoader for ${concreteBqClass.name} is null!")
+            return
+        }
+        val brClass = findClass("com.android.server.am.BroadcastRecord", classLoader) ?: run {
+            logError("FATAL: Could not find BroadcastRecord class!")
+            return
+        }
+        val ignorableSystemActions = setOf(
+            Intent.ACTION_SCREEN_ON,
+            Intent.ACTION_SCREEN_OFF,
+            Intent.ACTION_TIME_TICK,
+            Intent.ACTION_TIMEZONE_CHANGED,
+            Intent.ACTION_CONFIGURATION_CHANGED,
+            "android.net.conn.CONNECTIVITY_CHANGE"
+        )
+        val hook = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                // [DIAGNOSTIC] 在每次广播处理前，打印当前已知的冻结名单大小
+                log("Broadcast check. Current frozen UID count: ${ConfigManager.getFrozenUidsCount()}")
+
+                try {
+                    val record = param.args.firstOrNull { it != null && brClass.isInstance(it) } ?: return
+                    val intent = XposedHelpers.getObjectField(record, "intent") as? Intent ?: return
+                    val receiversList = XposedHelpers.getObjectField(record, "receivers") as? ArrayList<*> ?: return
+                    if (isGcmOrFcmIntent(intent)) {
+                        intent.flags = intent.flags or FLAG_INCLUDE_STOPPED_PACKAGES
+                        receiversList.forEach { receiver ->
+                            try {
+                                val uid = getUidFromReceiver(receiver)
+                                uid?.let { requestWakeupForUid(it, WakeupType.FCM_PUSH) }
+                            } catch (ignored: Throwable) {}
+                        }
+                        return
+                    }
+                    val action = intent.action
+                    if (action in ignorableSystemActions) {
+                        val originalSize = receiversList.size
+                        if (originalSize == 0) return
+                        receiversList.removeIf { receiver ->
+                            try {
+                                val uid = getUidFromReceiver(receiver)
+                                if (uid != null && ConfigManager.isUidFrozen(uid)) {
+                                    log("FILTER: Blocking broadcast '$action' to FROZEN UID $uid.")
+                                    return@removeIf true
+                                }
+                            } catch (ignored: Throwable) {}
+                            false
+                        }
+                        if (receiversList.size < originalSize) {
+                            log("Filtered ${originalSize - receiversList.size} frozen receivers for broadcast '$action'.")
+                            if (receiversList.isEmpty()) {
+                                log("All receivers for '$action' were frozen. Aborting broadcast.")
+                                param.result = null
+                            }
+                        }
+                    }
+                } catch (t: Throwable) { logError("Error in BroadcastQueue hook: ${t.message}") }
+            }
+        }
+        val potentialMethodNames = listOf("processNextBroadcast", "processNextBroadcastLocked", "scheduleReceiverLocked", "scheduleReceiverColdLocked")
+        var hookedCount = 0
+        for (methodName in potentialMethodNames) {
+            concreteBqClass.declaredMethods.filter { it.name == methodName }.forEach {
+                try {
+                    XposedBridge.hookMethod(it, hook)
+                    log("SUCCESS: Hooked ${concreteBqClass.simpleName}#${it.name} for broadcast filtering & wakeup.")
+                    hookedCount++
+                } catch (t: Throwable) {
+                    log("WARN: Failed to hook ${concreteBqClass.simpleName}#${it.name}: ${t.message}")
+                }
+            }
+        }
+        if (hookedCount == 0) {
+            logError("FATAL: Could not hook any broadcast processing method in ${concreteBqClass.name}.")
+        }
+    }
+    
+    // ... 其他所有未修改的函数保持原样 ...
+    private fun hookMiuiGreezeManager(classLoader: ClassLoader) {
+        findClass("com.miui.server.greeze.GreezeManagerService", classLoader)?.let { clazz ->
+            log("Found MIUI GreezeManagerService, attempting to hook.")
+            try {
+                val paramTypes = if (Build.VERSION.SDK_INT > Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    arrayOf(Int::class.java, Int::class.java, Int::class.java, Int::class.java, Int::class.java, Boolean::class.java, Long::class.java, Int::class.java, Int::class.java)
+                } else {
+                    arrayOf(Int::class.java, Int::class.java, Int::class.java, Int::class.java, Int::class.java, Boolean::class.java, Long::class.java, Int::class.java)
+                }
+
+                XposedHelpers.findAndHookMethod(clazz, "reportBinderTrans", *paramTypes, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val isOneway = param.args[5] as Boolean
+                            if (isOneway) return
+
+                            val dstUid = param.args[0] as Int
+                            if (dstUid >= Process.FIRST_APPLICATION_UID) {
+                                log("MIUI_COMPAT: reportBinderTrans for UID $dstUid. Requesting wakeup.")
+                                requestWakeupForUid(dstUid, WakeupType.BINDER_TRANSACTION)
+                            }
+                        } catch (t: Throwable) {
+                            logError("Error in MIUI GreezeManager hook: ${t.message}")
+                        }
+                    }
+                })
+                log("SUCCESS: Hooked MIUI GreezeManagerService#reportBinderTrans for compatibility.")
+            } catch (t: Throwable) {
+                logError("Failed to hook MIUI GreezeManagerService: ${t.message}")
+            }
+        } ?: log("INFO: MIUI GreezeManagerService not found (this is normal on non-MIUI systems).")
+    }
+    private fun hookOplusHansManager(classLoader: ClassLoader) {
+        findClass("com.android.server.am.OplusHansManager", classLoader)?.let { clazz ->
+            log("Found OplusHansManager, attempting to hook.")
+            val unfreezeHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    try {
+                        val type = param.args.find { it is Int && it == 1 } as? Int
+                        if (type == null) {
+                            return
+                        }
+                        var targetUid: Int? = null
+                        for (arg in param.args) {
+                            if (arg is Int && arg >= Process.FIRST_APPLICATION_UID) {
+                                targetUid = arg
+                                break
+                            }
+                        }
+
+                        if (targetUid != null) {
+                            log("OPLUS_COMPAT: unfreezeForKernel (Sync Binder) for UID $targetUid. Requesting wakeup.")
+                            requestWakeupForUid(targetUid, WakeupType.BINDER_TRANSACTION)
+                        }
+                    } catch (t: Throwable) {
+                        logError("Error in dynamic OplusHansManager hook: ${t.message}")
+                    }
+                }
+            }
+            var hookedCount = 0
+            clazz.declaredMethods.filter { it.name == "unfreezeForKernel" }.forEach { method ->
+                try {
+                    XposedBridge.hookMethod(method, unfreezeHook)
+                    hookedCount++
+                } catch (t: Throwable) {
+                    logError("Failed to hook a variant of unfreezeForKernel: ${t.message}")
+                }
+            }
+
+            if (hookedCount > 0) {
+                log("SUCCESS: Hooked $hookedCount variant(s) of OplusHansManager#unfreezeForKernel for compatibility.")
+            } else {
+                logError("Failed to hook any unfreezeForKernel method in OplusHansManager.")
+            }
+
+        } ?: log("INFO: OplusHansManager not found (this is normal on non-OplusOS systems).")
+    }
+    private fun hookPhantomProcessKiller(classLoader: ClassLoader) {
+        findClass("com.android.server.am.PhantomProcessList", classLoader)?.let { clazz ->
+            try {
+                val method = clazz.declaredMethods.find { it.name == "updateProcessCpuStatesLocked" }
+                if (method != null) {
+                    XposedBridge.hookMethod(method, XC_MethodReplacement.DO_NOTHING)
+                    log("SUCCESS: Hooked and disabled PhantomProcessList#updateProcessCpuStatesLocked.")
+                } else {
+                    logError("WARN: Could not find PhantomProcessList#updateProcessCpuStatesLocked method.")
+                }
+            } catch (t: Throwable) {
+                logError("Failed to hook PhantomProcessList: ${t.message}")
+            }
+        } ?: log("INFO: Did not find com.android.server.am.PhantomProcessList (normal on older Android).")
+    }
+    private fun hookExcessivePowerUsage(classLoader: ClassLoader) {
+        findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { clazz ->
+            try {
+                val method = clazz.declaredMethods.find { it.name == "checkExcessivePowerUsageLPr" }
+                if (method != null) {
+                    XposedBridge.hookMethod(method, XC_MethodReplacement.returnConstant(false))
+                    log("SUCCESS: Hooked and disabled AMS#checkExcessivePowerUsageLPr.")
+                } else {
+                    log("INFO: Did not find AMS#checkExcessivePowerUsageLPr method (may vary by ROM).")
+                }
+            } catch (t: Throwable) {
+                logError("Failed to hook AMS#checkExcessivePowerUsageLPr: ${t.message}")
+            }
+        }
+    }
+    private fun hookOomAdjustments(classLoader: ClassLoader) {
+        try {
+            val processListClass = findClass("com.android.server.am.ProcessList", classLoader)
+                ?: run {
+                    logError("FATAL: Could not find com.android.server.am.ProcessList class!")
+                    return
+                }
+
+            val setOomAdjHook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    try {
+                        val pid = param.args[0] as Int
+                        val uid = param.args[1] as Int
+                        val newAdj = param.args[2] as Int
+
+                        if (uid < Process.FIRST_APPLICATION_UID) return
+
+                        if (ConfigManager.isUidFrozen(uid)) {
+                            log("DEFENSE: System tried to set oom_adj of our FROZEN UID $uid to $newAdj. BLOCKED.")
+                            param.result = null
+                        }
+                    } catch (t: Throwable) {
+                        logError("Error in setOomAdj hook: ${t.message}")
+                    }
+                }
+            }
+
+            processListClass.declaredMethods.filter { it.name == "setOomAdj" }.forEach { method ->
+                try {
+                    XposedBridge.hookMethod(method, setOomAdjHook)
+                    log("SUCCESS: Hooked ${method.name} in ProcessList for smart oom_adj defense.")
+                } catch (t: Throwable) {
+                    logError("Failed to hook a variant of setOomAdj: ${t.message}")
+                }
+            }
+
+        } catch (t: Throwable) {
+            logError("Could not hook OOM adjustments: ${t.message}")
+        }
+    }
+    private fun sendEventToDaemon(type: String, payload: Any) { CommManager.sendEvent(type, payload) }
     private fun requestWakeupForUid(uid: Int, type: WakeupType) {
         if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidFrozen(uid)) {
             val reason = when(type) {
                 WakeupType.FCM_PUSH -> "FCM"
                 WakeupType.GENERIC_NOTIFICATION -> "Notification"
+                WakeupType.BINDER_TRANSACTION -> "Binder"
                 else -> "Wakeup"
             }
             log("WAKEUP: Requesting temporary unfreeze for UID $uid, Reason: $reason")
             sendEventToDaemon("event.app_wakeup_request_v2", mapOf("uid" to uid, "type_int" to type.value))
         }
     }
-
-
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
@@ -200,49 +510,15 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Could not hook AMS lifecycle for dynamic BQ hooking: ${t.message}")
         }
     }
-    private fun findAndHookBroadcastMethod(concreteBqClass: Class<*>) {
-        val classLoader = concreteBqClass.classLoader ?: run {
-            logError("FATAL: ClassLoader for ${concreteBqClass.name} is null!")
-            return
+    private fun getUidFromReceiver(receiver: Any?): Int? {
+        if (receiver == null) return null
+        (XposedHelpers.getObjectField(receiver, "app") as? Any)?.let { processRecord ->
+            return XposedHelpers.getIntField(processRecord, "uid")
         }
-        val brClass = findClass("com.android.server.am.BroadcastRecord", classLoader) ?: run {
-            logError("FATAL: Could not find BroadcastRecord class!")
-            return
+        (receiver as? ResolveInfo)?.activityInfo?.applicationInfo?.uid?.let {
+            return it
         }
-        val hook = object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    val record = param.args.firstOrNull { it != null && brClass.isInstance(it) } ?: return
-                    val intent = XposedHelpers.getObjectField(record, "intent") as? Intent ?: return
-                    if (isGcmOrFcmIntent(intent)) {
-                        intent.flags = intent.flags or FLAG_INCLUDE_STOPPED_PACKAGES
-                        (XposedHelpers.getObjectField(record, "receivers") as? List<*>)?.forEach { receiver ->
-                            try {
-                                val uid = (XposedHelpers.getObjectField(receiver, "app") as? Any)?.let { XposedHelpers.getIntField(it, "uid") }
-                                    ?: (receiver as? ResolveInfo)?.activityInfo?.applicationInfo?.uid
-                                uid?.let { requestWakeupForUid(it, WakeupType.FCM_PUSH) }
-                            } catch (ignored: Throwable) {}
-                        }
-                    }
-                } catch (t: Throwable) { logError("Error in BroadcastQueue hook: ${t.message}") }
-            }
-        }
-        val potentialMethodNames = listOf("processNextBroadcast", "processNextBroadcastLocked", "scheduleReceiverLocked", "scheduleReceiverColdLocked")
-        var hookedCount = 0
-        for (methodName in potentialMethodNames) {
-            concreteBqClass.declaredMethods.filter { it.name == methodName }.forEach {
-                try {
-                    XposedBridge.hookMethod(it, hook)
-                    log("SUCCESS: Hooked ${concreteBqClass.simpleName}#${it.name} for robust FCM capture.")
-                    hookedCount++
-                } catch (t: Throwable) {
-                    log("WARN: Failed to hook ${concreteBqClass.simpleName}#${it.name}: ${t.message}")
-                }
-            }
-        }
-        if (hookedCount == 0) {
-            logError("FATAL: Could not hook any broadcast processing method in ${concreteBqClass.name}.")
-        }
+        return null
     }
     private fun hookNmsConstructor(classLoader: ClassLoader) {
         try {
@@ -303,33 +579,7 @@ class ProbeHook : IXposedHookLoadPackage {
         if (hookCount > 0) log("SUCCESS: Hooked $hookCount NMS#enqueueNotificationInternal methods.")
         else logError("FATAL: No NMS#enqueueNotificationInternal methods were hooked.")
     }
-
-    private object ConfigManager {
-        @Volatile var isBqHooked = false
-        @Volatile private var frozenUids = emptySet<Int>()
-
-        fun updateConfig(jsonString: String) {
-            try {
-                val payload = JsonParser.parseString(jsonString)
-                    ?.asJsonObject?.getAsJsonObject("payload") ?: return
-
-                if (payload.has("frozen_uids")) {
-                    val uids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
-                    frozenUids = uids
-                }
-                if (frozenUids.isNotEmpty()) {
-                    log("Config updated. Now tracking ${frozenUids.size} frozen UIDs.")
-                }
-            } catch (e: Exception) {
-                logError("Failed to parse probe config: $e")
-            }
-        }
-
-        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
-    }
-
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? = XposedHelpers.findClassIfExists(className, classLoader)
-
     private fun hookActivitySwitchEvents(classLoader: ClassLoader) {
         findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { clazz ->
             val hook = object : XC_MethodHook() {
@@ -350,17 +600,12 @@ class ProbeHook : IXposedHookLoadPackage {
                 ?: logError("FATAL: Could not find ActivityManagerService#updateActivityUsageStats method!")
         } ?: logError("FATAL: Could not find com.android.server.am.ActivityManagerService class!")
     }
-
-    // [核心新增] 实现对任务修剪的 Hook，防止“白重载”
     private fun hookTaskTrimming(classLoader: ClassLoader) {
-        // 安全地查找目标类，因为它属于内部API，未来可能变动
         findClass("com.android.server.wm.RecentTasks", classLoader)?.let {
-            // 使用 XC_MethodReplacement.DO_NOTHING 完全替换该方法，使其变为空方法
             XposedBridge.hookAllMethods(it, "trimInactiveRecentTasks", XC_MethodReplacement.DO_NOTHING)
             log("SUCCESS: Hooked and disabled RecentTasks#trimInactiveRecentTasks.")
-        } ?: logError("WARN: Could not find com.android.server.wm.RecentTasks class. Task trimming prevention is disabled.")
+        } ?: logError("WARN: Could not find com.android.server.wm.RecentTasks class.")
     }
-
     private fun hookSystemFreezer(classLoader: ClassLoader) {
         findClass("com.android.server.am.CachedAppOptimizer", classLoader)?.let {
             XposedBridge.hookAllMethods(it, "useFreezer", XC_MethodReplacement.returnConstant(false))
@@ -379,7 +624,7 @@ class ProbeHook : IXposedHookLoadPackage {
                 }
             }
             clazz.declaredMethods.filter { it.name.contains("appNotResponding") }.forEach { XposedBridge.hookMethod(it, anrHook) }
-            log("SUCCESS: Hooked all ANR methods in AnrHelper.")
+            log("SUCCESS: Hooked all ANR methods in AnrHelper as a fallback.")
         }
     }
     private fun hookWakelocksAndAlarms(classLoader: ClassLoader) {

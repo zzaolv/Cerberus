@@ -4,8 +4,8 @@
 #include "system_monitor.h"
 #include "database_manager.h"
 #include "action_executor.h"
-#include "adj_mapper.h"      // [新增]
-#include "memory_butler.h"   // [新增]
+#include "adj_mapper.h"
+#include "memory_butler.h"
 #include "main.h"
 #include <nlohmann/json.hpp>
 #include <android/log.h>
@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <fstream>
 
-#define LOG_TAG "cerberusd_main_v35_more_settings" // 版本号更新
+#define LOG_TAG "cerberusd_main_v36_probe_sync" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -112,9 +112,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [核心新增] 处理获取OOM策略文件内容的请求
         if (type == "query.get_adj_rules_content") {
-            std::string content = SystemMonitor::read_file_once("/data/adb/cerberus/adj_rules.json", 16 * 1024); // 限制最大16KB
+            std::string content = SystemMonitor::read_file_once("/data/adb/cerberus/adj_rules.json", 16 * 1024);
             g_server->send_message(client_fd, json{
                 {"type", "resp.adj_rules_content"},
                 {"req_id", msg.value("req_id", "")},
@@ -123,7 +122,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [核心新增] 处理获取/data/app下所有包名的请求
         if (type == "query.get_data_app_packages") {
             auto packages = g_sys_monitor->get_data_app_packages();
             g_server->send_message(client_fd, json{
@@ -134,7 +132,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [核心新增] 处理设置 OOM 策略文件内容的请求
         if (type == "cmd.set_adj_rules_content") {
             const auto& payload = msg.value("payload", json::object());
             std::string content = payload.value("content", "");
@@ -144,12 +141,31 @@ void handle_client_message(int client_fd, const std::string& message_str) {
                 if (ofs.is_open()) {
                     ofs << content;
                     LOGI("OOM rules content updated from UI.");
-                    // 通知 StateManager 热重载
                     if (g_state_manager) g_state_manager->reload_adj_rules();
                 } else {
                     LOGE("Failed to open '%s' to write new adj rules.", path.c_str());
                 }
             }
+            return;
+        }
+
+        // [核心修正] 重新设计 probe_hello 的处理逻辑
+        if (type == "event.probe_hello") {
+            // 1. 这是一个同步请求，立即获取并返回配置
+            LOGI("Probe Hello received from fd %d. Sending initial config.", client_fd);
+            json payload = g_state_manager->get_probe_config_payload();
+            
+            // 2. 使用一个新的响应类型 `resp.probe_hello` 来明确这是一个同步响应
+            //    这确保了探针端可以确切地知道它收到了正确的初始配置
+            g_server->send_message(client_fd, json{
+                {"type", "resp.probe_hello"},
+                {"payload", payload}
+            }.dump());
+
+            // 3. 将此客户端标记为探针，以便后续可以通过 g_probe_fd 主动推送配置更新
+            g_probe_fd = client_fd;
+            
+            // 4. 处理完毕，直接返回，不再执行后续逻辑
             return;
         }
 
@@ -173,8 +189,6 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             g_state_manager->on_temp_unfreeze_request_by_pid(msg.at("payload"));
         }
         else if (type == "event.app_wakeup_request") {
-            // Note: This is the old event type. The new probe sends v2.
-            // We can keep this for backward compatibility or remove it.
             g_state_manager->on_wakeup_request(msg.at("payload"));
         } else if (type == "cmd.set_policy") {
             if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
@@ -196,13 +210,9 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             json payload = g_state_manager->get_full_config_for_ui();
             g_server->send_message(client_fd, json{{"type", "resp.all_policies"}, {"req_id", msg.value("req_id", "")}, {"payload", payload}}.dump());
         } 
-        // [核心新增] 处理OOM策略热重载命令
         else if (type == "cmd.reload_adj_rules") { 
             if (g_state_manager) g_state_manager->reload_adj_rules();
-        } else if (type == "event.probe_hello") {
-            g_probe_fd = client_fd;
-            notify_probe_of_config_change();
-        }
+        } 
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
 
@@ -243,7 +253,7 @@ void worker_thread_func() {
     int location_scan_countdown = 15;
     int audit_countdown = 30;
     int heartbeat_countdown = 7;
-    int butler_countdown = 60; // [新增] 内存管家调度周期    
+    int butler_countdown = 60; 
 
     const int SAMPLING_INTERVAL_SEC = 2;
 
