@@ -20,7 +20,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.crfzit.crfzit.data.model.Policy
-// [核心修复] 导入 AppIcons
 import com.crfzit.crfzit.ui.icons.AppIcons
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -44,7 +43,6 @@ fun MoreSettingsScreen(
                 },
                 actions = {
                     IconButton(onClick = { viewModel.saveAndReloadRules() }) {
-                        // [核心修复] 引用 AppIcons.Save
                         Icon(AppIcons.Save, contentDescription = "保存并重载")
                     }
                     IconButton(onClick = { viewModel.addNewRule() }) {
@@ -100,7 +98,31 @@ fun MoreSettingsScreen(
         }
     }
 
-    if (showBulkDialog != null) { /* ... 此对话框保持不变 ... */ }
+    // [核心修复] 实现了确认对话框的逻辑
+    showBulkDialog?.let { policy ->
+        AlertDialog(
+            onDismissRequest = { showBulkDialog = null },
+            title = { Text("确认批量操作") },
+            text = {
+                Text("您确定要将 ${uiState.dataAppPackages.size} 个第三方应用的策略批量设置为 '${policy.displayName}' 吗？此操作会覆盖这些应用现有的策略配置。")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.applyBulkPolicy(policy)
+                        showBulkDialog = null
+                    }
+                ) {
+                    Text("确认")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showBulkDialog = null }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
 
     if (showSigmoidDialog != null) {
         val rule = showSigmoidDialog!!
@@ -132,8 +154,6 @@ fun OomRuleCard(
             }
 
             Text("源范围 (Original Adj)", style = MaterialTheme.typography.labelLarge)
-            // [核心修复] 1. 参数名从 values 改为 value
-            //            2. onValueChange lambda 接收新范围 newRange
             RangeSlider(
                 value = rule.sourceRange[0].toFloat()..rule.sourceRange[1].toFloat(),
                 onValueChange = { newRange ->
@@ -160,8 +180,6 @@ fun OomRuleCard(
                     "linear" -> {
                         Column {
                             Text("目标范围 (Target Adj)", style = MaterialTheme.typography.labelLarge)
-                            // [核心修复] 1. 参数名从 values 改为 value
-                            //            2. onValueChange lambda 接收新范围 newRange
                             RangeSlider(
                                 value = (rule.targetRange?.getOrNull(0)?.toFloat() ?: 0f)..(rule.targetRange?.getOrNull(1)?.toFloat() ?: 0f),
                                 onValueChange = { newRange ->
@@ -229,10 +247,9 @@ fun SigmoidParamsDialog(
         title = { Text("编辑 Sigmoid 参数") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                // [核心修复] 使用 KeyboardType.Decimal 替换 NumberDecimal
-                OutlinedTextField(value = targetMin, onValueChange = { targetMin = it }, label = { Text("目标最小值") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
-                OutlinedTextField(value = targetMax, onValueChange = { targetMax = it }, label = { Text("目标最大值") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
-                OutlinedTextField(value = midpoint, onValueChange = { midpoint = it }, label = { Text("拐点 (Midpoint)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                OutlinedTextField(value = targetMin, onValueChange = { targetMin = it }, label = { Text("目标最小值") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                OutlinedTextField(value = targetMax, onValueChange = { targetMax = it }, label = { Text("目标最大值") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                OutlinedTextField(value = midpoint, onValueChange = { midpoint = it }, label = { Text("拐点 (Midpoint)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
                 OutlinedTextField(value = steepness, onValueChange = { steepness = it }, label = { Text("陡峭度 (Steepness)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
             }
         },
@@ -252,7 +269,6 @@ fun SigmoidParamsDialog(
     )
 }
 
-// ... BulkOperationsCard 保持不变 ...
 @Composable
 fun BulkOperationsCard(isLoading: Boolean, appCount: Int, onApplyPolicy: (Policy) -> Unit) {
     Card {
