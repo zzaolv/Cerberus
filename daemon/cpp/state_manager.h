@@ -75,8 +75,8 @@ struct AppRuntimeState {
     long swap_usage_kb = 0;
     long long last_foreground_timestamp_ms = 0;
     long long total_runtime_ms = 0;
-    time_t last_wakeup_timestamp = 0; 
-    int wakeup_count_in_window = 0;   
+    time_t last_wakeup_timestamp = 0;
+    int wakeup_count_in_window = 0;
     time_t last_successful_wakeup_timestamp = 0;
 };
 
@@ -116,7 +116,7 @@ public:
                  std::shared_ptr<MemoryButler> mem_butler);
 
     void initial_full_scan_and_warmup();
-    void reload_adj_rules(); 
+    void reload_adj_rules();
     bool evaluate_and_execute_strategy();
     bool handle_top_app_change_fast();
     void process_new_metrics(const MetricsRecord& record);
@@ -139,6 +139,9 @@ public:
     void on_signal_from_rekernel(const ReKernelSignalEvent& event);
     void on_binder_from_rekernel(const ReKernelBinderEvent& event);
     void run_memory_butler_tasks();
+
+    // [核心修正] 将此函数移动到 public 区域
+    std::vector<int> get_managed_uids_for_probe() const;
 
 
 private:
@@ -169,12 +172,12 @@ private:
     void schedule_timed_unfreeze(AppRuntimeState& app);
     bool check_timed_unfreeze();
     void cancel_timed_unfreeze(AppRuntimeState& app);
-    bool tick_state_machine_timers(); 
+    bool tick_state_machine_timers();
     bool update_foreground_state_from_pids(const std::set<int>& top_pids);
     bool update_foreground_state(const std::set<AppInstanceKey>& visible_app_keys);
     void audit_app_structures(const std::map<int, ProcessInfo>& process_tree);
     void validate_pids_nolock(AppRuntimeState& app);
-    void update_memory_health(const MetricsRecord& record); 
+    void update_memory_health(const MetricsRecord& record);
 
     std::shared_ptr<DatabaseManager> db_manager_;
     std::shared_ptr<SystemMonitor> sys_monitor_;
@@ -185,9 +188,9 @@ private:
     std::shared_ptr<MemoryButler> memory_butler_;
 
     MasterConfig master_config_;
-    MemoryHealth memory_health_ = MemoryHealth::HEALTHY; 
+    MemoryHealth memory_health_ = MemoryHealth::HEALTHY;
     std::unique_ptr<DozeManager> doze_manager_;
-    std::mutex state_mutex_;
+    mutable std::mutex state_mutex_;
     std::set<AppInstanceKey> last_known_visible_app_keys_;
     std::optional<MetricsRecord> last_metrics_record_;
     std::optional<std::pair<int, long long>> last_battery_level_info_;
@@ -195,7 +198,7 @@ private:
     std::vector<int> unfrozen_timeline_;
 
     std::map<int, int> kernel_wakeup_source_stats_;
-    std::map<std::string, int> ignored_rpc_stats_;   
+    std::map<std::string, int> ignored_rpc_stats_;
 
     std::map<int, DozeProcessRecord> doze_start_process_info_;
 
@@ -203,7 +206,6 @@ private:
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
     std::map<AppInstanceKey, AppRuntimeState>::iterator next_scan_iterator_;
-    std::vector<int> get_managed_uids_for_probe() const;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H
