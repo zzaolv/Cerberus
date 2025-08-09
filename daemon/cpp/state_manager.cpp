@@ -1846,6 +1846,25 @@ void StateManager::remove_pid_from_app(int pid) {
     }
 }
 
+// [核心新增] 实现获取受管UID列表的函数
+std::vector<int> StateManager::get_managed_uids_for_probe() const {
+    std::vector<int> managed_uids;
+    // 由于此函数在 const 方法中调用，我们不能使用常规的 lock_guard
+    // 但考虑到 state_mutex_ 是 mutable 的，我们仍然可以锁定它
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    for (const auto& [key, app] : managed_apps_) {
+        // 根据您的定义，策略为“智能”或“严格”的应用就是受管应用
+        if (app.config.policy == AppPolicy::STANDARD || app.config.policy == AppPolicy::STRICT) {
+            if (app.uid != -1) {
+                managed_uids.push_back(app.uid);
+            }
+        }
+    }
+    return managed_uids;
+}
+
+
 bool StateManager::is_critical_system_app(const std::string& package_name) const {
     return critical_system_apps_.count(package_name) > 0;
 }

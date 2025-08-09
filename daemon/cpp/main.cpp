@@ -149,23 +149,22 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // [核心修正] 重新设计 probe_hello 的处理逻辑
         if (type == "event.probe_hello") {
-            // 1. 这是一个同步请求，立即获取并返回配置
-            LOGI("Probe Hello received from fd %d. Sending initial config.", client_fd);
-            json payload = g_state_manager->get_probe_config_payload();
-            
-            // 2. 使用一个新的响应类型 `resp.probe_hello` 来明确这是一个同步响应
-            //    这确保了探针端可以确切地知道它收到了正确的初始配置
-            g_server->send_message(client_fd, json{
-                {"type", "resp.probe_hello"},
-                {"payload", payload}
-            }.dump());
-
-            // 3. 将此客户端标记为探针，以便后续可以通过 g_probe_fd 主动推送配置更新
             g_probe_fd = client_fd;
-            
-            // 4. 处理完毕，直接返回，不再执行后续逻辑
+            LOGI("Probe connected with fd %d. Immediately sending managed UIDs.", client_fd);
+            if (g_state_manager) {
+                auto managed_uids = g_state_manager->get_managed_uids_for_probe();
+                json payload = {
+                    {"managed_uids", managed_uids}
+                };
+                // 使用一个新的响应类型，表示这是Probe的初始化数据
+                g_server->send_message(client_fd, json{
+                    {"type", "resp.probe_init_data"},
+                    {"payload", payload}
+                }.dump());
+                LOGI("Sent %zu managed UIDs to Probe.", managed_uids.size());
+            }
+            // 不再需要旧的 notify_probe_of_config_change() 调用，因为配置在握手时就已发送
             return;
         }
 
@@ -190,9 +189,10 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
         else if (type == "event.app_wakeup_request") {
             g_state_manager->on_wakeup_request(msg.at("payload"));
-        } else if (type == "cmd.set_policy") {
+        }else if (type == "cmd.set_policy") {
             if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
-                notify_probe_of_config_change();
+                // 当UI修改了策略，我们才需要“推送”更新给Probe
+                notify_probe_of_config_change(); 
             }
             g_top_app_refresh_tickets = 1;
         }
@@ -232,8 +232,17 @@ void broadcast_dashboard_update() {
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
-        json payload = g_state_manager->get_probe_config_payload();
-        g_server->send_message(probe_fd, json{{"type", "stream.probe_config_update"}, {"payload", payload}}.dump());
+        // [核心修改] 这个函数现在也发送受管UID列表，用于配置热更新
+        auto managed_uids = g_state_manager->get_managed_uids_for_probe();
+        json payload = {
+            {"managed_uids", managed_uids}
+        };
+        // 使用与初始化时相同的消息类型
+        g_server->send_message(probe_fd, json{
+            {"type", "resp.probe_init_data"},
+            {"payload", payload}
+        }.dump());
+        LOGI("Hot-reloaded config to Probe, sent %zu managed UIDs.", managed_uids.size());
     }
 }
 void signal_handler(int signum) {
