@@ -138,6 +138,37 @@ std::vector<std::string> SystemMonitor::get_data_app_packages() {
     return {packages.begin(), packages.end()};
 }
 
+std::map<AppInstanceKey, int> SystemMonitor::get_all_installed_packages() {
+    std::map<AppInstanceKey, int> packages;
+    const std::string package_list_path = "/data/system/packages.list";
+    constexpr int PER_USER_RANGE = 100000;
+
+    std::string content = read_file_once(package_list_path, 2 * 1024 * 1024); // 读取最大2MB
+    if (content.empty()) {
+        LOGE("Failed to read /data/system/packages.list. Cannot build package-UID map.");
+        return packages;
+    }
+
+    std::stringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line)) {
+        std::stringstream line_ss(line);
+        std::string package_name;
+        int uid = -1;
+        
+        // 解析行: "com.example.app 10234 0 /data/user/0/com.example.app default..."
+        line_ss >> package_name >> uid;
+
+        if (uid >= 10000 && !package_name.empty()) {
+            int user_id = uid / PER_USER_RANGE;
+            AppInstanceKey key = {package_name, user_id};
+            packages[key] = uid;
+        }
+    }
+    LOGI("Built package-UID map from packages.list, found %zu entries.", packages.size());
+    return packages;
+}
+
 std::string SystemMonitor::exec_shell_pipe_efficient(const std::vector<std::string>& args) {
     if (args.empty()) return "";
 

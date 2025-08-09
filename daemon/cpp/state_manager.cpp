@@ -473,12 +473,13 @@ StateManager::StateManager(std::shared_ptr<DatabaseManager> db,
         "org.protonaosp.deviceconfig.auto_generated_rro_product__"
       };
 
+    initial_package_uid_map_ = sys_monitor_->get_all_installed_packages();
+
     load_all_configs();
     next_scan_iterator_ = managed_apps_.begin();
     last_battery_level_info_ = std::nullopt;
     LOGI("StateManager Initialized. Ready for warmup.");
 }
-
 void StateManager::reload_adj_rules() {
     LOGI("Reloading adj_rules.json by request...");
     if (adj_mapper_) {
@@ -1777,10 +1778,22 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
     AppInstanceKey key = {package_name, user_id};
     auto it = managed_apps_.find(key);
     if (it != managed_apps_.end()) return &it->second;
+    
     AppRuntimeState new_state;
     new_state.package_name = package_name;
     new_state.user_id = user_id;
-    new_state.app_name = package_name;
+    new_state.app_name = package_name; // 初始时用包名作为应用名
+
+    // [核心修改] 在创建状态时，立即从预加载的map中查找并设置UID
+    auto map_it = initial_package_uid_map_.find(key);
+    if (map_it != initial_package_uid_map_.end()) {
+        new_state.uid = map_it->second;
+    } else {
+        // 如果在map中找不到（例如系统应用或极少数情况），保持-1
+        new_state.uid = -1; 
+        LOGW("Could not find UID for %s (user %d) in initial map.", package_name.c_str(), user_id);
+    }
+
     auto config_opt = db_manager_->get_app_config(package_name, user_id);
     if (config_opt) {
         new_state.config = *config_opt;
@@ -1789,6 +1802,7 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
         if (is_critical_system_app(package_name)) {
             new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
         } else {
+            // 默认为豁免，让用户手动配置
             new_state.config = AppConfig{package_name, user_id, AppPolicy::EXEMPTED};
         }
         db_manager_->set_app_config(new_state.config);
@@ -1801,7 +1815,11 @@ AppRuntimeState* StateManager::get_or_create_app_state(const std::string& packag
 void StateManager::add_pid_to_app(int pid, const std::string& package_name, int user_id, int uid) {
     AppRuntimeState* app = get_or_create_app_state(package_name, user_id);
     if (!app) return;
-    if (app->uid == -1) app->uid = uid;
+
+    // [核心修改] 如果初始UID为-1，现在用进程信息来更新它
+    if (app->uid == -1 && uid != -1) {
+        app->uid = uid;
+    }
     if (app->app_name == app->package_name) {
         std::string friendly_name = sys_monitor_->get_app_name_from_pid(pid);
         if (!friendly_name.empty()) {

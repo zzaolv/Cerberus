@@ -78,6 +78,7 @@ public:
     std::vector<std::string> get_data_app_packages();
     // [核心新增] 公开 read_file_once 以便在 main.cpp 中使用
     static std::string read_file_once(const std::string& path, size_t max_size = 4096);
+    std::map<AppInstanceKey, int> get_all_installed_packages();
 
 private:
     class ProcFileReader {

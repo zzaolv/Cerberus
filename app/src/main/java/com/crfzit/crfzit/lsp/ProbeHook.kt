@@ -26,6 +26,7 @@ import java.io.OutputStreamWriter
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.min // 添加这一行
 
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -58,7 +59,8 @@ class ProbeHook : IXposedHookLoadPackage {
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
 
         CommManager.start()
-        CommManager.sendEvent("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
+        // [修改] 不再在这里发送hello，交给CommManager自己处理初始化
+        // CommManager.sendEvent("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
@@ -235,55 +237,117 @@ class ProbeHook : IXposedHookLoadPackage {
         private val eventQueue = LinkedBlockingQueue<Pair<String, Any>>()
         private var workerThread: Thread? = null
         private val gson = Gson()
+        @Volatile private var isConfigInitialized = false
 
+        // [核心新增] 定义配置刷新间隔
+        private const val CONFIG_REFRESH_INTERVAL_MINUTES = 5L
+
+        // [核心新增] 定义一个特殊的事件类型，用于触发配置刷新
+        private object RefreshConfigEvent
+
+        // 握手函数，提炼出来以便复用
+        private fun performHandshake(): Boolean {
+            try {
+                log("Attempting handshake with daemon...")
+                val helloMessage = CerberusMessage(
+                    type = "event.probe_hello",
+                    payload = mapOf("pid" to Process.myPid(), "version" to TAG)
+                )
+                val jsonMessage = gson.toJson(helloMessage)
+
+                Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
+                    socket.soTimeout = 10000
+
+                    val writer = OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8)
+                    writer.write(jsonMessage + "\n")
+                    writer.flush()
+
+                    val responseLine = socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()
+                    if (responseLine != null) {
+                        ConfigManager.updateConfig(responseLine)
+                        log("Handshake successful. Probe config updated.")
+                        return true // 握手成功
+                    } else {
+                        logError("Handshake failed: Daemon closed connection prematurely.")
+                    }
+                }
+            } catch (e: IOException) {
+                if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false) {
+                    logError("Handshake IOException: ${e.message}.")
+                } else {
+                    log("Daemon not ready during handshake attempt.")
+                }
+            } catch (t: Throwable) {
+                logError("Handshake unhandled error: $t.")
+            }
+            return false // 握手失败
+        }
+        
         fun start() {
             if (workerThread?.isAlive == true) return
             workerThread = Thread {
                 log("CommManager worker thread started.")
+
+                // 阶段一：初始化握手，带重试和退避
+                var retryDelayMs = 2000L
+                val maxDelayMs = 60000L
+
+                while (!isConfigInitialized) {
+                    if (performHandshake()) {
+                        isConfigInitialized = true
+                    } else {
+                        try {
+                            Thread.sleep(retryDelayMs)
+                            retryDelayMs = min(retryDelayMs * 2, maxDelayMs)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                    }
+                }
+
+                if (!isConfigInitialized) {
+                    logError("CommManager failed to initialize. Thread is stopping.")
+                    return@Thread
+                }
+                
+                // 阶段二：处理常规事件队列，并定时刷新配置
+                log("Initialization complete. Now processing event queue with periodic config refresh.")
                 while (true) {
                     try {
-                        val (type, payload) = eventQueue.take()
+                        // [核心修改] 使用 poll 进行带超时的等待
+                        val event = eventQueue.poll(CONFIG_REFRESH_INTERVAL_MINUTES, TimeUnit.MINUTES)
+
+                        // 检查等待结果
+                        if (event == null) {
+                            // poll 超时，意味着到了该刷新配置的时间了
+                            log("Scheduled config refresh triggered.")
+                            performHandshake() // 重新执行握手以获取最新配置
+                            continue // 继续下一次循环等待
+                        }
+
+                        val (type, payload) = event
                         val message = CerberusMessage(type = type, payload = payload)
                         val jsonMessage = gson.toJson(message)
-
-                        // [核心修改] 重构通信逻辑，特别是针对 "hello" 事件
+                        
                         try {
                             Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                                socket.soTimeout = 5000 // 增加超时以等待响应
-
-                                // 1. 发送消息
+                                socket.soTimeout = 2000
                                 OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
                                     writer.write(jsonMessage + "\n")
                                     writer.flush()
                                 }
-
-                                // 2. 如果是 "hello" 事件，则阻塞等待并读取响应
-                                if (type == "event.probe_hello") {
-                                    log("Sent hello to daemon, waiting for init data...")
-                                    try {
-                                        // 这是一个同步的请求-响应流程
-                                        socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()?.let { responseLine ->
-                                            log("Received init data from daemon.")
-                                            ConfigManager.updateConfig(responseLine)
-                                        } ?: logError("Daemon closed connection without sending init data.")
-                                    } catch (e: Exception) {
-                                        logError("Failed to read init data response from daemon: $e")
-                                    }
-                                }
-                                // 对于其他事件，仍然是“即发即关”
                             }
                         } catch (e: IOException) {
-                            if (e.message?.contains("ECONNREFUSED") != true) {
+                             if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false) {
                                 logError("Daemon short-conn send error for '$type': ${e.message}")
                             }
-                        } catch (e: Exception) {
-                            logError("Unexpected error during short-conn send for '$type': $e")
                         }
                     } catch (ie: InterruptedException) {
                         Thread.currentThread().interrupt()
                         break
                     } catch (t: Throwable) {
-                        logError("FATAL: Error in CommManager worker thread: ${t.message}")
+                        logError("FATAL: Error in CommManager event loop: $t")
                         Thread.sleep(1000)
                     }
                 }
@@ -300,6 +364,7 @@ class ProbeHook : IXposedHookLoadPackage {
             eventQueue.offer(type to payload)
         }
     }
+
     private fun sendEventToDaemon(type: String, payload: Any) { CommManager.sendEvent(type, payload) }
     private fun requestWakeupForUid(uid: Int, type: WakeupType) {
         if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidManaged(uid)) {
@@ -506,14 +571,28 @@ class ProbeHook : IXposedHookLoadPackage {
         @Volatile private var managedUids = emptySet<Int>()
 
         fun updateConfig(jsonString: String) {
+            // [验证步骤 1] 打印从守护进程收到的原始JSON字符串
+            // 这可以帮助我们确认通信是通的，并且收到了数据。
+            log("Received config JSON from daemon: $jsonString")
             try {
                 val payload = JsonParser.parseString(jsonString)
-                    ?.asJsonObject?.getAsJsonObject("payload") ?: return
+                    ?.asJsonObject?.getAsJsonObject("payload") ?: run {
+                        logError("Failed to parse config: payload is null or not an object.")
+                        return
+                    }
 
                 if (payload.has("managed_uids")) {
                     val uids = payload.getAsJsonArray("managed_uids").map { it.asInt }.toSet()
                     managedUids = uids
-                    log("Config updated. Now managing ${managedUids.size} UIDs.")
+                    
+                    // [验证步骤 2] 打印成功解析后的结果
+                    // 这可以确认JSON解析正确，并且Hook内部状态已更新。
+                    // 为了防止日志刷屏，我们只打印前15个UID作为样本。
+                    val sampleUids = if (uids.size > 15) "${uids.take(15).joinToString(", ")}..." else uids.joinToString(", ")
+                    log("Config updated successfully. Now managing ${managedUids.size} UIDs. Sample: [${sampleUids}]")
+
+                } else {
+                    logError("Config payload does not contain 'managed_uids' key.")
                 }
             } catch (e: Exception) {
                 logError("Failed to parse probe config: $e")

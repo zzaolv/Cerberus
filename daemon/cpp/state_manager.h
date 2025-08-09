@@ -206,6 +206,7 @@ private:
     std::map<int, AppRuntimeState*> pid_to_app_map_;
     std::unordered_set<std::string> critical_system_apps_;
     std::map<AppInstanceKey, AppRuntimeState>::iterator next_scan_iterator_;
+    std::map<AppInstanceKey, int> initial_package_uid_map_;
 };
 
 #endif //CERBERUS_STATE_MANAGER_H
