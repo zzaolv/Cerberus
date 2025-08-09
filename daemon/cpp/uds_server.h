@@ -12,7 +12,7 @@
 
 class UdsServer {
 public:
-    // [核心修改] 构造函数现在接收两种地址信息
+    // 构造函数现在接收两种地址信息
     explicit UdsServer(const std::string& uds_socket_name, int tcp_port);
     ~UdsServer();
 
@@ -39,7 +39,7 @@ private:
     void schedule_client_removal(int client_fd);
     void process_clients_to_remove();
 
-    // [核心修改] 成员变量更新，以支持双协议
+    // 成员变量更新，以支持双协议
     std::string uds_socket_name_;
     int tcp_port_;
     int server_fd_uds_; // UDS 监听 fd

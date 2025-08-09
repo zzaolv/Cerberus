@@ -1,6 +1,8 @@
 // app/src/main/java/com/crfzit/crfzit/lsp/ProbeHook.kt
 package com.crfzit.crfzit.lsp
 
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,8 +12,6 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
 import android.os.Build
 import android.os.Process
 import com.crfzit.crfzit.data.model.CerberusMessage
@@ -37,8 +37,8 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var packageManager: PackageManager? = null
 
     companion object {
-        private const val TAG = "CerberusProbe_v57_UDS"
-        private const val DAEMON_SOCKET_NAME = "cerberusd_socket"
+        private const val TAG = "CerberusProbe_v58_FsUDS" // 版本号更新
+        private const val DAEMON_SOCKET_PATH = "/data/adb/cerberus/cerberusd.sock"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
@@ -93,17 +93,17 @@ class ProbeHook : IXposedHookLoadPackage {
 
         private fun performHandshake(): Boolean {
             try {
-                log("Attempting handshake with daemon via UDS @${DAEMON_SOCKET_NAME}...")
+                log("Attempting handshake with daemon via UDS path ${DAEMON_SOCKET_PATH}...")
                 val helloMessage = CerberusMessage(
                     type = "event.probe_hello",
                     payload = mapOf("pid" to Process.myPid(), "version" to TAG)
                 )
                 val jsonMessage = gson.toJson(helloMessage)
-                
+
                 LocalSocket().use { socket ->
-                    val socketAddress = LocalSocketAddress(DAEMON_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT)
+                    val socketAddress = LocalSocketAddress(DAEMON_SOCKET_PATH, LocalSocketAddress.Namespace.FILESYSTEM)
                     socket.connect(socketAddress)
-                    
+
                     val writer = OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8)
                     writer.write(jsonMessage + "\n")
                     writer.flush()
@@ -172,15 +172,18 @@ class ProbeHook : IXposedHookLoadPackage {
                         }
 
                         val event = eventQueue.poll(1, TimeUnit.SECONDS)
-                        if (event == null) continue
+
+                        if (event == null) {
+                            continue
+                        }
 
                         val (type, payload) = event
                         val message = CerberusMessage(type = type, payload = payload)
                         val jsonMessage = gson.toJson(message)
-                        
+
                         try {
                             LocalSocket().use { socket ->
-                                val socketAddress = LocalSocketAddress(DAEMON_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT)
+                                val socketAddress = LocalSocketAddress(DAEMON_SOCKET_PATH, LocalSocketAddress.Namespace.FILESYSTEM)
                                 socket.connect(socketAddress)
                                 OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8).use { writer ->
                                     writer.write(jsonMessage + "\n")
@@ -188,8 +191,8 @@ class ProbeHook : IXposedHookLoadPackage {
                                 }
                             }
                         } catch (e: IOException) {
-                             if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false &&
-                                 e.message?.contains("No such file or directory", ignoreCase = true) == false) {
+                            if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false &&
+                                e.message?.contains("No such file or directory", ignoreCase = true) == false) {
                                 logError("Daemon short-conn send error for '$type': ${e.message}")
                             }
                         }
@@ -214,7 +217,7 @@ class ProbeHook : IXposedHookLoadPackage {
             eventQueue.offer(type to payload)
         }
     }
-    
+
     private object ConfigManager {
         @Volatile var isBqHooked = false
         @Volatile private var managedUids = emptySet<Int>()
@@ -245,7 +248,7 @@ class ProbeHook : IXposedHookLoadPackage {
                 logError("Failed to parse probe config: $e")
             }
         }
-        
+
         fun isUidManaged(uid: Int): Boolean = managedUids.contains(uid)
         fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
     }
@@ -263,6 +266,7 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
+    // 省略所有未修改的hook函数，以保持简洁...
     private fun hookMiuiGreezeManager(classLoader: ClassLoader) {
         findClass("com.miui.server.greeze.GreezeManagerService", classLoader)?.let { clazz ->
             log("Found MIUI GreezeManagerService, attempting to hook.")
@@ -344,7 +348,6 @@ class ProbeHook : IXposedHookLoadPackage {
 
         } ?: log("INFO: OplusHansManager not found (this is normal on non-OplusOS systems).")
     }
-    
     private fun hookPhantomProcessKiller(classLoader: ClassLoader) {
         findClass("com.android.server.am.PhantomProcessList", classLoader)?.let { clazz ->
             try {
@@ -412,7 +415,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
     private fun sendEventToDaemon(type: String, payload: Any) { CommManager.sendEvent(type, payload) }
-    
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)

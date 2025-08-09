@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <fstream>
 
-#define LOG_TAG "cerberusd_main_v36_probe_sync" // 版本号更新
+#define LOG_TAG "cerberusd_main_v36_probe_sync"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -80,7 +80,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             }
             return;
         }
-
+        
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
             std::string filename = payload_json.value("filename", "");
@@ -328,7 +328,7 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
     const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; 
-    const std::string DAEMON_UDS_NAME = "cerberusd_socket";
+    const std::string DAEMON_UDS_PATH = DATA_DIR + "/cerberusd.sock";
     const int DAEMON_TCP_PORT = 28900;
 
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
@@ -364,7 +364,7 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
 
-    g_server = std::make_unique<UdsServer>(DAEMON_UDS_NAME, DAEMON_TCP_PORT);
+    g_server = std::make_unique<UdsServer>(DAEMON_UDS_PATH, DAEMON_TCP_PORT);
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
     g_server->run();
