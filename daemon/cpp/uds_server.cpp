@@ -3,10 +3,10 @@
 #include <android/log.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/stat.h> // For chmod
-#include <netinet/in.h>     // For TCP
-#include <netinet/tcp.h>    // For TCP_NODELAY
-#include <arpa/inet.h>      // For inet_addr
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -16,7 +16,7 @@
 #include <sys/select.h>
 #include <thread>
 
-#define LOG_TAG "cerberusd_fs_uds_v1" // 版本号更新
+#define LOG_TAG "cerberusd_dev_socket_v1"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -28,6 +28,7 @@ UdsServer::UdsServer(const std::string& uds_socket_name, int tcp_port)
       server_fd_tcp_(-1),
       is_running_(false) {}
 
+// ... (所有非 run/stop 的函数保持不变) ...
 UdsServer::~UdsServer() {
     stop();
 }
@@ -180,58 +181,36 @@ void UdsServer::handle_client_data(int client_fd) {
     }
 }
 
-void UdsServer::stop() {
-    if (!is_running_.exchange(false)) return;
-    LOGI("Stopping Dual-Protocol server...");
-    
-    if (server_fd_uds_ != -1) {
-        shutdown(server_fd_uds_, SHUT_RDWR);
-        close(server_fd_uds_);
-        server_fd_uds_ = -1;
-    }
-    unlink(uds_socket_name_.c_str());
-
-    if (server_fd_tcp_ != -1) {
-        shutdown(server_fd_tcp_, SHUT_RDWR);
-        close(server_fd_tcp_);
-        server_fd_tcp_ = -1;
-    }
-    
-    process_clients_to_remove(); 
-    
-    std::lock_guard<std::mutex> lock(client_mutex_);
-    for (int fd : client_fds_) {
-        close(fd);
-    }
-    client_fds_.clear();
-    ui_client_fds_.clear();
-    client_buffers_.clear();
-    LOGI("Server stopped and all clients disconnected.");
-}
 
 void UdsServer::run() {
-    // 步骤1: 初始化 UDS Socket
+    // 步骤1: 初始化 UDS Socket (文件系统路径)
     server_fd_uds_ = socket(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_uds_ == -1) {
         LOGE("Failed to create UDS socket: %s", strerror(errno));
         return;
     }
+
     struct sockaddr_un uds_addr;
     memset(&uds_addr, 0, sizeof(uds_addr));
     uds_addr.sun_family = AF_LOCAL;
+    // uds_socket_name_ is now a full path, e.g., /dev/socket/cerberusd
     strncpy(uds_addr.sun_path, uds_socket_name_.c_str(), sizeof(uds_addr.sun_path) - 1);
+
     unlink(uds_socket_name_.c_str());
+
     if (bind(server_fd_uds_, (struct sockaddr*)&uds_addr, sizeof(uds_addr)) == -1) {
         LOGE("Failed to bind UDS socket to path '%s': %s", uds_socket_name_.c_str(), strerror(errno));
         close(server_fd_uds_);
         return;
     }
+    
     if (chmod(uds_socket_name_.c_str(), 0666) == -1) {
         LOGE("Failed to chmod UDS socket file '%s': %s", uds_socket_name_.c_str(), strerror(errno));
         close(server_fd_uds_);
         unlink(uds_socket_name_.c_str());
         return;
     }
+
     if (listen(server_fd_uds_, 5) == -1) {
         LOGE("Failed to listen on UDS socket: %s", strerror(errno));
         close(server_fd_uds_);
@@ -240,7 +219,7 @@ void UdsServer::run() {
     }
     LOGI("Server listening on UDS path: %s (permissions set to 0666)", uds_socket_name_.c_str());
 
-    // 步骤2: 初始化 TCP Socket
+    // 步骤2: 初始化 TCP Socket (保持不变)
     server_fd_tcp_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd_tcp_ == -1) {
         LOGE("Failed to create TCP socket: %s", strerror(errno));
@@ -272,7 +251,7 @@ void UdsServer::run() {
 
     is_running_ = true;
 
-    // 步骤3: 主循环同时监控两个监听Socket
+    // 步骤3: 主循环同时监控两个监听Socket (保持不变)
     while (is_running_) {
         process_clients_to_remove();
 
@@ -301,7 +280,6 @@ void UdsServer::run() {
         }
         if (activity == 0) continue;
 
-        // 步骤4: 检查是哪个服务器收到了连接
         if (FD_ISSET(server_fd_uds_, &read_fds)) {
             struct sockaddr_un client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -336,4 +314,34 @@ void UdsServer::run() {
         }
     }
     LOGI("Server event loop terminated.");
+}
+
+
+void UdsServer::stop() {
+    if (!is_running_.exchange(false)) return;
+    LOGI("Stopping Dual-Protocol server...");
+    
+    if (server_fd_uds_ != -1) {
+        shutdown(server_fd_uds_, SHUT_RDWR);
+        close(server_fd_uds_);
+        server_fd_uds_ = -1;
+    }
+    unlink(uds_socket_name_.c_str());
+
+    if (server_fd_tcp_ != -1) {
+        shutdown(server_fd_tcp_, SHUT_RDWR);
+        close(server_fd_tcp_);
+        server_fd_tcp_ = -1;
+    }
+    
+    process_clients_to_remove(); 
+    
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    for (int fd : client_fds_) {
+        close(fd);
+    }
+    client_fds_.clear();
+    ui_client_fds_.clear();
+    client_buffers_.clear();
+    LOGI("Server stopped and all clients disconnected.");
 }

@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <fstream>
 
-#define LOG_TAG "cerberusd_main_v36_probe_sync"
+#define LOG_TAG "cerberusd_main_v37_final_ipc"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -328,7 +328,9 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
     const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; 
-    const std::string DAEMON_UDS_PATH = DATA_DIR + "/cerberusd.sock";
+    
+    // [核心修改] UDS 地址指向 /dev/socket/
+    const std::string DAEMON_UDS_PATH = "/dev/socket/cerberusd";
     const int DAEMON_TCP_PORT = 28900;
 
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());

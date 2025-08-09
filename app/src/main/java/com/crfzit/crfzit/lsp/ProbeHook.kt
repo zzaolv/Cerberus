@@ -37,8 +37,9 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var packageManager: PackageManager? = null
 
     companion object {
-        private const val TAG = "CerberusProbe_v58_FsUDS" // 版本号更新
-        private const val DAEMON_SOCKET_PATH = "/data/adb/cerberus/cerberusd.sock"
+        private const val TAG = "CerberusProbe_v59_DevSocket"
+        // Socket 地址改为 /dev/socket/ 下的路径
+        private const val DAEMON_SOCKET_PATH = "/dev/socket/cerberusd"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
@@ -101,6 +102,8 @@ class ProbeHook : IXposedHookLoadPackage {
                 val jsonMessage = gson.toJson(helloMessage)
 
                 LocalSocket().use { socket ->
+                    // LocalSocketAddress 对于 /dev/socket/ 下的路径，可以直接使用名字，并指定 FILESYSTEM 命名空间
+                    // 这是最明确和兼容的方式
                     val socketAddress = LocalSocketAddress(DAEMON_SOCKET_PATH, LocalSocketAddress.Namespace.FILESYSTEM)
                     socket.connect(socketAddress)
 
@@ -266,7 +269,6 @@ class ProbeHook : IXposedHookLoadPackage {
         }
     }
 
-    // 省略所有未修改的hook函数，以保持简洁...
     private fun hookMiuiGreezeManager(classLoader: ClassLoader) {
         findClass("com.miui.server.greeze.GreezeManagerService", classLoader)?.let { clazz ->
             log("Found MIUI GreezeManagerService, attempting to hook.")
