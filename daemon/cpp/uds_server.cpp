@@ -2,9 +2,10 @@
 #include "uds_server.h"
 #include <android/log.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+#include <sys/un.h>
+#include <netinet/in.h>     // For TCP
+#include <netinet/tcp.h>    // For TCP_NODELAY
+#include <arpa/inet.h>      // For inet_addr
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -14,13 +15,18 @@
 #include <sys/select.h>
 #include <thread>
 
-#define LOG_TAG "cerberusd_tcp_v4_safe_remove" // 版本号更新
+#define LOG_TAG "cerberusd_dual_server_v1" // 版本号更新
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-UdsServer::UdsServer(int port)
-    : port_(port), server_fd_(-1), is_running_(false) {}
+// [核心修改] 构造函数实现
+UdsServer::UdsServer(const std::string& uds_socket_name, int tcp_port)
+    : uds_socket_name_(uds_socket_name),
+      tcp_port_(tcp_port),
+      server_fd_uds_(-1),
+      server_fd_tcp_(-1),
+      is_running_(false) {}
 
 UdsServer::~UdsServer() {
     stop();
@@ -63,7 +69,6 @@ void UdsServer::add_client(int client_fd) {
 }
 
 void UdsServer::remove_client(int client_fd) {
-    // 这个函数现在只应该被主线程调用
     std::lock_guard<std::mutex> lock(client_mutex_);
     auto it = std::remove(client_fds_.begin(), client_fds_.end(), client_fd);
     if (it != client_fds_.end()) {
@@ -78,16 +83,13 @@ void UdsServer::remove_client(int client_fd) {
     }
 }
 
-// [核心修复] 新增的方法，用于将客户端标记为待移除
 void UdsServer::schedule_client_removal(int client_fd) {
     std::lock_guard<std::mutex> lock(clients_to_remove_mutex_);
-    // 防止重复添加
     if (std::find(clients_to_remove_.begin(), clients_to_remove_.end(), client_fd) == clients_to_remove_.end()) {
         clients_to_remove_.push_back(client_fd);
     }
 }
 
-// [核心修复] 新增的方法，用于在主循环中安全地处理移除
 void UdsServer::process_clients_to_remove() {
     std::vector<int> to_remove;
     {
@@ -122,7 +124,6 @@ bool UdsServer::send_message(int client_fd, const std::string& message) {
     if (bytes_sent < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
             LOGW("Send to fd %d failed (connection closed), scheduling for removal.", client_fd);
-            // [核心修复] 不再创建线程，而是安全地调度移除
             schedule_client_removal(client_fd);
         } else {
             LOGE("Send to fd %d failed: %s", client_fd, strerror(errno));
@@ -147,7 +148,6 @@ void UdsServer::handle_client_data(int client_fd) {
     ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
 
     if (bytes_read <= 0) {
-        // [核心修复] 接收失败也通过调度来移除，而不是直接移除
         schedule_client_removal(client_fd);
         return;
     }
@@ -182,15 +182,19 @@ void UdsServer::handle_client_data(int client_fd) {
 
 void UdsServer::stop() {
     if (!is_running_.exchange(false)) return;
-    LOGI("Stopping TCP server...");
+    LOGI("Stopping Dual-Protocol server...");
     
-    if (server_fd_ != -1) {
-        shutdown(server_fd_, SHUT_RDWR);
-        close(server_fd_);
-        server_fd_ = -1;
+    if (server_fd_uds_ != -1) {
+        shutdown(server_fd_uds_, SHUT_RDWR);
+        close(server_fd_uds_);
+        server_fd_uds_ = -1;
     }
-
-    // [核心修复] 在主线程中安全关闭所有客户端
+    if (server_fd_tcp_ != -1) {
+        shutdown(server_fd_tcp_, SHUT_RDWR);
+        close(server_fd_tcp_);
+        server_fd_tcp_ = -1;
+    }
+    
     process_clients_to_remove(); 
     
     std::lock_guard<std::mutex> lock(client_mutex_);
@@ -200,52 +204,74 @@ void UdsServer::stop() {
     client_fds_.clear();
     ui_client_fds_.clear();
     client_buffers_.clear();
-    LOGI("TCP Server stopped and all clients disconnected.");
+    LOGI("Server stopped and all clients disconnected.");
 }
 
 void UdsServer::run() {
-    server_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (server_fd_ == -1) {
+    // [核心修改] 步骤1: 初始化 UDS Socket
+    server_fd_uds_ = socket(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server_fd_uds_ == -1) {
+        LOGE("Failed to create UDS socket: %s", strerror(errno));
+        return;
+    }
+    struct sockaddr_un uds_addr;
+    memset(&uds_addr, 0, sizeof(uds_addr));
+    uds_addr.sun_family = AF_LOCAL;
+    uds_addr.sun_path[0] = '\0'; 
+    strncpy(uds_addr.sun_path + 1, uds_socket_name_.c_str(), sizeof(uds_addr.sun_path) - 2);
+    if (bind(server_fd_uds_, (struct sockaddr*)&uds_addr, sizeof(uds_addr)) == -1) {
+        LOGE("Failed to bind UDS socket to abstract name '%s': %s", uds_socket_name_.c_str(), strerror(errno));
+        close(server_fd_uds_);
+        return;
+    }
+    if (listen(server_fd_uds_, 5) == -1) {
+        LOGE("Failed to listen on UDS socket: %s", strerror(errno));
+        close(server_fd_uds_);
+        return;
+    }
+    LOGI("Server listening on UDS abstract name: @%s", uds_socket_name_.c_str());
+
+    // [核心修改] 步骤2: 初始化 TCP Socket
+    server_fd_tcp_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server_fd_tcp_ == -1) {
         LOGE("Failed to create TCP socket: %s", strerror(errno));
+        close(server_fd_uds_);
         return;
     }
-
     int opt = 1;
-    if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        LOGE("setsockopt(SO_REUSEADDR) failed: %s", strerror(errno));
-        close(server_fd_);
+    if (setsockopt(server_fd_tcp_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOGW("setsockopt(SO_REUSEADDR) failed for TCP: %s", strerror(errno));
+    }
+    struct sockaddr_in tcp_addr;
+    memset(&tcp_addr, 0, sizeof(tcp_addr));
+    tcp_addr.sin_family = AF_INET;
+    tcp_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    tcp_addr.sin_port = htons(tcp_port_);
+    if (bind(server_fd_tcp_, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) == -1) {
+        LOGE("Failed to bind TCP socket to 127.0.0.1:%d : %s", tcp_port_, strerror(errno));
+        close(server_fd_uds_);
+        close(server_fd_tcp_);
         return;
     }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port_);
-
-    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        LOGE("Failed to bind TCP socket to 127.0.0.1:%d : %s", port_, strerror(errno));
-        close(server_fd_);
-        return;
-    }
-
-    if (listen(server_fd_, 5) == -1) {
+    if (listen(server_fd_tcp_, 5) == -1) {
         LOGE("Failed to listen on TCP socket: %s", strerror(errno));
-        close(server_fd_);
+        close(server_fd_uds_);
+        close(server_fd_tcp_);
         return;
     }
+    LOGI("Server listening on TCP 127.0.0.1:%d", tcp_port_);
 
-    LOGI("Server listening on TCP 127.0.0.1:%d", port_);
     is_running_ = true;
 
+    // [核心修改] 步骤3: 主循环同时监控两个监听Socket
     while (is_running_) {
-        // [核心修复] 在循环开始时，处理所有待移除的客户端
         process_clients_to_remove();
 
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(server_fd_, &read_fds);
-        int max_fd = server_fd_;
+        FD_SET(server_fd_uds_, &read_fds);
+        FD_SET(server_fd_tcp_, &read_fds);
+        int max_fd = std::max(server_fd_uds_, server_fd_tcp_);
 
         {
             std::lock_guard<std::mutex> lock(client_mutex_);
@@ -266,15 +292,25 @@ void UdsServer::run() {
         }
         if (activity == 0) continue;
 
-        if (FD_ISSET(server_fd_, &read_fds)) {
+        // [核心修改] 步骤4: 检查是哪个服务器收到了连接
+        if (FD_ISSET(server_fd_uds_, &read_fds)) {
+            struct sockaddr_un client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int new_socket = accept(server_fd_uds_, (struct sockaddr*)&client_addr, &client_len);
+            if (new_socket >= 0) {
+                LOGI("Accepted new UDS connection.");
+                add_client(new_socket);
+            }
+        }
+        
+        if (FD_ISSET(server_fd_tcp_, &read_fds)) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int new_socket = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
+            int new_socket = accept(server_fd_tcp_, (struct sockaddr*)&client_addr, &client_len);
             if (new_socket >= 0) {
+                LOGI("Accepted new TCP connection.");
                 int nodelay_opt = 1;
-                if (setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay_opt, sizeof(nodelay_opt)) < 0) {
-                    LOGW("setsockopt(TCP_NODELAY) failed for client fd %d: %s", new_socket, strerror(errno));
-                }
+                setsockopt(new_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay_opt, sizeof(nodelay_opt));
                 add_client(new_socket);
             }
         }

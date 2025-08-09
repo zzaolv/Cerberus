@@ -30,7 +30,6 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// --- 全局变量声明保持不变 ---
 std::unique_ptr<UdsServer> g_server;
 static std::unique_ptr<ReKernelClient> g_rekernel_client;
 static std::shared_ptr<StateManager> g_state_manager;
@@ -41,7 +40,7 @@ static std::atomic<bool> g_is_running = true;
 std::atomic<int> g_probe_fd = -1;
 static std::thread g_worker_thread;
 std::atomic<int> g_top_app_refresh_tickets = 0;
-// --- Re-Kernel 相关函数保持不变 ---
+
 void handle_rekernel_signal(const ReKernelSignalEvent& event) {
     if (g_state_manager) {
         g_state_manager->on_signal_from_rekernel(event);
@@ -68,7 +67,20 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        // --- query.get_logs 和 query.get_log_files 逻辑保持不变 ---
+        if (type == "event.probe_hello") {
+            g_probe_fd = client_fd;
+            LOGI("Probe connected with fd %d. Immediately sending full probe config.", client_fd);
+            if (g_state_manager) {
+                json payload = g_state_manager->get_probe_config_payload();
+                g_server->send_message(client_fd, json{
+                    {"type", "resp.probe_init_data"},
+                    {"payload", payload}
+                }.dump());
+                LOGI("Sent full config to Probe.");
+            }
+            return;
+        }
+
         if (type == "query.get_logs") {
             const auto& payload_json = msg.value("payload", json::object());
             std::string filename = payload_json.value("filename", "");
@@ -149,28 +161,8 @@ void handle_client_message(int client_fd, const std::string& message_str) {
             return;
         }
 
-        if (type == "event.probe_hello") {
-            g_probe_fd = client_fd;
-            LOGI("Probe connected with fd %d. Immediately sending managed UIDs.", client_fd);
-            if (g_state_manager) {
-                auto managed_uids = g_state_manager->get_managed_uids_for_probe();
-                json payload = {
-                    {"managed_uids", managed_uids}
-                };
-                // 使用一个新的响应类型，表示这是Probe的初始化数据
-                g_server->send_message(client_fd, json{
-                    {"type", "resp.probe_init_data"},
-                    {"payload", payload}
-                }.dump());
-                LOGI("Sent %zu managed UIDs to Probe.", managed_uids.size());
-            }
-            // 不再需要旧的 notify_probe_of_config_change() 调用，因为配置在握手时就已发送
-            return;
-        }
-
         if (!g_state_manager) return;
 
-        // --- 其余事件和命令处理逻辑保持不变 ---
         if (type == "event.app_wakeup_request_v2") {
             g_state_manager->on_wakeup_request_from_probe(msg.at("payload"));
         } else if (type == "cmd.proactive_unfreeze") {
@@ -189,10 +181,9 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         }
         else if (type == "event.app_wakeup_request") {
             g_state_manager->on_wakeup_request(msg.at("payload"));
-        }else if (type == "cmd.set_policy") {
+        } else if (type == "cmd.set_policy") {
             if (g_state_manager->on_config_changed_from_ui(msg.at("payload"))) {
-                // 当UI修改了策略，我们才需要“推送”更新给Probe
-                notify_probe_of_config_change(); 
+                notify_probe_of_config_change();
             }
             g_top_app_refresh_tickets = 1;
         }
@@ -212,7 +203,7 @@ void handle_client_message(int client_fd, const std::string& message_str) {
         } 
         else if (type == "cmd.reload_adj_rules") { 
             if (g_state_manager) g_state_manager->reload_adj_rules();
-        } 
+        }
     } catch (const json::exception& e) { LOGE("JSON Error: %s in msg: %s", e.what(), message_str.c_str()); }
 }
 
@@ -232,17 +223,12 @@ void broadcast_dashboard_update() {
 void notify_probe_of_config_change() {
     int probe_fd = g_probe_fd.load();
     if (g_server && probe_fd != -1 && g_state_manager) {
-        // [核心修改] 这个函数现在也发送受管UID列表，用于配置热更新
-        auto managed_uids = g_state_manager->get_managed_uids_for_probe();
-        json payload = {
-            {"managed_uids", managed_uids}
-        };
-        // 使用与初始化时相同的消息类型
+        json payload = g_state_manager->get_probe_config_payload();
         g_server->send_message(probe_fd, json{
             {"type", "resp.probe_init_data"},
             {"payload", payload}
         }.dump());
-        LOGI("Hot-reloaded config to Probe, sent %zu managed UIDs.", managed_uids.size());
+        LOGI("Hot-reloaded full config to Probe.");
     }
 }
 void signal_handler(int signum) {
@@ -262,7 +248,7 @@ void worker_thread_func() {
     int location_scan_countdown = 15;
     int audit_countdown = 30;
     int heartbeat_countdown = 7;
-    int butler_countdown = 60; 
+    int butler_countdown = 60;
 
     const int SAMPLING_INTERVAL_SEC = 2;
 
@@ -342,6 +328,9 @@ int main(int argc, char *argv[]) {
     const std::string DB_PATH = DATA_DIR + "/cerberus.db";
     const std::string LOG_DIR = DATA_DIR + "/logs";
     const std::string ADJ_RULES_PATH = DATA_DIR + "/adj_rules.json"; 
+    const std::string DAEMON_UDS_NAME = "cerberusd_socket";
+    const int DAEMON_TCP_PORT = 28900;
+
     LOGI("Project Cerberus Daemon starting... (PID: %d)", getpid());
 
     try {
@@ -375,8 +364,7 @@ int main(int argc, char *argv[]) {
     g_sys_monitor->start_network_snapshot_thread();
     g_worker_thread = std::thread(worker_thread_func);
 
-    const int DAEMON_PORT = 28900;
-    g_server = std::make_unique<UdsServer>(DAEMON_PORT);
+    g_server = std::make_unique<UdsServer>(DAEMON_UDS_NAME, DAEMON_TCP_PORT);
     g_server->set_message_handler(handle_client_message);
     g_server->set_disconnect_handler(handle_client_disconnect);
     g_server->run();

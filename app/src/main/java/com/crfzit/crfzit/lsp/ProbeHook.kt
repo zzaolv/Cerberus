@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.os.Build
 import android.os.Process
 import com.crfzit.crfzit.data.model.CerberusMessage
@@ -23,10 +25,10 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.IOException
 import java.io.OutputStreamWriter
-import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.LinkedBlockingQueue
-import kotlin.math.min // 添加这一行
+import java.util.concurrent.TimeUnit
+import kotlin.math.min
 
 class ProbeHook : IXposedHookLoadPackage {
 
@@ -35,10 +37,9 @@ class ProbeHook : IXposedHookLoadPackage {
     @Volatile private var packageManager: PackageManager? = null
 
     companion object {
-        private const val TAG = "CerberusProbe_v50_SyncHandshake" // 版本号更新
+        private const val TAG = "CerberusProbe_v57_UDS"
+        private const val DAEMON_SOCKET_NAME = "cerberusd_socket"
         const val FLAG_INCLUDE_STOPPED_PACKAGES = 32
-        private const val DAEMON_HOST = "127.0.0.1"
-        private const val DAEMON_PORT = 28900
         private const val USAGE_EVENT_ACTIVITY_RESUMED = 1
         private const val USAGE_EVENT_ACTIVITY_PAUSED = 2
 
@@ -59,8 +60,6 @@ class ProbeHook : IXposedHookLoadPackage {
         log("Loading into system_server (PID: ${Process.myPid()}). HookSet active: $TAG")
 
         CommManager.start()
-        // [修改] 不再在这里发送hello，交给CommManager自己处理初始化
-        // CommManager.sendEvent("event.probe_hello", mapOf("pid" to Process.myPid(), "version" to TAG))
 
         try {
             val classLoader = lpparam.classLoader
@@ -73,7 +72,7 @@ class ProbeHook : IXposedHookLoadPackage {
             hookWakelocksAndAlarms(classLoader)
             hookActivityStarter(classLoader)
             hookNotificationService(classLoader)
-            hookServices(classLoader)
+            log("INFO: Direct service startup blocking is disabled by configuration.")
             hookOomAdjustments(classLoader)
             hookPhantomProcessKiller(classLoader)
             hookExcessivePowerUsage(classLoader)
@@ -81,6 +80,186 @@ class ProbeHook : IXposedHookLoadPackage {
             hookOplusHansManager(classLoader)
         } catch (t: Throwable) {
             logError("CRITICAL: Failed during hook placement: $t")
+        }
+    }
+
+
+    private object CommManager {
+        private val eventQueue = LinkedBlockingQueue<Pair<String, Any>>()
+        private var workerThread: Thread? = null
+        private val gson = Gson()
+        @Volatile private var isConfigInitialized = false
+        private const val CONFIG_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
+
+        private fun performHandshake(): Boolean {
+            try {
+                log("Attempting handshake with daemon via UDS @${DAEMON_SOCKET_NAME}...")
+                val helloMessage = CerberusMessage(
+                    type = "event.probe_hello",
+                    payload = mapOf("pid" to Process.myPid(), "version" to TAG)
+                )
+                val jsonMessage = gson.toJson(helloMessage)
+                
+                LocalSocket().use { socket ->
+                    val socketAddress = LocalSocketAddress(DAEMON_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT)
+                    socket.connect(socketAddress)
+                    
+                    val writer = OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8)
+                    writer.write(jsonMessage + "\n")
+                    writer.flush()
+
+                    val responseLine = socket.inputStream.bufferedReader(StandardCharsets.UTF_8).readLine()
+                    if (responseLine != null) {
+                        ConfigManager.updateConfig(responseLine)
+                        log("Handshake successful. Probe config updated.")
+                        return true
+                    } else {
+                        logError("Handshake failed: Daemon closed UDS connection prematurely.")
+                    }
+                }
+            } catch (e: IOException) {
+                if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false &&
+                    e.message?.contains("No such file or directory", ignoreCase = true) == false) {
+                    logError("Handshake IOException: ${e.message}.")
+                } else {
+                    log("Daemon UDS not ready during handshake attempt.")
+                }
+            } catch (t: Throwable) {
+                logError("Handshake unhandled error: $t.")
+            }
+            return false
+        }
+
+        fun start() {
+            if (workerThread?.isAlive == true) return
+            workerThread = Thread {
+                log("CommManager worker thread started.")
+
+                var retryDelayMs = 2000L
+                val maxDelayMs = 60000L
+                while (!isConfigInitialized) {
+                    if (performHandshake()) {
+                        isConfigInitialized = true
+                    } else {
+                        try {
+                            Thread.sleep(retryDelayMs)
+                            retryDelayMs = min(retryDelayMs * 2, maxDelayMs)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                    }
+                }
+
+                if (!isConfigInitialized) {
+                    logError("CommManager failed to initialize. Thread is stopping.")
+                    return@Thread
+                }
+
+                log("Initialization complete. Now processing event queue with reliable periodic config refresh.")
+                var lastRefreshTime = System.currentTimeMillis()
+
+                while (true) {
+                    try {
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastRefreshTime > CONFIG_REFRESH_INTERVAL_MS) {
+                            log("Scheduled config refresh triggered by timer.")
+                            if (performHandshake()) {
+                                lastRefreshTime = currentTime
+                            } else {
+                                lastRefreshTime = currentTime - CONFIG_REFRESH_INTERVAL_MS + 60000L
+                            }
+                        }
+
+                        val event = eventQueue.poll(1, TimeUnit.SECONDS)
+                        if (event == null) continue
+
+                        val (type, payload) = event
+                        val message = CerberusMessage(type = type, payload = payload)
+                        val jsonMessage = gson.toJson(message)
+                        
+                        try {
+                            LocalSocket().use { socket ->
+                                val socketAddress = LocalSocketAddress(DAEMON_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT)
+                                socket.connect(socketAddress)
+                                OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8).use { writer ->
+                                    writer.write(jsonMessage + "\n")
+                                    writer.flush()
+                                }
+                            }
+                        } catch (e: IOException) {
+                             if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false &&
+                                 e.message?.contains("No such file or directory", ignoreCase = true) == false) {
+                                logError("Daemon short-conn send error for '$type': ${e.message}")
+                            }
+                        }
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    } catch (t: Throwable) {
+                        logError("FATAL: Error in CommManager event loop: $t")
+                        Thread.sleep(1000)
+                    }
+                }
+                log("CommManager worker thread stopped.")
+            }.apply {
+                name = "CerberusCommThread"
+                priority = Thread.NORM_PRIORITY - 1
+                isDaemon = true
+                start()
+            }
+        }
+
+        fun sendEvent(type: String, payload: Any) {
+            eventQueue.offer(type to payload)
+        }
+    }
+    
+    private object ConfigManager {
+        @Volatile var isBqHooked = false
+        @Volatile private var managedUids = emptySet<Int>()
+        @Volatile private var frozenUids = emptySet<Int>()
+
+        fun updateConfig(jsonString: String) {
+            log("Received config JSON from daemon: $jsonString")
+            try {
+                val payload = JsonParser.parseString(jsonString)
+                    ?.asJsonObject?.getAsJsonObject("payload") ?: run {
+                    logError("Failed to parse config: payload is null or not an object.")
+                    return
+                }
+
+                if (payload.has("managed_uids")) {
+                    val uids = payload.getAsJsonArray("managed_uids").map { it.asInt }.toSet()
+                    managedUids = uids
+                    log("Config updated. Now managing ${managedUids.size} UIDs.")
+                }
+
+                if (payload.has("frozen_uids")) {
+                    val uids = payload.getAsJsonArray("frozen_uids").map { it.asInt }.toSet()
+                    frozenUids = uids
+                    log("State updated. Now tracking ${frozenUids.size} frozen UIDs.")
+                }
+
+            } catch (e: Exception) {
+                logError("Failed to parse probe config: $e")
+            }
+        }
+        
+        fun isUidManaged(uid: Int): Boolean = managedUids.contains(uid)
+        fun isUidFrozen(uid: Int): Boolean = frozenUids.contains(uid)
+    }
+
+    private fun requestWakeupForUid(uid: Int, type: WakeupType) {
+        if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidFrozen(uid)) {
+            val reason = when(type) {
+                WakeupType.FCM_PUSH -> "FCM"
+                WakeupType.GENERIC_NOTIFICATION -> "Notification"
+                WakeupType.BINDER_TRANSACTION -> "Binder"
+                else -> "Wakeup"
+            }
+            log("WAKEUP: Requesting temporary unfreeze for FROZEN UID $uid, Reason: $reason")
+            sendEventToDaemon("event.app_wakeup_request_v2", mapOf("uid" to uid, "type_int" to type.value))
         }
     }
 
@@ -165,7 +344,7 @@ class ProbeHook : IXposedHookLoadPackage {
 
         } ?: log("INFO: OplusHansManager not found (this is normal on non-OplusOS systems).")
     }
-
+    
     private fun hookPhantomProcessKiller(classLoader: ClassLoader) {
         findClass("com.android.server.am.PhantomProcessList", classLoader)?.let { clazz ->
             try {
@@ -209,9 +388,8 @@ class ProbeHook : IXposedHookLoadPackage {
                     try {
                         val uid = param.args[1] as Int
                         if (uid < Process.FIRST_APPLICATION_UID) return
-
                         if (ConfigManager.isUidManaged(uid)) {
-                            log("DEFENSE: System tried to set oom_adj of our MANAGED UID $uid. BLOCKED to prevent premature wakeup.")
+                            log("DEFENSE: System tried to set oom_adj of our MANAGED UID $uid. BLOCKED.")
                             param.result = null
                         }
                     } catch (t: Throwable) {
@@ -233,151 +411,8 @@ class ProbeHook : IXposedHookLoadPackage {
             logError("Could not hook OOM adjustments: ${t.message}")
         }
     }
-    private object CommManager {
-        private val eventQueue = LinkedBlockingQueue<Pair<String, Any>>()
-        private var workerThread: Thread? = null
-        private val gson = Gson()
-        @Volatile private var isConfigInitialized = false
-
-        // [核心新增] 定义配置刷新间隔
-        private const val CONFIG_REFRESH_INTERVAL_MINUTES = 5L
-
-        // [核心新增] 定义一个特殊的事件类型，用于触发配置刷新
-        private object RefreshConfigEvent
-
-        // 握手函数，提炼出来以便复用
-        private fun performHandshake(): Boolean {
-            try {
-                log("Attempting handshake with daemon...")
-                val helloMessage = CerberusMessage(
-                    type = "event.probe_hello",
-                    payload = mapOf("pid" to Process.myPid(), "version" to TAG)
-                )
-                val jsonMessage = gson.toJson(helloMessage)
-
-                Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                    socket.soTimeout = 10000
-
-                    val writer = OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8)
-                    writer.write(jsonMessage + "\n")
-                    writer.flush()
-
-                    val responseLine = socket.getInputStream().bufferedReader(StandardCharsets.UTF_8).readLine()
-                    if (responseLine != null) {
-                        ConfigManager.updateConfig(responseLine)
-                        log("Handshake successful. Probe config updated.")
-                        return true // 握手成功
-                    } else {
-                        logError("Handshake failed: Daemon closed connection prematurely.")
-                    }
-                }
-            } catch (e: IOException) {
-                if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false) {
-                    logError("Handshake IOException: ${e.message}.")
-                } else {
-                    log("Daemon not ready during handshake attempt.")
-                }
-            } catch (t: Throwable) {
-                logError("Handshake unhandled error: $t.")
-            }
-            return false // 握手失败
-        }
-        
-        fun start() {
-            if (workerThread?.isAlive == true) return
-            workerThread = Thread {
-                log("CommManager worker thread started.")
-
-                // 阶段一：初始化握手，带重试和退避
-                var retryDelayMs = 2000L
-                val maxDelayMs = 60000L
-
-                while (!isConfigInitialized) {
-                    if (performHandshake()) {
-                        isConfigInitialized = true
-                    } else {
-                        try {
-                            Thread.sleep(retryDelayMs)
-                            retryDelayMs = min(retryDelayMs * 2, maxDelayMs)
-                        } catch (ie: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        }
-                    }
-                }
-
-                if (!isConfigInitialized) {
-                    logError("CommManager failed to initialize. Thread is stopping.")
-                    return@Thread
-                }
-                
-                // 阶段二：处理常规事件队列，并定时刷新配置
-                log("Initialization complete. Now processing event queue with periodic config refresh.")
-                while (true) {
-                    try {
-                        // [核心修改] 使用 poll 进行带超时的等待
-                        val event = eventQueue.poll(CONFIG_REFRESH_INTERVAL_MINUTES, TimeUnit.MINUTES)
-
-                        // 检查等待结果
-                        if (event == null) {
-                            // poll 超时，意味着到了该刷新配置的时间了
-                            log("Scheduled config refresh triggered.")
-                            performHandshake() // 重新执行握手以获取最新配置
-                            continue // 继续下一次循环等待
-                        }
-
-                        val (type, payload) = event
-                        val message = CerberusMessage(type = type, payload = payload)
-                        val jsonMessage = gson.toJson(message)
-                        
-                        try {
-                            Socket(DAEMON_HOST, DAEMON_PORT).use { socket ->
-                                socket.soTimeout = 2000
-                                OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8).use { writer ->
-                                    writer.write(jsonMessage + "\n")
-                                    writer.flush()
-                                }
-                            }
-                        } catch (e: IOException) {
-                             if (e.message?.contains("ECONNREFUSED", ignoreCase = true) == false) {
-                                logError("Daemon short-conn send error for '$type': ${e.message}")
-                            }
-                        }
-                    } catch (ie: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        break
-                    } catch (t: Throwable) {
-                        logError("FATAL: Error in CommManager event loop: $t")
-                        Thread.sleep(1000)
-                    }
-                }
-                log("CommManager worker thread stopped.")
-            }.apply {
-                name = "CerberusCommThread"
-                priority = Thread.NORM_PRIORITY - 1
-                isDaemon = true
-                start()
-            }
-        }
-
-        fun sendEvent(type: String, payload: Any) {
-            eventQueue.offer(type to payload)
-        }
-    }
-
     private fun sendEventToDaemon(type: String, payload: Any) { CommManager.sendEvent(type, payload) }
-    private fun requestWakeupForUid(uid: Int, type: WakeupType) {
-        if (uid >= Process.FIRST_APPLICATION_UID && ConfigManager.isUidManaged(uid)) {
-            val reason = when(type) {
-                WakeupType.FCM_PUSH -> "FCM"
-                WakeupType.GENERIC_NOTIFICATION -> "Notification"
-                WakeupType.BINDER_TRANSACTION -> "Binder"
-                else -> "Wakeup"
-            }
-            log("WAKEUP: Requesting temporary unfreeze for MANAGED UID $uid, Reason: $reason")
-            sendEventToDaemon("event.app_wakeup_request_v2", mapOf("uid" to uid, "type_int" to type.value))
-        }
-    }
+    
     private fun hookAmsLifecycle(classLoader: ClassLoader) {
         try {
             val amsClass = XposedHelpers.findClass("com.android.server.am.ActivityManagerService", classLoader)
@@ -566,41 +601,6 @@ class ProbeHook : IXposedHookLoadPackage {
         if (hookCount > 0) log("SUCCESS: Hooked $hookCount NMS#enqueueNotificationInternal methods.")
         else logError("FATAL: No NMS#enqueueNotificationInternal methods were hooked.")
     }
-    private object ConfigManager {
-        @Volatile var isBqHooked = false
-        @Volatile private var managedUids = emptySet<Int>()
-
-        fun updateConfig(jsonString: String) {
-            // [验证步骤 1] 打印从守护进程收到的原始JSON字符串
-            // 这可以帮助我们确认通信是通的，并且收到了数据。
-            log("Received config JSON from daemon: $jsonString")
-            try {
-                val payload = JsonParser.parseString(jsonString)
-                    ?.asJsonObject?.getAsJsonObject("payload") ?: run {
-                        logError("Failed to parse config: payload is null or not an object.")
-                        return
-                    }
-
-                if (payload.has("managed_uids")) {
-                    val uids = payload.getAsJsonArray("managed_uids").map { it.asInt }.toSet()
-                    managedUids = uids
-                    
-                    // [验证步骤 2] 打印成功解析后的结果
-                    // 这可以确认JSON解析正确，并且Hook内部状态已更新。
-                    // 为了防止日志刷屏，我们只打印前15个UID作为样本。
-                    val sampleUids = if (uids.size > 15) "${uids.take(15).joinToString(", ")}..." else uids.joinToString(", ")
-                    log("Config updated successfully. Now managing ${managedUids.size} UIDs. Sample: [${sampleUids}]")
-
-                } else {
-                    logError("Config payload does not contain 'managed_uids' key.")
-                }
-            } catch (e: Exception) {
-                logError("Failed to parse probe config: $e")
-            }
-        }
-
-        fun isUidManaged(uid: Int): Boolean = managedUids.contains(uid)
-    }
     private fun findClass(className: String, classLoader: ClassLoader): Class<*>? = XposedHelpers.findClassIfExists(className, classLoader)
     private fun hookActivitySwitchEvents(classLoader: ClassLoader) {
         findClass("com.android.server.am.ActivityManagerService", classLoader)?.let { clazz ->
@@ -696,22 +696,6 @@ class ProbeHook : IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(clazz, "execute", executeHook)
             log("SUCCESS: Hooked ActivityStarter#execute for proactive unfreezing.")
         } ?: logError("FATAL: Could not find ActivityStarter class!")
-    }
-    private fun hookServices(classLoader: ClassLoader) {
-        findClass("com.android.server.am.ActiveServices", classLoader)?.let { clazz ->
-            val hook = object: XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val serviceRecord = param.args.find { it != null && it.javaClass.name.endsWith("ServiceRecord") } ?: return
-                    val appInfo = XposedHelpers.getObjectField(serviceRecord, "appInfo") as? ApplicationInfo ?: return
-                    if (ConfigManager.isUidManaged(appInfo.uid)) {
-                        log("DEFENSE: Blocked service startup for managed app: ${appInfo.packageName}")
-                        param.result = null
-                    }
-                }
-            }
-            clazz.declaredMethods.filter { it.name.contains("bringUpService") }.forEach { XposedBridge.hookMethod(it, hook) }
-            log("SUCCESS: Hooked ActiveServices service startup methods.")
-        }
     }
     private fun isGcmOrFcmIntent(intent: Intent): Boolean {
         return intent.action?.let { it == "com.google.android.c2dm.intent.RECEIVE" || it == "com.google.firebase.MESSAGING_EVENT" } ?: false

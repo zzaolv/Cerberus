@@ -12,7 +12,8 @@
 
 class UdsServer {
 public:
-    explicit UdsServer(int port);
+    // [核心修改] 构造函数现在接收两种地址信息
+    explicit UdsServer(const std::string& uds_socket_name, int tcp_port);
     ~UdsServer();
 
     UdsServer(const UdsServer&) = delete;
@@ -35,20 +36,20 @@ private:
     void add_client(int client_fd);
     void remove_client(int client_fd);
     void handle_client_data(int client_fd);
-    // [核心修复] 新增一个方法，用于将客户端标记为待移除
     void schedule_client_removal(int client_fd);
-    // [核心修复] 新增一个方法，用于处理所有待移除的客户端
     void process_clients_to_remove();
 
-    int port_;
-    int server_fd_;
+    // [核心修改] 成员变量更新，以支持双协议
+    std::string uds_socket_name_;
+    int tcp_port_;
+    int server_fd_uds_; // UDS 监听 fd
+    int server_fd_tcp_; // TCP 监听 fd
     std::atomic<bool> is_running_;
     
     std::vector<int> client_fds_;
     std::set<int> ui_client_fds_;
     mutable std::mutex client_mutex_;
 
-    // [核心修复] 新增待移除客户端队列
     std::vector<int> clients_to_remove_;
     std::mutex clients_to_remove_mutex_;
 
@@ -57,4 +58,4 @@ private:
     std::map<int, std::string> client_buffers_;
 };
 
-#endif //CERBERUSD_UDS_SERVER_H
+#endif // CERBERUSD_UDS_SERVER_H
